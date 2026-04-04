@@ -4,6 +4,7 @@ import matplotlib
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
     QAbstractItemView,
@@ -40,6 +42,7 @@ from config_adapter import (
     run_reconstruction,
     true_point_rows_from_config,
 )
+from layout_preview import build_measurement_preview
 
 
 matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "SimSun", "Arial Unicode MS"]
@@ -47,10 +50,11 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 
 class EditableTable(QWidget):
-    def __init__(self, title, field_specs, parent=None):
+    def __init__(self, title, field_specs, parent=None, on_change=None):
         super().__init__(parent)
         self.field_specs = field_specs
         self.inputs = {}
+        self.on_change = on_change
 
         layout = QVBoxLayout(self)
         group = QGroupBox(title)
@@ -149,6 +153,7 @@ class EditableTable(QWidget):
         for col, spec in enumerate(self.field_specs):
             self.table.setItem(row, col, QTableWidgetItem(values[spec["key"]]))
         self.clear_form()
+        self._emit_change()
 
     def update_selected(self):
         row = self.table.currentRow()
@@ -157,15 +162,18 @@ class EditableTable(QWidget):
         values = self.get_form_values()
         for col, spec in enumerate(self.field_specs):
             self.table.setItem(row, col, QTableWidgetItem(values[spec["key"]]))
+        self._emit_change()
 
     def delete_selected(self):
         row = self.table.currentRow()
         if row >= 0:
             self.table.removeRow(row)
+            self._emit_change()
 
     def clear_rows(self):
         self.table.setRowCount(0)
         self.clear_form()
+        self._emit_change()
 
     def on_selection_changed(self):
         row = self.table.currentRow()
@@ -195,6 +203,11 @@ class EditableTable(QWidget):
             for col, spec in enumerate(self.field_specs):
                 self.table.setItem(row, col, QTableWidgetItem(str(payload.get(spec["key"], ""))))
         self.clear_form()
+        self._emit_change()
+
+    def _emit_change(self):
+        if callable(self.on_change):
+            self.on_change()
 
 
 class ReadOnlyTable(QWidget):
@@ -221,6 +234,187 @@ class ReadOnlyTable(QWidget):
                 self.table.setItem(row, col, QTableWidgetItem(str(payload.get(column, ""))))
 
 
+class MeasurementPreviewWidget(QWidget):
+    MARK_LINE = QColor("#b91c1c")
+    MARK_FILL = QColor("#ef4444")
+    BEAM_COLOR = QColor("#4b5563")
+    NODE_COLOR = QColor("#9ca3af")
+    TEXT_COLOR = QColor("#1f2937")
+    MUTED_TEXT = QColor("#6b7280")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.preview_data = {
+            "ok": False,
+            "message": "填写合法节点与测量数据后显示示意。",
+            "beam_start": 0.0,
+            "beam_end": 0.0,
+            "beam_length": 0.0,
+            "nodes": [],
+            "items": [],
+            "measurement_count": 0,
+            "node_count": 0,
+        }
+        self._hovered_item_key = None
+        self.setMinimumHeight(230)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+
+    def set_preview_data(self, preview_data):
+        self.preview_data = preview_data
+        self._hovered_item_key = None
+        QToolTip.hideText()
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = self.rect().adjusted(12, 10, -12, -10)
+        if rect.width() <= 80 or rect.height() <= 80:
+            return
+
+        painter.setPen(self.TEXT_COLOR)
+        if not self.preview_data.get("ok"):
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.preview_data["message"])
+            return
+
+        summary = (
+            f"梁长 {self.preview_data['beam_length']:.6g} | "
+            f"节点 {self.preview_data['node_count']} | "
+            f"测点 {self.preview_data['measurement_count']}"
+        )
+        painter.drawText(rect.left(), rect.top() + 16, summary)
+        self._draw_legend(painter, rect.left(), rect.top() + 34)
+
+        beam_left = rect.left() + 38
+        beam_right = rect.right() - 18
+        drawing_top = rect.top() + 56
+        drawing_bottom = rect.bottom() - 16
+        beam_y = int((drawing_top + drawing_bottom) / 2)
+
+        painter.setPen(QPen(self.BEAM_COLOR, 3))
+        painter.drawLine(beam_left, beam_y, beam_right, beam_y)
+        painter.setPen(self.MUTED_TEXT)
+        painter.drawText(rect.left(), beam_y - 22, 30, 18, Qt.AlignmentFlag.AlignLeft, "上")
+        painter.drawText(rect.left(), beam_y + 6, 30, 18, Qt.AlignmentFlag.AlignLeft, "下")
+
+        nodes = self.preview_data["nodes"]
+        for node in nodes:
+            x_pos = self._map_x(node, beam_left, beam_right)
+            painter.setPen(QPen(self.NODE_COLOR, 1))
+            painter.drawLine(x_pos, beam_y - 14, x_pos, beam_y + 14)
+            painter.setPen(self.MUTED_TEXT)
+            painter.drawText(x_pos - 24, beam_y + 18, 48, 16, Qt.AlignmentFlag.AlignHCenter, f"{node:.3g}")
+
+        laid_out_items = self._layout_items(beam_left, beam_right, beam_y)
+        for item in laid_out_items:
+            rect_width = item["rect_width"]
+            rect_height = item["rect_height"]
+            y_pos = item["center_y"]
+            x_pos = item["pixel_x"]
+
+            painter.setPen(QPen(self.MARK_LINE, 1.2))
+            painter.setBrush(self.MARK_FILL)
+            painter.drawRoundedRect(x_pos - rect_width // 2, y_pos - rect_height // 2, rect_width, rect_height, 3, 3)
+
+    def mouseMoveEvent(self, event):
+        item = self._find_item_at(event.position().x(), event.position().y())
+        if item is None:
+            self._hovered_item_key = None
+            QToolTip.hideText()
+            return
+
+        item_key = item["sequence"]
+        self._hovered_item_key = item_key
+        QToolTip.showText(event.globalPosition().toPoint(), self._tooltip_text(item), self)
+
+    def leaveEvent(self, _event):
+        self._hovered_item_key = None
+        QToolTip.hideText()
+
+    def _draw_legend(self, painter, x, y):
+        self._draw_legend_chip(painter, x, y, self.MARK_FILL, self.MARK_LINE, "测点位置（按上下表面分层）")
+
+    def _draw_legend_chip(self, painter, x, y, fill_color, line_color, text):
+        painter.setPen(QPen(line_color, 1.2))
+        painter.setBrush(fill_color)
+        painter.drawRoundedRect(x, y - 9, 18, 9, 3, 3)
+        painter.setPen(self.TEXT_COLOR)
+        painter.drawText(x + 24, y, text)
+
+    def _map_x(self, value, beam_left, beam_right):
+        beam_start = self.preview_data["beam_start"]
+        beam_length = max(self.preview_data["beam_length"], 1e-12)
+        ratio = (value - beam_start) / beam_length
+        return int(beam_left + ratio * (beam_right - beam_left))
+
+    def _layout_items(self, beam_left, beam_right, beam_y):
+        items = []
+        side_row_ends = {"top": [], "bottom": []}
+        min_gap = 6
+
+        for item in sorted(
+            self.preview_data["items"],
+            key=lambda payload: (payload["surface_side"], payload["global_x"], payload["sequence"]),
+        ):
+            payload = {
+                "pixel_x": self._map_x(item["global_x"], beam_left, beam_right),
+                "rect_width": 14,
+                "rect_height": 8,
+                "row_index": 0,
+                "surface_side": item["surface_side"],
+                "sequence": item["sequence"],
+                "element_index": item["element_index"],
+                "local_x": item["local_x"],
+                "global_x": item["global_x"],
+                "surface_label": item["surface_label"],
+                "strain_text": item["strain_text"],
+            }
+            row_ends = side_row_ends[payload["surface_side"]]
+            left_edge = payload["pixel_x"] - payload["rect_width"] // 2
+            row_index = 0
+            while row_index < len(row_ends) and left_edge <= row_ends[row_index] + min_gap:
+                row_index += 1
+            right_edge = payload["pixel_x"] + payload["rect_width"] // 2
+            if row_index == len(row_ends):
+                row_ends.append(right_edge)
+            else:
+                row_ends[row_index] = right_edge
+            payload["row_index"] = row_index
+            if payload["surface_side"] == "top":
+                payload["center_y"] = beam_y - 18 - row_index * 16
+            else:
+                payload["center_y"] = beam_y + 18 + row_index * 16
+            items.append(payload)
+
+        return items
+
+    def _find_item_at(self, x_pos, y_pos):
+        rect = self.rect().adjusted(12, 10, -12, -10)
+        if not self.preview_data.get("ok") or rect.width() <= 80 or rect.height() <= 80:
+            return None
+
+        beam_left = rect.left() + 38
+        beam_right = rect.right() - 18
+        beam_y = int(((rect.top() + 56) + (rect.bottom() - 16)) / 2)
+        for item in reversed(self._layout_items(beam_left, beam_right, beam_y)):
+            half_width = item["rect_width"] // 2 + 3
+            half_height = item["rect_height"] // 2 + 4
+            if (item["pixel_x"] - half_width) <= x_pos <= (item["pixel_x"] + half_width) and (
+                item["center_y"] - half_height
+            ) <= y_pos <= (item["center_y"] + half_height):
+                return item
+        return None
+
+    def _tooltip_text(self, item):
+        return (
+            f"位置: 单元 {item['element_index']} | 局部 x={item['local_x']:.6g} | 全局 x={item['global_x']:.6g}\n"
+            f"表面: {item['surface_label']}\n"
+            f"应变: {item['strain_text']}"
+        )
+
+
 class ReconstructionMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -230,7 +424,6 @@ class ReconstructionMainWindow(QMainWindow):
 
         self.current_model = None
         self.current_config = None
-        self.legend_summary = "图例："
 
         self._build_ui()
         self.load_sample_data()
@@ -269,6 +462,16 @@ class ReconstructionMainWindow(QMainWindow):
         self.left_tabs = QTabWidget()
         left_layout.addWidget(self.left_tabs, 1)
         self._build_left_tabs()
+        self.node_x_edit.textChanged.connect(self.refresh_measurement_preview)
+
+        preview_group = QGroupBox("梁长与测点位置")
+        preview_group.setMinimumHeight(240)
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        self.measurement_preview = MeasurementPreviewWidget()
+        preview_layout.addWidget(self.measurement_preview)
+        left_layout.addWidget(preview_group)
+        self.refresh_measurement_preview()
 
         plot_panel = QWidget()
         plot_panel_layout = QVBoxLayout(plot_panel)
@@ -276,7 +479,7 @@ class ReconstructionMainWindow(QMainWindow):
         right_split.addWidget(plot_panel)
 
         plot_group = QGroupBox("重构图")
-        plot_group_layout = QHBoxLayout(plot_group)
+        plot_group_layout = QVBoxLayout(plot_group)
         plot_panel_layout.addWidget(plot_group, 1)
 
         canvas_container = QFrame()
@@ -289,16 +492,6 @@ class ReconstructionMainWindow(QMainWindow):
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         canvas_layout.addWidget(self.canvas)
         plot_group_layout.addWidget(canvas_container, 1)
-
-        legend_group = QGroupBox("图例")
-        legend_group.setMinimumWidth(260)
-        legend_group.setMaximumWidth(320)
-        legend_layout = QVBoxLayout(legend_group)
-        self.legend_text = QPlainTextEdit()
-        self.legend_text.setReadOnly(True)
-        self.legend_text.setMinimumHeight(200)
-        legend_layout.addWidget(self.legend_text)
-        plot_group_layout.addWidget(legend_group)
 
         result_tabs = QTabWidget()
         right_split.addWidget(result_tabs)
@@ -388,7 +581,6 @@ class ReconstructionMainWindow(QMainWindow):
         self.show_nodes_check.setChecked(True)
         self.equal_axis_check = QCheckBox("等比例坐标轴")
         self.annotate_points_check = QCheckBox("标注实测/重构点")
-        self.annotate_points_check.setChecked(True)
         self.connect_pairs_check = QCheckBox("连线显示差异")
         self.connect_pairs_check.setChecked(True)
 
@@ -412,7 +604,7 @@ class ReconstructionMainWindow(QMainWindow):
             {"key": "zone_a", "label": "zone起点"},
             {"key": "zone_b", "label": "zone终点"},
         ]
-        self.measurement_editor = EditableTable("测量数据", specs)
+        self.measurement_editor = EditableTable("测量数据", specs, on_change=self.refresh_measurement_preview)
         layout.addWidget(self.measurement_editor)
 
     def _build_boundary_tab(self, parent):
@@ -528,6 +720,13 @@ class ReconstructionMainWindow(QMainWindow):
         self.measurement_editor.set_rows(measurement_rows_from_config(config))
         self.boundary_editor.set_rows(boundary_rows_from_prescribed_dofs(config["prescribed_dofs"]))
         self.true_point_editor.set_rows(true_point_rows_from_config(config))
+        self.refresh_measurement_preview()
+
+    def refresh_measurement_preview(self):
+        if not hasattr(self, "measurement_editor") or not hasattr(self, "measurement_preview"):
+            return
+        preview_data = build_measurement_preview(self.node_x_edit.text(), self.measurement_editor.get_rows())
+        self.measurement_preview.set_preview_data(preview_data)
 
     def run_reconstruction(self):
         try:
@@ -552,7 +751,6 @@ class ReconstructionMainWindow(QMainWindow):
         plot_options = dict(inputs["plot_options"])
         plot_options.pop("figsize", None)
         title = plot_options.pop("title", "直接表面应变矩阵法二维梁形状重构结果")
-        y_limits = plot_options.get("y_limits")
 
         model.plot_on_axes(
             self.axes,
@@ -562,27 +760,40 @@ class ReconstructionMainWindow(QMainWindow):
             show_legend=False,
             **plot_options,
         )
-        self.figure.tight_layout(pad=1.2)
+        self._render_plot_legend()
+        self.figure.tight_layout(pad=1.0, rect=(0.02, 0.02, 0.98, 0.86))
         self.canvas.draw_idle()
-        self._update_legend_summary(plot_options, inputs["true_points"], y_limits)
 
-    def _update_legend_summary(self, plot_options, true_points, y_limits):
-        items = []
-        if plot_options.get("show_original", True):
-            items.append("原始中性层: 黑色虚线")
-        items.append("重构后形状: 蓝色实线")
-        if plot_options.get("show_nodes", True):
-            items.append("重构节点: 蓝色圆点")
-        if true_points:
-            items.append("输入实测点: 红色圆点")
-            items.append("同位置重构点: 绿色方点")
-            if plot_options.get("connect_pairs", True):
-                items.append("实测-重构差异: 灰色虚线")
-        items.append(
-            f"Y轴范围: {y_limits[0]:.6g} ~ {y_limits[1]:.6g}" if y_limits is not None else "Y轴范围: 自动"
+    def _render_plot_legend(self):
+        for legend in list(self.figure.legends):
+            legend.remove()
+
+        handles, labels = self.axes.get_legend_handles_labels()
+        unique = []
+        seen = set()
+        for handle, label in zip(handles, labels):
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            unique.append((handle, label))
+
+        if not unique:
+            return
+
+        legend_handles = [handle for handle, _label in unique]
+        legend_labels = [label for _handle, label in unique]
+        self.figure.legend(
+            legend_handles,
+            legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=min(len(legend_labels), 4),
+            frameon=False,
+            fontsize=9,
+            handlelength=2.0,
+            handletextpad=0.6,
+            columnspacing=1.3,
         )
-        self.legend_summary = "图例说明\n\n" + "\n".join(f"• {item}" for item in items)
-        self.legend_text.setPlainText(self.legend_summary)
 
     def _fill_result_tables(self, model, inputs):
         node_rows = []
@@ -628,10 +839,7 @@ class ReconstructionMainWindow(QMainWindow):
         self.compare_result_table.set_rows(compare_rows)
 
     def _write_message(self, message):
-        if self.legend_summary:
-            self.message_text.setPlainText(f"{message}\n\n{self.legend_summary}")
-        else:
-            self.message_text.setPlainText(message)
+        self.message_text.setPlainText(message)
 
     def _show_error(self, exc):
         message = str(exc)

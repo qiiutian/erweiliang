@@ -23,26 +23,11 @@ def main():
     try:
         import numpy  # noqa: F401
         import matplotlib  # noqa: F401
-    except ModuleNotFoundError as exc:
-        show_startup_error(f"{DEPENDENCY_HINT}\n\n缺失模块：{exc.name}")
-        return 1
-
-    try:
         import PySide6  # noqa: F401
         from gui_qt import launch_app
     except ModuleNotFoundError as exc:
-        if exc.name != "PySide6":
-            show_startup_error(f"{DEPENDENCY_HINT}\n\n缺失模块：{exc.name}")
-            return 1
-        try:
-            from gui import launch_app
-            print(
-                "未安装 PySide6，当前回退到 Tkinter 界面。安装 requirements.txt 后会自动使用新版 Qt 界面。",
-                file=sys.stderr,
-            )
-        except ModuleNotFoundError as fallback_exc:
-            show_startup_error(f"{DEPENDENCY_HINT}\n\n缺失模块：{fallback_exc.name}")
-            return 1
+        show_startup_error(f"{DEPENDENCY_HINT}\n\n缺失模块：{exc.name}")
+        return 1
     except Exception as exc:
         show_startup_error(f"程序启动失败：{exc}\n\n{traceback.format_exc()}")
         return 1

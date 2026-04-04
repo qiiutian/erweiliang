@@ -119,7 +119,7 @@ SAMPLE_CONFIG = {
         "show_original": True,
         "show_nodes": True,
         "equal_axis": False,
-        "annotate_points": True,
+        "annotate_points": False,
         "connect_pairs": True,
         "title": "直接表面应变矩阵法二维梁形状重构结果（积分型，手动分区）",
         "legend_loc": "best",
@@ -187,7 +187,7 @@ def normalize_config(config):
     normalized["plot_options"].setdefault("show_original", True)
     normalized["plot_options"].setdefault("show_nodes", True)
     normalized["plot_options"].setdefault("equal_axis", False)
-    normalized["plot_options"].setdefault("annotate_points", True)
+    normalized["plot_options"].setdefault("annotate_points", False)
     normalized["plot_options"].setdefault("connect_pairs", True)
     normalized["plot_options"].setdefault(
         "title", "直接表面应变矩阵法二维梁形状重构结果"

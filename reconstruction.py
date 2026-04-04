@@ -517,26 +517,53 @@ class IBeam3SurfaceIntegralReconstruction2D:
         show_legend=True,
         y_limits=None,
     ):
+        original_color = "#6b7280"
+        shape_color = "#1d4ed8"
+        node_face_color = "#3b82f6"
+        true_face_color = "#ef4444"
+        rec_face_color = "#16a34a"
+        pair_line_color = "#94a3b8"
+
         X, _, _, X_def, Y_def = self.reconstruct_full_shape(
             points_per_element=points_per_element
         )
         u_node, v_node, _ = self.nodal_results()
 
         ax.clear()
+        ax.set_facecolor("#fbfdff")
+        ax.figure.set_facecolor("white")
 
         if show_original:
             ax.plot(
                 self.node_x,
                 np.zeros_like(self.node_x),
-                "k--",
-                lw=1.0,
+                linestyle=(0, (4, 3)),
+                color=original_color,
+                lw=1.2,
                 label="原始中性层",
             )
 
-        ax.plot(X_def, Y_def, "b-", lw=2.0, label="重构后形状")
+        ax.plot(
+            X_def,
+            Y_def,
+            color=shape_color,
+            lw=2.4,
+            solid_capstyle="round",
+            label="重构后形状",
+        )
 
         if show_nodes:
-            ax.plot(self.node_x + u_node, v_node, "bo", ms=4, label="重构节点")
+            ax.plot(
+                self.node_x + u_node,
+                v_node,
+                linestyle="none",
+                marker="o",
+                ms=5.2,
+                markerfacecolor=node_face_color,
+                markeredgecolor="white",
+                markeredgewidth=0.8,
+                label="重构节点",
+            )
 
         x_span = max(np.max(X_def) - np.min(X_def), 1e-6)
         y_all = np.concatenate([Y_def, np.zeros_like(self.node_x)])
@@ -573,22 +600,61 @@ class IBeam3SurfaceIntegralReconstruction2D:
                 y_rec = v_rec
 
                 if first_true:
-                    ax.plot([x_true], [y_true], "ro", ms=7, label="输入实测点")
+                    ax.plot(
+                        [x_true],
+                        [y_true],
+                        linestyle="none",
+                        marker="o",
+                        ms=8.4,
+                        markerfacecolor=true_face_color,
+                        markeredgecolor="white",
+                        markeredgewidth=0.9,
+                        label="输入实测点",
+                    )
                     first_true = False
                 else:
-                    ax.plot([x_true], [y_true], "ro", ms=7)
+                    ax.plot(
+                        [x_true],
+                        [y_true],
+                        linestyle="none",
+                        marker="o",
+                        ms=8.4,
+                        markerfacecolor=true_face_color,
+                        markeredgecolor="white",
+                        markeredgewidth=0.9,
+                    )
 
                 if first_rec:
-                    ax.plot([x_rec], [y_rec], "gs", ms=6, label="同位置重构点")
+                    ax.plot(
+                        [x_rec],
+                        [y_rec],
+                        linestyle="none",
+                        marker="s",
+                        ms=7.0,
+                        markerfacecolor=rec_face_color,
+                        markeredgecolor="white",
+                        markeredgewidth=0.9,
+                        label="同位置重构点",
+                    )
                     first_rec = False
                 else:
-                    ax.plot([x_rec], [y_rec], "gs", ms=6)
+                    ax.plot(
+                        [x_rec],
+                        [y_rec],
+                        linestyle="none",
+                        marker="s",
+                        ms=7.0,
+                        markerfacecolor=rec_face_color,
+                        markeredgecolor="white",
+                        markeredgewidth=0.9,
+                    )
 
                 if connect_pairs:
                     line_kwargs = {
-                        "linestyle": ":",
-                        "linewidth": 1.2,
-                        "color": "gray",
+                        "linestyle": (0, (2, 2)),
+                        "linewidth": 1.0,
+                        "color": pair_line_color,
+                        "alpha": 0.75,
                     }
                     if i == 1:
                         ax.plot(
@@ -620,14 +686,22 @@ class IBeam3SurfaceIntegralReconstruction2D:
                         xytext=(x_rec - dx, y_rec - dy),
                         textcoords="data",
                         fontsize=9,
-                        color="black",
-                        arrowprops={"arrowstyle": "-", "lw": 0.8, "color": "green"},
+                        color="#111827",
+                        arrowprops={"arrowstyle": "-", "lw": 0.8, "color": rec_face_color},
                     )
 
-        ax.set_xlabel("变形后 x 坐标")
-        ax.set_ylabel("y 坐标")
-        ax.set_title(title)
-        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.set_xlabel("变形后 x 坐标", color="#334155")
+        ax.set_ylabel("y 坐标", color="#334155")
+        ax.set_title(title, pad=10, fontsize=16, color="#0f172a", fontweight="semibold")
+        ax.grid(True, linestyle=(0, (4, 4)), linewidth=0.8, color="#cbd5e1", alpha=0.65)
+        ax.tick_params(colors="#334155")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#94a3b8")
+        ax.spines["bottom"].set_color("#94a3b8")
+        ax.spines["left"].set_linewidth(1.0)
+        ax.spines["bottom"].set_linewidth(1.0)
+        ax.margins(x=0.04, y=0.12)
 
         if y_limits is not None:
             y_min, y_max = float(y_limits[0]), float(y_limits[1])
