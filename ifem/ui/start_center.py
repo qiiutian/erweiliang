@@ -88,7 +88,7 @@ QLabel#startBrandMark {
 }
 QLabel#startBrandTitle {
     color: #1f2c25;
-    font-family: "Iowan Old Style", "Songti SC", "STSong";
+    font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC";
     font-size: 20px;
     font-weight: 700;
 }
@@ -505,7 +505,7 @@ class StartCenterDialog(QDialog):
         layout.addLayout(secondary)
         layout.addStretch(1)
 
-        file_hint = QLabel("项目库")
+        file_hint = QLabel("项目文件 · .ifemproj")
         file_hint.setObjectName("startFileHint")
         file_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(file_hint)

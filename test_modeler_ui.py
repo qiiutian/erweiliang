@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(__file__), ".mplconfig"))
 
 from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
 
@@ -153,6 +154,151 @@ class ModelerUiTests(unittest.TestCase):
         self.assertTrue(window.node_x_edit.hasFocus())
         window.close()
 
+    def test_readiness_badge_and_empty_state_are_actionable(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        self.app.processEvents()
+
+        self.assertIs(
+            window.plot_content_stack.currentWidget(),
+            window.analysis_empty_state,
+        )
+        self.assertEqual(window.analysis_empty_state.action_button.text(), "运行重构")
+
+        window.node_x_edit.setText("0, invalid")
+        self.app.processEvents()
+        self.assertIn("需检查", window.input_status_label.text())
+        self.assertEqual(
+            window.analysis_empty_state.action_button.text(),
+            "定位首个问题",
+        )
+
+        window.input_status_label.click()
+        self.app.processEvents()
+        self.assertEqual(window.left_tabs.currentIndex(), 0)
+        self.assertTrue(window.node_x_edit.hasFocus())
+        window.close()
+
+    def test_stale_result_is_preserved_and_visibly_marked_until_rerun(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.run_reconstruction()
+        original_rows = window.node_result_table.table.rowCount()
+
+        window.thickness_edit.setText("0.0017")
+        self.app.processEvents()
+
+        self.assertTrue(window.results_stale)
+        self.assertFalse(window.result_freshness_label.isHidden())
+        self.assertIn("已过期", window.result_group.title())
+        self.assertEqual(window.node_result_table.table.rowCount(), original_rows)
+
+        window.run_reconstruction()
+        self.assertFalse(window.results_stale)
+        self.assertNotIn("已过期", window.result_group.title())
+        window.close()
+
+    def test_failed_postprocessing_restores_last_result_as_stale(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.run_reconstruction()
+        previous_model = window.current_model
+        previous_first_value = window.node_result_table.table.item(0, 2).text()
+        window.thickness_edit.setText("0.0017")
+
+        with patch.object(
+            gui_qt,
+            "element_boundary_jumps",
+            side_effect=RuntimeError("forced postprocess failure"),
+        ), patch.object(gui_qt.QMessageBox, "critical"):
+            window.run_reconstruction()
+
+        self.assertIs(window.current_model, previous_model)
+        self.assertEqual(
+            window.node_result_table.table.item(0, 2).text(),
+            previous_first_value,
+        )
+        self.assertTrue(window.results_stale)
+        self.assertEqual(window.run_status_label.property("state"), "error")
+        window.close()
+
+    def test_busy_state_cannot_be_reenabled_and_exits_before_error_dialog(self):
+        window = gui_qt.ReconstructionMainWindow()
+        observed = {}
+
+        def fail_while_busy(*_args, **_kwargs):
+            observed["busy_before_refresh"] = window._analysis_busy
+            observed["button_text"] = window.run_button.text()
+            window._refresh_input_readiness()
+            observed["button_enabled_after_refresh"] = window.run_button.isEnabled()
+            observed["action_enabled_after_refresh"] = window.run_action.isEnabled()
+            observed["status_enabled_after_refresh"] = (
+                window.input_status_label.isEnabled()
+            )
+            raise RuntimeError("forced solver failure")
+
+        def inspect_error_dialog(*_args, **_kwargs):
+            observed["busy_during_dialog"] = window._analysis_busy
+            observed["text_during_dialog"] = window.run_button.text()
+            return QMessageBox.StandardButton.Ok
+
+        with patch.object(
+            window.analysis_service,
+            "run",
+            side_effect=fail_while_busy,
+        ), patch.object(
+            gui_qt.QMessageBox,
+            "critical",
+            side_effect=inspect_error_dialog,
+        ):
+            window.run_reconstruction()
+
+        self.assertTrue(observed["busy_before_refresh"])
+        self.assertEqual(observed["button_text"], "计算中…")
+        self.assertFalse(observed["button_enabled_after_refresh"])
+        self.assertFalse(observed["action_enabled_after_refresh"])
+        self.assertFalse(observed["status_enabled_after_refresh"])
+        self.assertFalse(observed["busy_during_dialog"])
+        self.assertEqual(observed["text_during_dialog"], "运行重构")
+        self.assertFalse(window._analysis_busy)
+        window.close()
+
+    def test_result_row_can_be_copied_as_tsv(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.run_reconstruction()
+        window.show()
+        window.result_tabs.setCurrentIndex(window.node_result_tab_index)
+        self.app.processEvents()
+        table = window.node_result_table.table
+        table.selectRow(0)
+        table.setFocus()
+        QApplication.clipboard().clear()
+
+        QTest.keySequence(table, QKeySequence.StandardKey.Copy)
+        self.app.processEvents()
+        copied = QApplication.clipboard().text()
+        self.assertEqual(len(copied.split("\t")), table.columnCount())
+        self.assertEqual(copied.split("\t")[0], table.item(0, 0).text())
+        window.close()
+
+    def test_workspace_navigation_shortcuts_have_scoped_actions(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        self.app.processEvents()
+
+        self.assertEqual(window.run_action.shortcut().toString(), "F5")
+        self.assertEqual(
+            [action.shortcut().toString() for action in window.view_shortcut_actions],
+            ["Ctrl+1", "Ctrl+2", "Ctrl+3"],
+        )
+        self.assertEqual(
+            [action.shortcut().toString() for action in window.input_tab_actions],
+            ["Alt+1", "Alt+2", "Alt+3", "Alt+4", "Alt+5"],
+        )
+        window._focus_input_tab(4)
+        self.app.processEvents()
+        self.assertEqual(window.left_tabs.currentIndex(), 4)
+        self.assertTrue(window.json_text.hasFocus())
+        window.close()
+
     def test_field_feedback_targets_thickness_and_clears_stale_tooltip(self):
         window = gui_qt.ReconstructionMainWindow()
         base_tooltip = window.thickness_edit.toolTip()
@@ -173,6 +319,7 @@ class ModelerUiTests(unittest.TestCase):
 
     def test_measurement_parse_error_is_reported_on_sensor_tab(self):
         window = gui_qt.ReconstructionMainWindow()
+        window.show()
         editor = window.measurement_editor
         editor.table.selectRow(0)
         editor.inputs["strain"].setText("invalid")
@@ -183,6 +330,41 @@ class ModelerUiTests(unittest.TestCase):
         self.assertIn("测量数据", editor.count_label.toolTip())
         self.assertIn("·", window.left_tabs.tabText(1))
         self.assertFalse(window.run_button.isEnabled())
+        window.input_status_label.click()
+        self.app.processEvents()
+        self.assertEqual(window.left_tabs.currentIndex(), 1)
+        self.assertTrue(editor.inputs["strain"].hasFocus())
+        self.assertEqual(editor.inputs["strain"].selectedText(), "invalid")
+        window.close()
+
+    def test_mixed_display_and_algorithm_issues_keep_error_action(self):
+        window = gui_qt.ReconstructionMainWindow()
+        spatial_project = PathBeamEditor.create_circular_arc(
+            window.current_project_document,
+            radius=2.0,
+            sweep_degrees=90.0,
+            plane="xz",
+        )
+        window._apply_project_document(
+            spatial_project,
+            dirty=False,
+            status_text="空间模型已载入",
+        )
+        window.show()
+        window.y_min_edit.setText("invalid")
+        window.y_max_edit.setText("1")
+        self.app.processEvents()
+
+        self.assertIn("需检查", window.input_status_label.text())
+        self.assertNotIn("等待算法", window.input_status_label.text())
+        self.assertEqual(
+            window.analysis_empty_state.action_button.text(),
+            "定位首个问题",
+        )
+        window.input_status_label.click()
+        self.app.processEvents()
+        self.assertTrue(window.display_settings_panel.isVisible())
+        self.assertTrue(window.y_min_edit.hasFocus())
         window.close()
 
     def test_display_settings_are_saved_in_view_state(self):
@@ -943,6 +1125,33 @@ class ModelerUiTests(unittest.TestCase):
         self.assertIn("测点布置请在建模视图查看", view.interaction_hint.text())
         self.assertFalse(hasattr(view, "show_sensors_check"))
         view.close()
+
+    def test_modeler_actions_describe_persistence_and_replacement(self):
+        dialog = BeamModelerDialog(project_from_legacy_config(get_sample_config()))
+
+        self.assertEqual(dialog.save_project_button.text(), "保存项目")
+        self.assertIn("项目库", dialog.save_project_button.toolTip())
+        self.assertEqual(dialog.apply_to_workspace_button.text(), "应用到工作台")
+        self.assertIn("不会自动写入", dialog.apply_to_workspace_button.toolTip())
+        self.assertEqual(dialog.generate_button.text(), "替换当前路径")
+        self.assertIn("清空", dialog.generate_button.toolTip())
+        dialog.close()
+
+    def test_replacing_path_confirms_when_only_boundaries_would_be_cleared(self):
+        project = project_from_legacy_config(get_sample_config()).revised(sensors=())
+        self.assertTrue(project.boundary_conditions)
+        dialog = BeamModelerDialog(project)
+
+        with patch(
+            "ifem.ui.modeler.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as confirm:
+            dialog._generate_geometry()
+
+        confirm.assert_called_once()
+        self.assertIn("边界约束", confirm.call_args.args[2])
+        self.assertEqual(dialog.project.to_dict(), project.to_dict())
+        dialog.close()
 
 
 if __name__ == "__main__":

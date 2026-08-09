@@ -1,3 +1,4 @@
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -9,7 +10,7 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -546,26 +547,31 @@ QLabel#statusBadge[state="error"] {
     background: #f6e3de;
     border: 1px solid #e9c6bc;
 }
-QLabel#inputBadge {
+QPushButton#inputBadge {
+    min-height: 26px;
     border-radius: 10px;
-    padding: 3px 9px;
+    padding: 1px 10px;
     font-size: 11px;
     font-weight: 700;
 }
-QLabel#inputBadge[state="ready"] {
+QPushButton#inputBadge[state="ready"] {
     color: #315b46;
     background: #e1eee5;
     border: 1px solid #bfd6c6;
 }
-QLabel#inputBadge[state="pending"] {
+QPushButton#inputBadge[state="pending"] {
     color: #796334;
     background: #f5edd9;
     border: 1px solid #e5d6ae;
 }
-QLabel#inputBadge[state="error"] {
+QPushButton#inputBadge[state="error"] {
     color: #934b3d;
     background: #f6e3de;
     border: 1px solid #e9c6bc;
+}
+QPushButton#inputBadge:hover, QPushButton#inputBadge:focus {
+    border-width: 2px;
+    padding: 0 9px;
 }
 QGroupBox {
     background: #ffffff;
@@ -758,6 +764,51 @@ QFrame#plotMetaBar {
     background: transparent;
     border: none;
     border-bottom: 1px solid #e4e9e5;
+}
+QLabel#resultFreshness {
+    min-height: 22px;
+    padding: 0 8px;
+    border-radius: 9px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QFrame#analysisEmptyState {
+    border: 1px solid #dce4de;
+    border-radius: 8px;
+}
+QLabel#analysisEmptyEyebrow {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+QLabel#analysisEmptyTitle {
+    font-size: 20px;
+    font-weight: 700;
+}
+QLabel#analysisEmptyDescription, QLabel#analysisEmptyIssue {
+    font-size: 12px;
+}
+QFrame#analysisWorkflow {
+    border: none;
+    border-radius: 9px;
+}
+QFrame#analysisStep {
+    border: 1px solid transparent;
+    border-radius: 7px;
+}
+QLabel#analysisStepMarker {
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLabel#analysisStepLabel {
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#emptyStateAction {
+    min-height: 36px;
+    padding: 0 18px;
+    font-weight: 700;
 }
 QLabel#plotContext {
     color: #31463a;
@@ -956,6 +1007,11 @@ QTabBar::tab:selected {
 QTabBar::tab:hover:!selected {
     color: #36483d;
     background: #edf2ee;
+}
+QTabWidget#resultTabs QTabBar::tab {
+    min-width: 0;
+    min-height: 30px;
+    padding: 0 9px;
 }
 QTableWidget {
     color: #2c3931;
@@ -1448,18 +1504,76 @@ class EditableTable(QWidget):
         style.polish(self.count_label)
         self.count_label.update()
 
+    def focus_validation_issue(self, message=""):
+        """Reveal the row and form field most likely responsible for an error."""
+        text = str(message or "")
+        row_match = re.search(r"第\s*(\d+)\s*(?:条|个)", text)
+        row = int(row_match.group(1)) - 1 if row_match else self.table.currentRow()
+        if not 0 <= row < self.table.rowCount():
+            row = 0 if self.table.rowCount() else -1
+        if row >= 0:
+            self.table.selectRow(row)
+            self.on_selection_changed()
+
+        field_terms = (
+            ("量长起点", "zone_a"),
+            ("量长终点", "zone_b"),
+            ("单元号", "element"),
+            ("节点号", "node"),
+            ("自由度", "dof"),
+            ("约束值", "value"),
+            ("截面 y", "y"),
+            ("surface", "surface"),
+            ("应变", "strain"),
+            ("权重", "weight"),
+            ("的 u", "u"),
+            ("的 v", "v"),
+            ("的 x", "x"),
+        )
+        field_key = next(
+            (
+                key
+                for term, key in field_terms
+                if term in text and key in self.inputs
+            ),
+            None,
+        )
+        if field_key is None:
+            field_key = next(iter(self.inputs), None)
+        target = self.inputs.get(field_key)
+        if target is None:
+            self.table.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        if hasattr(self, "editor_tabs"):
+            form_page = target.parentWidget()
+            tab_index = self.editor_tabs.indexOf(form_page)
+            if tab_index >= 0:
+                self.editor_tabs.setCurrentIndex(tab_index)
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        if isinstance(target, QLineEdit):
+            target.selectAll()
+
     def _emit_change(self):
         if callable(self.on_change):
             self.on_change()
 
 
 class ReadOnlyTable(QWidget):
-    def __init__(self, columns, headings, parent=None, stretch_columns=True):
+    def __init__(
+        self,
+        columns,
+        headings,
+        parent=None,
+        stretch_columns=True,
+        *,
+        accessible_name="结果数据表",
+    ):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(4, 4, 4, 4)
         self.table = QTableWidget(0, len(columns))
         self.columns = columns
+        self.headings = headings
         self.table.setHorizontalHeaderLabels(headings)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1469,6 +1583,11 @@ class ReadOnlyTable(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setWordWrap(False)
+        self.table.setAccessibleName(accessible_name)
+        self.table.setAccessibleDescription(
+            "只读科学结果表。选择一行后使用复制快捷键可导出为制表符分隔文本。"
+        )
+        self.table.setToolTip("选择一行后按 Ctrl+C（macOS 为 ⌘C）复制数据")
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(76)
@@ -1478,6 +1597,28 @@ class ReadOnlyTable(QWidget):
             header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
             header.setStretchLastSection(True)
         layout.addWidget(self.table)
+
+        self.copy_action = QAction("复制所选行", self)
+        self.copy_action.triggered.connect(self.copy_selected_row)
+        self.table.addAction(self.copy_action)
+        self.copy_shortcut = QShortcut(
+            QKeySequence.StandardKey.Copy,
+            self.table,
+        )
+        self.copy_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        self.copy_shortcut.activated.connect(self.copy_selected_row)
+
+    def copy_selected_row(self):
+        """Copy the current result row as TSV for spreadsheets and reports."""
+        row = self.table.currentRow()
+        if row < 0:
+            return False
+        values = []
+        for column in range(self.table.columnCount()):
+            item = self.table.item(row, column)
+            values.append("" if item is None else item.text())
+        QApplication.clipboard().setText("\t".join(values))
+        return True
 
     def set_rows(self, rows):
         self.table.setRowCount(0)
@@ -1490,6 +1631,154 @@ class ReadOnlyTable(QWidget):
                 item.setTextAlignment(alignment | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, col, item)
             self.table.setRowHeight(row, 30)
+
+
+class AnalysisEmptyState(QFrame):
+    """Actionable pre-analysis state shown instead of an inert blank plot."""
+
+    action_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("analysisEmptyState")
+        self.setAccessibleName("分析准备状态")
+
+        root = QVBoxLayout(self)
+        self.root_layout = root
+        root.setContentsMargins(40, 24, 40, 24)
+        root.setSpacing(10)
+        root.addStretch(2)
+
+        self.eyebrow_label = QLabel("分析流程")
+        self.eyebrow_label.setObjectName("analysisEmptyEyebrow")
+        self.eyebrow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self.eyebrow_label)
+
+        self.title_label = QLabel("正在检查输入")
+        self.title_label.setObjectName("analysisEmptyTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setWordWrap(True)
+        root.addWidget(self.title_label)
+
+        self.description_label = QLabel("模型、测点与约束会在这里汇总。")
+        self.description_label.setObjectName("analysisEmptyDescription")
+        self.description_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.description_label.setWordWrap(True)
+        root.addWidget(self.description_label)
+
+        self.workflow = QFrame()
+        self.workflow.setObjectName("analysisWorkflow")
+        self.workflow.setMinimumHeight(38)
+        workflow_layout = QHBoxLayout(self.workflow)
+        workflow_layout.setContentsMargins(8, 7, 8, 7)
+        workflow_layout.setSpacing(7)
+        self.step_frames = []
+        self.step_markers = []
+        for index, text in enumerate(("检查输入", "运行重构", "查看结果"), start=1):
+            step = QFrame()
+            step.setObjectName("analysisStep")
+            step_layout = QHBoxLayout(step)
+            step_layout.setContentsMargins(9, 5, 9, 5)
+            step_layout.setSpacing(6)
+            marker = QLabel(str(index))
+            marker.setObjectName("analysisStepMarker")
+            marker.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            marker.setFixedSize(20, 20)
+            label = QLabel(text)
+            label.setObjectName("analysisStepLabel")
+            step_layout.addWidget(marker)
+            step_layout.addWidget(label)
+            workflow_layout.addWidget(step, 1)
+            self.step_frames.append(step)
+            self.step_markers.append(marker)
+        root.addWidget(self.workflow)
+
+        self.issue_label = QLabel()
+        self.issue_label.setObjectName("analysisEmptyIssue")
+        self.issue_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.issue_label.setWordWrap(True)
+        self.issue_label.setMinimumHeight(34)
+        root.addWidget(self.issue_label)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        self.action_button = QPushButton("检查输入")
+        self.action_button.setObjectName("emptyStateAction")
+        self.action_button.setMinimumWidth(168)
+        self.action_button.clicked.connect(
+            lambda _checked=False: self.action_requested.emit()
+        )
+        action_row.addWidget(self.action_button)
+        action_row.addStretch(1)
+        root.addLayout(action_row)
+        root.addStretch(3)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        compact = self.height() < 280
+        self.eyebrow_label.setVisible(not compact)
+        if compact:
+            self.root_layout.setContentsMargins(24, 10, 24, 10)
+            self.root_layout.setSpacing(6)
+            self.issue_label.setMinimumHeight(22)
+        else:
+            self.root_layout.setContentsMargins(40, 24, 40, 24)
+            self.root_layout.setSpacing(10)
+            self.issue_label.setMinimumHeight(34)
+
+    @staticmethod
+    def _apply_state(widget, state):
+        widget.setProperty("state", state)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def set_readiness(self, issues, *, waiting_for_algorithm=False):
+        issues = list(issues or [])
+        if issues:
+            count = len(issues)
+            if waiting_for_algorithm:
+                self.title_label.setText("模型已保存，正在等待可用算法")
+                self.description_label.setText(
+                    "当前几何超出已接入求解器的能力范围，配置不会丢失。"
+                )
+                self.action_button.setText("查看算法说明")
+            else:
+                self.title_label.setText("先完成输入检查")
+                self.description_label.setText(
+                    f"发现 {count} 项需要处理；定位后可直接回到这里运行重构。"
+                )
+                self.action_button.setText("定位首个问题")
+            first_message = str(issues[0].get("message", "请检查当前输入。"))
+            self.issue_label.setText(first_message)
+            self.issue_label.setToolTip("\n".join(
+                str(issue.get("message", "")) for issue in issues[:4]
+            ))
+            states = ("active", "waiting", "waiting")
+            markers = ("1", "2", "3")
+        else:
+            self.title_label.setText("输入已就绪，可以开始重构")
+            self.description_label.setText(
+                "运行后可在形态、应变与应力之间切换，并复制精确结果数据。"
+            )
+            self.issue_label.setText("所有必填项和当前算法兼容性检查均已通过")
+            self.issue_label.setToolTip("")
+            self.action_button.setText("运行重构")
+            states = ("done", "active", "waiting")
+            markers = ("✓", "2", "3")
+
+        for frame, marker, state, marker_text in zip(
+            self.step_frames,
+            self.step_markers,
+            states,
+            markers,
+        ):
+            marker.setText(marker_text)
+            self._apply_state(frame, state)
+            self._apply_state(marker, state)
+        self.setAccessibleDescription(
+            f"{self.title_label.text()}。{self.issue_label.text()}"
+        )
+        self.action_button.setAccessibleName(self.action_button.text())
 
 
 class MeasurementPreviewWidget(QWidget):
@@ -1509,7 +1798,7 @@ class MeasurementPreviewWidget(QWidget):
             "node_count": 0,
         }
         self._hovered_item_key = None
-        self.setMinimumHeight(205)
+        self.setMinimumHeight(140)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
 
@@ -2077,6 +2366,8 @@ class ReconstructionMainWindow(QMainWindow):
         self.current_project_document = None
         self.current_project_path = None
         self.project_dirty = False
+        self.results_stale = False
+        self._analysis_busy = False
         self.result_sequence = 0
         self.current_view = "stress"
         self._field_colorbar = None
@@ -2192,8 +2483,17 @@ class ReconstructionMainWindow(QMainWindow):
         self.run_button.setObjectName("primaryButton")
         self.run_button.setToolTip("校验当前输入并计算梁的重构形状（Ctrl+Return）")
         self.run_button.setShortcut(QKeySequence("Ctrl+Return"))
+        self.run_button.setAccessibleName("运行重构")
+        self.run_button.setAccessibleDescription(
+            "校验模型、测点、约束和算法参数后运行当前重构方案。"
+        )
         self.run_button.clicked.connect(self.run_reconstruction)
         toolbar.addWidget(self.run_button)
+        self.run_action = QAction("运行重构", self)
+        self.run_action.setShortcut(QKeySequence("F5"))
+        self.run_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.run_action.triggered.connect(self.run_reconstruction)
+        self.addAction(self.run_action)
         root_layout.addWidget(top_bar)
 
         main_split = QSplitter(Qt.Orientation.Horizontal)
@@ -2225,11 +2525,15 @@ class ReconstructionMainWindow(QMainWindow):
         left_title_box.addWidget(left_hint)
         left_heading.addLayout(left_title_box)
         left_heading.addStretch(1)
-        self.input_status_label = QLabel("检查中")
+        self.input_status_label = QPushButton("检查中")
         self.input_status_label.setObjectName("inputBadge")
         self.input_status_label.setProperty("state", "pending")
-        self.input_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.input_status_label.setToolTip("显示当前模型、测点、约束和分析参数是否可运行")
+        self.input_status_label.setAccessibleName("输入就绪状态")
+        self.input_status_label.setAccessibleDescription(
+            "激活后定位首个输入问题；全部就绪时运行重构。"
+        )
+        self.input_status_label.clicked.connect(self._activate_input_status)
         left_heading.addWidget(
             self.input_status_label,
             0,
@@ -2243,18 +2547,24 @@ class ReconstructionMainWindow(QMainWindow):
         left_layout.addWidget(left_split, 1)
 
         self.left_tabs = QTabWidget()
+        self.left_tabs.setAccessibleName("模型与输入工作区")
         left_split.addWidget(self.left_tabs)
         self._build_left_tabs()
 
         preview_group = QGroupBox("梁与传感器布置")
         preview_group.setObjectName("workspaceGroup")
-        preview_group.setMinimumHeight(210)
+        preview_group.setMinimumHeight(150)
         preview_layout = QVBoxLayout(preview_group)
         preview_layout.setContentsMargins(8, 8, 8, 8)
         self.measurement_preview = MeasurementPreviewWidget()
+        self.measurement_preview.setMinimumHeight(140)
+        self.measurement_preview.setAccessibleName("梁与传感器布置预览")
+        self.measurement_preview.setAccessibleDescription(
+            "根据当前节点坐标和测点表显示梁、节点与测点位置。"
+        )
         preview_layout.addWidget(self.measurement_preview)
         left_split.addWidget(preview_group)
-        left_split.setSizes([530, 220])
+        left_split.setSizes([550, 170])
         left_split.setStretchFactor(0, 3)
         left_split.setStretchFactor(1, 1)
         self.refresh_measurement_preview()
@@ -2362,6 +2672,20 @@ class ReconstructionMainWindow(QMainWindow):
             self.view_buttons[mode] = button
             view_toolbar_layout.addWidget(button)
         self.view_buttons["stress"].setChecked(True)
+        self.view_shortcut_actions = []
+        for index, mode in enumerate(("shape", "strain", "stress"), start=1):
+            shortcut = f"Ctrl+{index}"
+            action = QAction(f"切换到{self.view_buttons[mode].text()}结果", self)
+            action.setShortcut(QKeySequence(shortcut))
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            action.triggered.connect(
+                lambda _checked=False, selected=mode: self._switch_view(selected)
+            )
+            self.addAction(action)
+            self.view_shortcut_actions.append(action)
+            self.view_buttons[mode].setToolTip(
+                f"{self.view_buttons[mode].toolTip()}（{shortcut}）"
+            )
 
         toolbar_divider = QFrame()
         toolbar_divider.setObjectName("toolbarDivider")
@@ -2449,6 +2773,15 @@ class ReconstructionMainWindow(QMainWindow):
         self.view_context_label = QLabel("二维结果 · 轴向应力")
         self.view_context_label.setObjectName("plotContext")
         plot_meta_layout.addWidget(self.view_context_label)
+        self.result_freshness_label = QLabel("结果已过期")
+        self.result_freshness_label.setObjectName("resultFreshness")
+        self.result_freshness_label.setProperty("state", "stale")
+        self.result_freshness_label.setToolTip(
+            "输入已修改；当前图表仍保留上一次计算结果，请重新运行后再用于判断。"
+        )
+        self.result_freshness_label.setAccessibleName("结果已过期")
+        self.result_freshness_label.hide()
+        plot_meta_layout.addWidget(self.result_freshness_label)
         plot_meta_layout.addStretch(1)
         self.view_meta_label = QLabel()
         self.view_meta_label.setObjectName("viewMeta")
@@ -2471,54 +2804,83 @@ class ReconstructionMainWindow(QMainWindow):
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.canvas.setAccessibleName("二维重构结果图")
+        self.canvas.setAccessibleDescription(
+            "显示重构形态、轴向应变或轴向应力；结果数值可在下方表格读取。"
+        )
         canvas_layout.addWidget(self.canvas)
 
         self.visualization_stack = QStackedWidget()
+        self.visualization_stack.setAccessibleName("结果可视化视口")
         self.visualization_stack.addWidget(canvas_container)
         self.structure_3d_view = Structure3DView()
         self.visualization_stack.addWidget(self.structure_3d_view)
-        plot_group_layout.addWidget(self.visualization_stack, 1)
+
+        self.plot_content_stack = QStackedWidget()
+        self.plot_content_stack.setObjectName("plotContentStack")
+        self.analysis_empty_state = AnalysisEmptyState()
+        self.analysis_empty_state.action_requested.connect(
+            self._activate_empty_state_action
+        )
+        self.plot_content_stack.addWidget(self.analysis_empty_state)
+        self.plot_content_stack.addWidget(self.visualization_stack)
+        plot_group_layout.addWidget(self.plot_content_stack, 1)
 
         result_group = QGroupBox("结果数据")
         self.result_group = result_group
         result_group.setObjectName("workspaceGroup")
-        result_group.setMinimumHeight(175)
+        result_group.setMinimumHeight(145)
         result_layout = QVBoxLayout(result_group)
-        result_layout.setContentsMargins(8, 12, 8, 8)
+        result_layout.setContentsMargins(6, 8, 6, 5)
         right_split.addWidget(result_group)
-        right_split.setSizes([665, 215])
+        right_split.setSizes([700, 155])
         right_split.setStretchFactor(0, 4)
         right_split.setStretchFactor(1, 1)
 
         self.result_tabs = QTabWidget()
+        self.result_tabs.setObjectName("resultTabs")
+        self.result_tabs.setAccessibleName("重构结果数据")
         result_layout.addWidget(self.result_tabs)
 
         self.node_result_table = ReadOnlyTable(
             columns=["节点", "x坐标", "u位移", "v位移", "转角phi"],
             headings=["节点", "x坐标", "u位移", "v位移", "转角phi"],
+            accessible_name="节点重构结果表",
         )
         self.query_result_table = ReadOnlyTable(
             columns=["序号", "x", "u", "v"],
             headings=["序号", "x坐标", "u位移", "v位移"],
+            accessible_name="查询点位移结果表",
         )
         self.compare_result_table = ReadOnlyTable(
             columns=["序号", "标签", "x", "u_实测", "v_实测", "u_重构", "v_重构", "Δu", "Δv"],
             headings=["序号", "标签", "x坐标", "u实测", "v实测", "u重构", "v重构", "Δu", "Δv"],
             stretch_columns=False,
+            accessible_name="实测与重构对比表",
         )
         self.field_result_table = ReadOnlyTable(
             columns=["序号", "x", "上表面应变", "下表面应变", "上表面应力", "下表面应力"],
             headings=["序号", "x坐标", "上表面应变 με", "下表面应变 με", "上表面应力 MPa", "下表面应力 MPa"],
             stretch_columns=False,
+            accessible_name="截面应变应力场结果表",
         )
         self.message_text = QTextEdit()
         self.message_text.setReadOnly(True)
+        self.message_text.setAccessibleName("运行信息")
 
-        self.result_tabs.addTab(self.node_result_table, "节点结果")
-        self.result_tabs.addTab(self.query_result_table, "查询结果")
-        self.result_tabs.addTab(self.compare_result_table, "实测对比")
+        self.node_result_tab_index = self.result_tabs.addTab(
+            self.node_result_table, "节点结果"
+        )
+        self.query_result_tab_index = self.result_tabs.addTab(
+            self.query_result_table, "查询结果"
+        )
+        self.compare_result_tab_index = self.result_tabs.addTab(
+            self.compare_result_table, "实测对比"
+        )
         self.field_result_tab_index = self.result_tabs.addTab(self.field_result_table, "截面场")
-        self.result_tabs.addTab(self.message_text, "运行信息")
+        self.message_result_tab_index = self.result_tabs.addTab(
+            self.message_text, "运行信息"
+        )
 
         main_split.setSizes([520, 1100])
         main_split.setStretchFactor(0, 1)
@@ -2576,7 +2938,18 @@ class ReconstructionMainWindow(QMainWindow):
             "项目 JSON 数据检查与交换",
         )
         for index, tooltip in enumerate(self._left_tab_tooltips):
-            self.left_tabs.setTabToolTip(index, tooltip)
+            self.left_tabs.setTabToolTip(index, f"{tooltip}（Alt+{index + 1}）")
+
+        self.input_tab_actions = []
+        for index, name in enumerate(self.left_tab_names):
+            action = QAction(f"打开{name}输入页", self)
+            action.setShortcut(QKeySequence(f"Alt+{index + 1}"))
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            action.triggered.connect(
+                lambda _checked=False, selected=index: self._focus_input_tab(selected)
+            )
+            self.addAction(action)
+            self.input_tab_actions.append(action)
 
         self._build_basic_tab(basic_tab)
         self._build_measure_tab(measure_tab)
@@ -2649,10 +3022,17 @@ class ReconstructionMainWindow(QMainWindow):
 
         node_label = QLabel("节点坐标 node_x")
         node_label.setObjectName("fieldLabel")
+        node_label.setBuddy(self.node_x_edit)
         thickness_label = QLabel("梁厚度")
         thickness_label.setObjectName("fieldLabel")
+        thickness_label.setBuddy(self.thickness_edit)
         elastic_modulus_label = QLabel("弹性模量 E (GPa)")
         elastic_modulus_label.setObjectName("fieldLabel")
+        elastic_modulus_label.setBuddy(self.elastic_modulus_edit)
+        self.node_x_edit.setAccessibleName("节点坐标")
+        self.thickness_edit.setAccessibleName("梁厚度")
+        self.elastic_modulus_edit.setAccessibleName("弹性模量")
+        self.query_xs_edit.setAccessibleName("位移查询点")
 
         grid.addWidget(node_label, 0, 0)
         grid.addWidget(self.node_x_edit, 0, 1, 1, 3)
@@ -2682,6 +3062,7 @@ class ReconstructionMainWindow(QMainWindow):
         query_row.setSpacing(10)
         query_label = QLabel("位移查询点")
         query_label.setObjectName("fieldLabel")
+        query_label.setBuddy(self.query_xs_edit)
         query_row.addWidget(query_label)
         query_row.addWidget(self.query_xs_edit, 1)
         analysis_layout.addLayout(query_row)
@@ -2939,8 +3320,10 @@ class ReconstructionMainWindow(QMainWindow):
         self._set_project_dirty(True)
         if self.current_model is None:
             self._set_run_status("参数待运行", "idle")
+            self._set_result_freshness(False)
         else:
             self._set_run_status("参数已修改 · 请重新运行", "stale")
+            self._set_result_freshness(True)
         self._refresh_input_readiness()
 
     @staticmethod
@@ -2960,7 +3343,11 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _readiness_issue_target(self, message):
         text = str(message)
-        if "Y 轴" in text or "Y轴" in text or "plot_options" in text or "显示" in text:
+        if "厚度显示倍率" in text:
+            return 0, self.thickness_scale_combo
+        if "Y 轴" in text or "Y轴" in text:
+            return 0, self.y_min_edit if "最小" in text else self.y_max_edit
+        if "plot_options" in text or "显示" in text:
             return 0, self.display_settings_button
         if "node_x" in text or "节点" in text:
             return 0, self.node_x_edit
@@ -2986,7 +3373,44 @@ class ReconstructionMainWindow(QMainWindow):
             if count:
                 self.left_tabs.setTabToolTip(index, "\n".join(messages[index]))
             else:
-                self.left_tabs.setTabToolTip(index, self._left_tab_tooltips[index])
+                self.left_tabs.setTabToolTip(
+                    index,
+                    f"{self._left_tab_tooltips[index]}（Alt+{index + 1}）",
+                )
+
+    def _focus_input_tab(self, index):
+        if not 0 <= int(index) < self.left_tabs.count():
+            return
+        index = int(index)
+        self.left_tabs.setCurrentIndex(index)
+        targets = (
+            self.node_x_edit,
+            self.measurement_editor.table,
+            self.boundary_editor.table,
+            self.true_point_editor.table,
+            self.json_text,
+        )
+        target = targets[index]
+        target.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _activate_input_status(self):
+        if self._analysis_busy:
+            return
+        if self._readiness_issues:
+            self._focus_first_input_issue()
+            return
+        self.run_reconstruction()
+
+    def _activate_empty_state_action(self):
+        self._activate_input_status()
+
+    def _sync_empty_state(self, *, waiting_for_algorithm=False):
+        if not hasattr(self, "analysis_empty_state"):
+            return
+        self.analysis_empty_state.set_readiness(
+            self._readiness_issues,
+            waiting_for_algorithm=waiting_for_algorithm,
+        )
 
     def _focus_first_input_issue(self):
         if not self._readiness_issues:
@@ -2995,8 +3419,17 @@ class ReconstructionMainWindow(QMainWindow):
         tab_index = issue["tab"]
         widget = issue.get("widget")
         self.left_tabs.setCurrentIndex(tab_index)
+        if widget in {
+            self.y_min_edit,
+            self.y_max_edit,
+            self.thickness_scale_combo,
+        }:
+            self.display_settings_button.setChecked(True)
         if widget is not None:
-            widget.setFocus(Qt.FocusReason.OtherFocusReason)
+            if isinstance(widget, EditableTable):
+                widget.focus_validation_issue(issue["message"])
+            else:
+                widget.setFocus(Qt.FocusReason.OtherFocusReason)
             if isinstance(widget, QLineEdit):
                 widget.selectAll()
         self.statusBar().showMessage(issue["message"], 7000)
@@ -3010,6 +3443,9 @@ class ReconstructionMainWindow(QMainWindow):
             self.thickness_edit,
             self.elastic_modulus_edit,
             self.query_xs_edit,
+            self.y_min_edit,
+            self.y_max_edit,
+            self.thickness_scale_combo,
             self.display_settings_button,
         ):
             self._set_validation_state(widget)
@@ -3035,9 +3471,22 @@ class ReconstructionMainWindow(QMainWindow):
                 self.thickness_edit,
                 self.elastic_modulus_edit,
                 self.query_xs_edit,
+                self.y_min_edit,
+                self.y_max_edit,
+                self.thickness_scale_combo,
                 self.display_settings_button,
             }:
                 self._set_validation_state(widget, "error", str(message))
+                if widget in {
+                    self.y_min_edit,
+                    self.y_max_edit,
+                    self.thickness_scale_combo,
+                }:
+                    self._set_validation_state(
+                        self.display_settings_button,
+                        "error",
+                        str(message),
+                    )
             elif widget is self.measurement_editor:
                 self.measurement_editor.set_validation_state("error", str(message))
             elif widget is self.boundary_editor:
@@ -3079,27 +3528,58 @@ class ReconstructionMainWindow(QMainWindow):
         self._readiness_issues = issues
         self._update_readiness_tabs(tab_counts, tab_messages)
         if issues:
-            has_algorithm_only = all(issue["tab"] == 0 for issue in issues) and any(
-                "算法" in issue["message"] or "求解入口" in issue["message"]
+            algorithm_terms = (
+                "算法",
+                "求解入口",
+                "插件",
+                "不适用",
+                "不支持",
+            )
+            has_algorithm_only = all(
+                any(term in issue["message"] for term in algorithm_terms)
                 for issue in issues
             )
             state = "pending" if has_algorithm_only else "error"
             self.input_status_label.setText(
-                "等待算法" if has_algorithm_only else f"需检查 · {len(issues)}"
+                "等待算法  ›"
+                if has_algorithm_only
+                else f"需检查 · {len(issues)}  ›"
             )
         else:
+            has_algorithm_only = False
             state = "ready"
-            self.input_status_label.setText("可运行")
+            self.input_status_label.setText("可运行  ›")
         self.input_status_label.setProperty("state", state)
         self.input_status_label.setToolTip(
-            "可运行" if not issues else "\n".join(issue["message"] for issue in issues[:4])
+            "输入已就绪；点击运行重构（Ctrl+Return 或 F5）"
+            if not issues
+            else "点击定位首个问题\n" + "\n".join(
+                issue["message"] for issue in issues[:4]
+            )
+        )
+        self.input_status_label.setAccessibleDescription(
+            "输入已就绪，激活后运行重构。"
+            if not issues
+            else f"发现 {len(issues)} 项问题，激活后定位首个问题。"
         )
         style = self.input_status_label.style()
         style.unpolish(self.input_status_label)
         style.polish(self.input_status_label)
         self.input_status_label.update()
-        can_run = not issues and capability is not None and capability.legacy_solver_compatible
+        self._sync_empty_state(waiting_for_algorithm=has_algorithm_only)
+        can_run = (
+            not issues
+            and capability is not None
+            and capability.legacy_solver_compatible
+            and not self._analysis_busy
+        )
         self.run_button.setEnabled(bool(can_run))
+        self.run_action.setEnabled(bool(can_run))
+        self.input_status_label.setEnabled(not self._analysis_busy)
+        if hasattr(self, "analysis_empty_state"):
+            self.analysis_empty_state.action_button.setEnabled(
+                not self._analysis_busy
+            )
         return bool(can_run)
 
     def _set_run_status(self, text, state):
@@ -3111,6 +3591,85 @@ class ReconstructionMainWindow(QMainWindow):
         style.unpolish(self.run_status_label)
         style.polish(self.run_status_label)
         self.run_status_label.update()
+
+    def _set_analysis_busy(self, busy):
+        self._analysis_busy = bool(busy)
+        self.run_button.setText("计算中…" if busy else "运行重构")
+        self.run_button.setAccessibleName(self.run_button.text())
+        self.run_button.setEnabled(False if busy else not self._readiness_issues)
+        self.run_action.setEnabled(False if busy else not self._readiness_issues)
+        self.input_status_label.setEnabled(not busy)
+        if hasattr(self, "analysis_empty_state"):
+            self.analysis_empty_state.action_button.setEnabled(not busy)
+        if busy:
+            self.setCursor(Qt.CursorShape.WaitCursor)
+        else:
+            self.unsetCursor()
+
+    def _set_result_freshness(self, stale):
+        self.results_stale = bool(stale and self.current_model is not None)
+        if hasattr(self, "result_freshness_label"):
+            self.result_freshness_label.setVisible(self.results_stale)
+        if hasattr(self, "result_group"):
+            self.result_group.setTitle(
+                "结果数据 · 已过期" if self.results_stale else "结果数据"
+            )
+        if self.results_stale:
+            self.statusBar().showMessage(
+                "输入已修改；当前仍显示上一次结果，请重新运行。",
+                6000,
+            )
+
+    def _capture_analysis_result_state(self):
+        return {
+            "current_model": self.current_model,
+            "current_config": self.current_config,
+            "current_inputs": self.current_inputs,
+            "current_field": self.current_field,
+            "current_raw_field": self.current_raw_field,
+            "current_recovered_field": self.current_recovered_field,
+            "current_visual_model": self.current_visual_model,
+            "current_result_frame": self.current_result_frame,
+            "current_view": self.current_view,
+            "result_sequence": self.result_sequence,
+            "result_tab_index": self.result_tabs.currentIndex(),
+            "visualization_index": self.visualization_stack.currentIndex(),
+            "json_text": self.json_text.toPlainText(),
+            "metrics": {
+                key: label.text()
+                for key, label in self.analysis_metric_labels.items()
+            },
+        }
+
+    def _restore_analysis_result_state(self, snapshot):
+        previous_model = snapshot["current_model"]
+        if previous_model is None:
+            self._clear_result_views()
+        else:
+            for key in (
+                "current_model",
+                "current_config",
+                "current_inputs",
+                "current_field",
+                "current_raw_field",
+                "current_recovered_field",
+                "current_visual_model",
+                "current_result_frame",
+                "current_view",
+                "result_sequence",
+            ):
+                setattr(self, key, snapshot[key])
+            self.view_buttons[self.current_view].setChecked(True)
+            self._fill_result_tables(self.current_model, self.current_inputs)
+            self._render_current_view()
+            self.visualization_stack.setCurrentIndex(
+                snapshot["visualization_index"]
+            )
+            self.result_tabs.setCurrentIndex(snapshot["result_tab_index"])
+            self._set_result_freshness(True)
+        self.json_text.setPlainText(snapshot["json_text"])
+        for key, text in snapshot["metrics"].items():
+            self.analysis_metric_labels[key].setText(text)
 
     def _set_view_meta(self, text):
         self._view_meta_text = str(text)
@@ -3220,6 +3779,9 @@ class ReconstructionMainWindow(QMainWindow):
         self.axes = self.figure.add_subplot(111)
 
     def _render_empty_plot(self):
+        if hasattr(self, "plot_content_stack"):
+            self.plot_content_stack.setCurrentWidget(self.analysis_empty_state)
+            self._sync_empty_state()
         self._clear_figure_overlays()
         self.axes.clear()
         self.axes.set_axis_off()
@@ -3256,6 +3818,7 @@ class ReconstructionMainWindow(QMainWindow):
         self.current_recovered_field = None
         self.current_visual_model = None
         self.current_result_frame = None
+        self._set_result_freshness(False)
         self.current_view = "stress"
         if hasattr(self, "view_buttons"):
             self.view_buttons["stress"].setChecked(True)
@@ -3265,6 +3828,10 @@ class ReconstructionMainWindow(QMainWindow):
         self.query_result_table.set_rows([])
         self.compare_result_table.set_rows([])
         self.field_result_table.set_rows([])
+        if hasattr(self, "node_result_tab_index"):
+            self.result_tabs.setTabText(self.node_result_tab_index, "节点结果")
+            self.result_tabs.setTabText(self.query_result_tab_index, "查询结果")
+            self.result_tabs.setTabText(self.compare_result_tab_index, "实测对比")
         if hasattr(self, "field_result_tab_index"):
             self.result_tabs.setTabText(self.field_result_tab_index, "截面场")
         if hasattr(self, "structure_3d_view"):
@@ -4096,6 +4663,8 @@ class ReconstructionMainWindow(QMainWindow):
         self.measurement_preview.set_preview_data(preview_data)
 
     def run_reconstruction(self):
+        if self._analysis_busy:
+            return
         if not self._refresh_input_readiness():
             self._set_run_status("请先修正输入", "error")
             self._focus_first_input_issue()
@@ -4130,8 +4699,10 @@ class ReconstructionMainWindow(QMainWindow):
                     )
                 )
                 return
+        previous_result_state = self._capture_analysis_result_state()
+        failure = None
         self._set_run_status("正在计算…", "running")
-        self.run_button.setEnabled(False)
+        self._set_analysis_busy(True)
         QApplication.processEvents()
         try:
             config = self._build_form_config()
@@ -4148,6 +4719,7 @@ class ReconstructionMainWindow(QMainWindow):
             self._render_plot(model, inputs)
             self._fill_result_tables(model, inputs)
             self._update_analysis_summary(config=config, model=model)
+            self._set_result_freshness(False)
             result_tab_index = 0 if self.current_view == "shape" else self.field_result_tab_index
             self.result_tabs.setCurrentIndex(result_tab_index)
             self._set_run_status(f"重构完成 · {model.n_nodes} 节点 / {model.n_elems} 单元", "success")
@@ -4201,9 +4773,16 @@ class ReconstructionMainWindow(QMainWindow):
                 message_lines.append("应力假设: 一维线弹性 σ=Eε")
             self._write_message("\n".join(message_lines))
         except Exception as exc:
-            self._show_error(exc)
+            failure = exc
+            try:
+                self._restore_analysis_result_state(previous_result_state)
+            except Exception:
+                self._clear_result_views()
         finally:
+            self._set_analysis_busy(False)
             self._refresh_input_readiness()
+        if failure is not None:
+            self._show_error(failure)
 
     def _render_plot(self, model, inputs):
         elastic_modulus = inputs.get("material", {}).get("elastic_modulus")
@@ -4334,6 +4913,9 @@ class ReconstructionMainWindow(QMainWindow):
         if self.current_model is None or self.current_field is None or self.current_inputs is None:
             self._render_empty_plot()
             return
+
+        if hasattr(self, "plot_content_stack"):
+            self.plot_content_stack.setCurrentWidget(self.visualization_stack)
 
         thickness_setting = self.current_inputs["plot_options"].get("thickness_scale", "auto")
         thickness_scale = resolve_thickness_scale(self.current_field, thickness_setting)
@@ -4741,6 +5323,10 @@ class ReconstructionMainWindow(QMainWindow):
                 }
             )
         self.node_result_table.set_rows(node_rows)
+        self.result_tabs.setTabText(
+            self.node_result_tab_index,
+            f"节点结果 · {len(node_rows)}",
+        )
 
         query_rows = []
         for idx, row in enumerate(model.evaluate_displacement_at_points(inputs["query_xs"]), start=1):
@@ -4753,6 +5339,10 @@ class ReconstructionMainWindow(QMainWindow):
                 }
             )
         self.query_result_table.set_rows(query_rows)
+        self.result_tabs.setTabText(
+            self.query_result_tab_index,
+            f"查询结果 · {len(query_rows)}",
+        )
 
         compare_rows = []
         for row in model.compare_true_points(inputs["true_points"]):
@@ -4770,6 +5360,10 @@ class ReconstructionMainWindow(QMainWindow):
                 }
             )
         self.compare_result_table.set_rows(compare_rows)
+        self.result_tabs.setTabText(
+            self.compare_result_tab_index,
+            f"实测对比 · {len(compare_rows)}",
+        )
 
         self._fill_field_result_table()
 
@@ -4794,9 +5388,9 @@ class ReconstructionMainWindow(QMainWindow):
             if self.current_field is None:
                 tab_text = "截面场"
             elif self.current_field.representation == "raw":
-                tab_text = "截面场 · 原始"
+                tab_text = f"截面场 · 原始 · {len(field_rows)}"
             else:
-                tab_text = "截面场 · 连续化"
+                tab_text = f"截面场 · 连续化 · {len(field_rows)}"
             self.result_tabs.setTabText(self.field_result_tab_index, tab_text)
 
     def _write_message(self, message):

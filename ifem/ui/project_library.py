@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QUrl, Qt
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -126,6 +126,22 @@ class ProjectLibraryDialog(QDialog):
         self.search_edit.setFixedWidth(230)
         self.search_edit.textChanged.connect(self._apply_filter)
         heading.addWidget(self.search_edit)
+        self.search_action = QAction("搜索项目", self)
+        self.search_action.setShortcut(QKeySequence.StandardKey.Find)
+        self.search_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.search_action.triggered.connect(self._focus_search)
+        self.addAction(self.search_action)
+        self.clear_search_action = QAction("清除项目搜索", self)
+        self.clear_search_action.setShortcut(QKeySequence("Esc"))
+        self.clear_search_action.setShortcutContext(
+            Qt.ShortcutContext.WindowShortcut
+        )
+        self.clear_search_action.setEnabled(False)
+        self.clear_search_action.triggered.connect(self.search_edit.clear)
+        self.search_edit.textChanged.connect(
+            lambda text: self.clear_search_action.setEnabled(bool(text))
+        )
+        self.addAction(self.clear_search_action)
         root.addLayout(heading)
 
         location = QFrame()
@@ -171,9 +187,20 @@ class ProjectLibraryDialog(QDialog):
         self.empty_label = QLabel("项目库为空")
         self.empty_label.setObjectName("projectEmptyState")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
         self.empty_label.setMinimumHeight(240)
         self.empty_label.hide()
         root.addWidget(self.empty_label, 1)
+
+        self.selection_feedback_label = QLabel()
+        self.selection_feedback_label.setObjectName("projectLibraryFeedback")
+        self.selection_feedback_label.setWordWrap(True)
+        self.selection_feedback_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.selection_feedback_label.hide()
+        root.addWidget(self.selection_feedback_label)
 
         footer = QHBoxLayout()
         self.count_label = QLabel()
@@ -189,6 +216,7 @@ class ProjectLibraryDialog(QDialog):
         self.open_button.setObjectName("primaryButton")
         self.open_button.setEnabled(False)
         self.open_button.clicked.connect(self._open_selected)
+        self.search_edit.returnPressed.connect(self._open_selected)
         footer.addWidget(buttons)
         root.addLayout(footer)
 
@@ -214,6 +242,8 @@ class ProjectLibraryDialog(QDialog):
             item = QTreeWidgetItem((entry.name, space, model, modified))
             item.setData(0, Qt.ItemDataRole.UserRole, str(entry.path))
             item.setData(0, Qt.ItemDataRole.UserRole + 1, entry.valid)
+            item.setData(0, Qt.ItemDataRole.UserRole + 2, entry.error or "")
+            item.setToolTip(0, str(entry.path))
             if entry.error:
                 item.setToolTip(0, entry.error)
                 item.setToolTip(2, entry.error)
@@ -222,7 +252,6 @@ class ProjectLibraryDialog(QDialog):
             if selected is not None and entry.path == selected:
                 self.tree.setCurrentItem(item)
 
-        self.count_label.setText(f"{len(entries)} 个项目")
         self._apply_filter(self.search_edit.text())
         if self.tree.currentItem() is None:
             first_valid = next(
@@ -249,8 +278,26 @@ class ProjectLibraryDialog(QDialog):
         self.tree.setVisible(bool(visible_count))
         self.empty_label.setVisible(not visible_count)
         self.empty_label.setText(
-            "没有匹配的项目" if self._items else "项目库为空"
+            "没有匹配的项目\n请清除搜索条件后重试"
+            if self._items
+            else "项目库为空\n请先新建项目，或打开上方文件夹放入 .ifemproj 文件"
         )
+        self.count_label.setText(
+            f"显示 {visible_count} / {len(self._items)} 个项目"
+        )
+        current = self.tree.currentItem()
+        if current is None or current.isHidden():
+            visible_items = [item for item in self._items if not item.isHidden()]
+            first_valid = next(
+                (
+                    item
+                    for item in visible_items
+                    if bool(item.data(0, Qt.ItemDataRole.UserRole + 1))
+                ),
+                None,
+            )
+            candidate = first_valid or (visible_items[0] if visible_items else None)
+            self.tree.setCurrentItem(candidate)
         self._selection_changed()
 
     def _selection_changed(self):
@@ -261,6 +308,27 @@ class ProjectLibraryDialog(QDialog):
             and item.data(0, Qt.ItemDataRole.UserRole + 1)
         )
         self.open_button.setEnabled(valid)
+        if item is None or item.isHidden():
+            feedback = ""
+        elif valid:
+            feedback = ""
+        else:
+            error = str(item.data(0, Qt.ItemDataRole.UserRole + 2) or "未知错误")
+            feedback = f"无法读取：{error}"
+        self.selection_feedback_label.setText(feedback)
+        self.selection_feedback_label.setVisible(bool(feedback))
+        self.selection_feedback_label.setToolTip(feedback)
+
+    def _focus_search(self):
+        self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_edit.selectAll()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.search_edit.text():
+            self.search_edit.clear()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _item_activated(self, item, _column):
         self.tree.setCurrentItem(item)
@@ -327,6 +395,10 @@ class ProjectNameDialog(QDialog):
         clean_initial = "" if initial_name == "未命名项目" else str(initial_name)
         self.name_edit.setText(clean_initial)
         self.name_edit.setClearButtonEnabled(True)
+        name_label = QLabel("项目名称")
+        name_label.setObjectName("fieldLabel")
+        name_label.setBuddy(self.name_edit)
+        root.addWidget(name_label)
         root.addWidget(self.name_edit)
 
         path_row = QHBoxLayout()
@@ -354,6 +426,7 @@ class ProjectNameDialog(QDialog):
         )
         self.confirm_button.setText(confirm_text)
         self.confirm_button.setObjectName("primaryButton")
+        self.confirm_button.setDefault(True)
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         self.buttons.accepted.connect(self._accept_valid_name)
         self.buttons.rejected.connect(self.reject)
@@ -390,7 +463,7 @@ class ProjectNameDialog(QDialog):
             self.path_edit.setText(str(self.library.root))
             self.path_edit.setToolTip(str(path))
             self.path_edit.setCursorPosition(0)
-            message = f"将保存为 {path.name}"
+            message = f"可保存为 {path.name}"
             state = "ready"
             valid = True
         except ValueError as exc:
@@ -398,7 +471,7 @@ class ProjectNameDialog(QDialog):
             self._project_path = None
             self.path_edit.setText(str(self.library.root))
             self.path_edit.setToolTip(str(self.library.root))
-            message = str(exc)
+            message = f"无法使用此名称：{exc} 请修改后重试。"
             state = "error"
             valid = False
         self.name_edit.setProperty("validationState", state)

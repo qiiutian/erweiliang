@@ -10,7 +10,9 @@ os.environ.setdefault(
     os.path.join(os.path.dirname(__file__), ".mplconfig"),
 )
 
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QLabel
 
 import gui_qt
 from ifem.domain.project import empty_beam_project
@@ -103,6 +105,83 @@ class ProjectLibraryTests(unittest.TestCase):
             dialog._open_selected()
             self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
             self.assertEqual(dialog.selected_path, path)
+            dialog.close()
+
+    def test_project_browser_search_and_damaged_state_are_keyboard_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = ProjectLibrary(directory)
+            save_project(
+                library.path_for_name("可用项目"),
+                empty_beam_project(name="可用项目"),
+            )
+            damaged_path = library.path_for_name("损坏项目")
+            damaged_path.write_text("not-json", encoding="utf-8")
+            dialog = ProjectLibraryDialog(library=library)
+            dialog.show()
+            self.app.processEvents()
+
+            self.assertEqual(dialog.search_action.shortcut().toString(), "Ctrl+F")
+            dialog.search_action.trigger()
+            self.assertTrue(dialog.search_edit.hasFocus())
+            dialog.search_edit.setText("不存在")
+            self.assertIn("0 / 2", dialog.count_label.text())
+            self.assertIn("清除搜索", dialog.empty_label.text())
+
+            QTest.keyClick(dialog.search_edit, Qt.Key.Key_Escape)
+            self.assertEqual(dialog.search_edit.text(), "")
+            self.assertEqual(dialog.result(), 0)
+
+            damaged_item = next(
+                dialog.tree.topLevelItem(index)
+                for index in range(dialog.tree.topLevelItemCount())
+                if dialog.tree.topLevelItem(index).text(0) == "损坏项目"
+            )
+            dialog.tree.setCurrentItem(damaged_item)
+            self.assertIn("无法读取", dialog.selection_feedback_label.text())
+            self.assertTrue(dialog.selection_feedback_label.wordWrap())
+            self.assertFalse(dialog.selection_feedback_label.isHidden())
+            self.assertTrue(
+                dialog.selection_feedback_label.textInteractionFlags()
+                & Qt.TextInteractionFlag.TextSelectableByMouse
+            )
+            self.assertFalse(dialog.open_button.isEnabled())
+            dialog.close()
+
+    def test_project_search_selects_and_opens_the_unique_visible_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = ProjectLibrary(directory)
+            expected_path = library.path_for_name("甲项目")
+            save_project(expected_path, empty_beam_project(name="甲项目"))
+            save_project(
+                library.path_for_name("乙项目"),
+                empty_beam_project(name="乙项目"),
+            )
+            dialog = ProjectLibraryDialog(library=library)
+            dialog.show()
+            dialog.search_edit.setText("甲项目")
+            self.app.processEvents()
+
+            self.assertEqual(dialog.tree.currentItem().text(0), "甲项目")
+            self.assertTrue(dialog.open_button.isEnabled())
+            QTest.keyClick(dialog.search_edit, Qt.Key.Key_Return)
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            self.assertEqual(dialog.selected_path, expected_path)
+            dialog.close()
+
+    def test_project_name_dialog_has_visible_label_and_default_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dialog = ProjectNameDialog(library=ProjectLibrary(directory))
+            labels = [
+                label
+                for label in dialog.findChildren(QLabel)
+                if label.text() == "项目名称"
+            ]
+
+            self.assertEqual(len(labels), 1)
+            self.assertIs(labels[0].buddy(), dialog.name_edit)
+            self.assertTrue(dialog.confirm_button.isDefault())
+            dialog.name_edit.setText("桥梁项目")
+            self.assertIn("可保存为", dialog.status_label.text())
             dialog.close()
 
     def test_main_window_save_as_uses_name_and_managed_path(self):

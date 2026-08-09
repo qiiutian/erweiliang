@@ -210,11 +210,6 @@ QDialog#modelerDialog QSpinBox, QDialog#modelerDialog QDoubleSpinBox {
     min-height: 28px;
     border-radius: 6px;
 }
-QDialog#modelerDialog QLineEdit:focus, QDialog#modelerDialog QComboBox:focus,
-QDialog#modelerDialog QSpinBox:focus, QDialog#modelerDialog QDoubleSpinBox:focus {
-    border: 1px solid #4f775f;
-    background: #fcfefc;
-}
 QPushButton#workspacePrimary {
     min-width: 126px;
     min-height: 36px;
@@ -1124,7 +1119,7 @@ class BeamModelerDialog(QDialog):
         title.setObjectName("modelerTitle")
         heading.addWidget(title)
         heading.addStretch(1)
-        self.summary_label = QLabel()
+        self.summary_label = ElidedLabel()
         self.summary_label.setObjectName("modelerSummary")
         self.summary_label.setMinimumWidth(0)
         self.summary_label.setMaximumWidth(720)
@@ -1140,12 +1135,14 @@ class BeamModelerDialog(QDialog):
         open_button.setShortcut(QKeySequence.StandardKey.Open)
         open_button.clicked.connect(self._open_project)
         heading.addWidget(open_button)
-        save_button = QPushButton("保存")
-        save_button.setObjectName("modelerFileButton")
-        save_button.setToolTip("将当前模型保存到 iFEM 项目库")
-        save_button.setShortcut(QKeySequence.StandardKey.Save)
-        save_button.clicked.connect(self._save_project)
-        heading.addWidget(save_button)
+        self.save_project_button = QPushButton("保存项目")
+        self.save_project_button.setObjectName("modelerFileButton")
+        self.save_project_button.setToolTip(
+            "将当前模型写入 iFEM 项目库；建模器保持打开（Ctrl+S）"
+        )
+        self.save_project_button.setShortcut(QKeySequence.StandardKey.Save)
+        self.save_project_button.clicked.connect(self._save_project)
+        heading.addWidget(self.save_project_button)
         root.addWidget(header)
 
         toolbar = QFrame()
@@ -1183,7 +1180,13 @@ class BeamModelerDialog(QDialog):
             toolbar_layout.addWidget(button)
         self.mode_buttons[BeamModelCanvas.MODE_SELECT].setChecked(True)
 
-        toolbar_layout.addSpacing(8)
+        toolbar_layout.addStretch(1)
+        history_divider = QFrame()
+        history_divider.setObjectName("toolbarDivider")
+        history_divider.setFrameShape(QFrame.Shape.VLine)
+        history_divider.setFixedHeight(24)
+        toolbar_layout.addWidget(history_divider)
+        toolbar_layout.addSpacing(3)
         self.undo_button = QPushButton("撤销")
         self.redo_button = QPushButton("重做")
         self.delete_button = QPushButton("删除")
@@ -1199,7 +1202,6 @@ class BeamModelerDialog(QDialog):
         toolbar_layout.addWidget(self.undo_button)
         toolbar_layout.addWidget(self.redo_button)
         toolbar_layout.addWidget(self.delete_button)
-        toolbar_layout.addStretch(1)
         root.addWidget(toolbar)
 
         self._build_generator(root)
@@ -1246,7 +1248,7 @@ class BeamModelerDialog(QDialog):
         )
         view_bar_layout.addWidget(self.plane_combo)
         view_bar_layout.addStretch(1)
-        self.capability_label = QLabel()
+        self.capability_label = ElidedLabel()
         self.capability_label.setObjectName("viewportStatus")
         self.capability_label.setMinimumWidth(76)
         self.capability_label.setMaximumWidth(180)
@@ -1313,12 +1315,16 @@ class BeamModelerDialog(QDialog):
             QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Apply
         )
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.button(QDialogButtonBox.StandardButton.Apply).setText("保存到工作台")
-        buttons.button(QDialogButtonBox.StandardButton.Apply).setObjectName(
-            "workspacePrimary"
+        self.apply_to_workspace_button = buttons.button(
+            QDialogButtonBox.StandardButton.Apply
         )
+        self.apply_to_workspace_button.setText("应用到工作台")
+        self.apply_to_workspace_button.setToolTip(
+            "将当前模型交回分析工作台并关闭建模器；不会自动写入项目库"
+        )
+        self.apply_to_workspace_button.setObjectName("workspacePrimary")
         buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.accept)
+        self.apply_to_workspace_button.clicked.connect(self.accept)
         footer.addWidget(buttons)
         root.addLayout(footer)
 
@@ -1435,9 +1441,10 @@ class BeamModelerDialog(QDialog):
         empty_layout = QVBoxLayout(empty_page)
         empty_layout.setContentsMargins(8, 12, 8, 12)
         empty_layout.addStretch(1)
-        empty_hint = QLabel("未选择对象")
+        empty_hint = QLabel("在画布中选择节点、梁段或测点\n即可在这里编辑工程属性")
         empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_hint.setObjectName("sectionHint")
+        empty_hint.setWordWrap(True)
         empty_layout.addWidget(empty_hint)
         empty_layout.addStretch(1)
         self.property_stack.addWidget(empty_page)
@@ -1543,6 +1550,19 @@ class BeamModelerDialog(QDialog):
         self.sensor_orientation_angle_edit = QLineEdit()
         self.sensor_direction_label = QLabel()
         self.sensor_direction_label.setWordWrap(True)
+        for data_label in (
+            self.node_id_label,
+            self.element_id_label,
+            self.element_nodes_label,
+            self.element_length_label,
+            self.sensor_id_label,
+            self.sensor_position_label,
+            self.sensor_direction_label,
+        ):
+            data_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
         self.sensor_strain_edit = QLineEdit()
         self.sensor_weight_edit = QLineEdit()
         self.sensor_zone_a_edit = QLineEdit()
@@ -1923,6 +1943,15 @@ class BeamModelerDialog(QDialog):
             self.mode_buttons[BeamModelCanvas.MODE_SELECT].setChecked(True)
             self.geometry_3d_view.set_mode(BeamGeometry3DView.MODE_SELECT)
         capability = PathBeamEditor.capability(project)
+        has_geometry = bool(project.elements)
+        self.generate_button.setText(
+            "替换当前路径" if has_geometry else "新建路径"
+        )
+        self.generate_button.setToolTip(
+            "使用当前参数替换全部现有几何；现有测点和边界约束将被清空"
+            if has_geometry
+            else "使用当前参数创建第一条结构路径"
+        )
         dimension_label = "二维" if capability.dimension == 2 else "三维"
         self.summary_label.setText(
             f"{dimension_label} · {capability.total_length:.6g} m · "
@@ -2168,6 +2197,7 @@ class BeamModelerDialog(QDialog):
             if node is not None:
                 self.property_stack.setCurrentIndex(1)
                 self.node_id_label.setText(node.identifier[-10:])
+                self.node_id_label.setToolTip(node.identifier)
                 self.node_x_edit.setText(f"{node.coordinates[0]:.12g}")
                 self.node_y_edit.setText(f"{node.coordinates[1]:.12g}")
                 self.node_z_edit.setText(f"{node.coordinates[2]:.12g}")
@@ -2180,8 +2210,12 @@ class BeamModelerDialog(QDialog):
             if element is not None:
                 self.property_stack.setCurrentIndex(3)
                 self.element_id_label.setText(element.identifier[-10:])
+                self.element_id_label.setToolTip(element.identifier)
                 self.element_nodes_label.setText(
                     f"{element.node_ids[0][-6:]} → {element.node_ids[1][-6:]}"
+                )
+                self.element_nodes_label.setToolTip(
+                    f"{element.node_ids[0]} → {element.node_ids[1]}"
                 )
                 self.element_length_label.setText(
                     f"{PathBeamEditor.element_length(self._project, element):.8g} m"
@@ -2228,6 +2262,7 @@ class BeamModelerDialog(QDialog):
                 location = PathBeamEditor.sensor_location(self._project, sensor.identifier)
                 self.property_stack.setCurrentIndex(2)
                 self.sensor_id_label.setText(sensor.identifier[-10:])
+                self.sensor_id_label.setToolTip(sensor.identifier)
                 self.sensor_label_edit.setText(sensor.label)
                 self.sensor_element_combo.setCurrentIndex(
                     max(self.sensor_element_combo.findData(sensor.attachment.entity_id), 0)
@@ -2385,11 +2420,20 @@ class BeamModelerDialog(QDialog):
             QMessageBox.warning(self, "删除对象", str(exc))
 
     def _generate_geometry(self):
-        if self._project.sensors:
+        if self._project.sensors or self._project.boundary_conditions:
+            cleared_items = []
+            if self._project.sensors:
+                cleared_items.append(f"{len(self._project.sensors)} 个测点")
+            if self._project.boundary_conditions:
+                cleared_items.append(
+                    f"{len(self._project.boundary_conditions)} 条边界约束"
+                )
             answer = QMessageBox.question(
                 self,
                 "替换当前模型",
-                "参数化生成会替换当前几何并清空测点，是否继续？",
+                "参数化生成会替换当前几何，并清空"
+                + "和".join(cleared_items)
+                + "。此操作可以撤销，是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )

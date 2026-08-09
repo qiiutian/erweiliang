@@ -252,7 +252,8 @@ QLabel#projectEmptyState {{ color: {c['text_strong']}; }}
 QLabel#appSubtitle, QLabel#startBrandSubtitle, QLabel#startDescription,
 QLabel#startActionHint, QLabel#sectionHint, QLabel#hintLabel,
 QLabel#modelerSummary, QLabel#appearanceHint, QLabel#projectDialogHint,
-QLabel#projectLibraryMeta, QLabel#projectNameStatus {{ color: {c['text_muted']}; }}
+QLabel#projectLibraryMeta, QLabel#projectLibraryFeedback,
+QLabel#projectNameStatus {{ color: {c['text_muted']}; }}
 QLabel#startEyebrow {{ color: {c['sensor']}; }}
 QLabel#startBadge, QLabel#recordBadge, QLabel#statusMeta {{
     color: {c['text_secondary']};
@@ -505,24 +506,83 @@ QToolTip {{
     border-color: {c['viewport_start']};
 }}
 QStatusBar {{ color: {c['text_muted']}; background: {c['background']}; }}
-QLabel#statusBadge[state="idle"], QLabel#inputBadge[state="pending"],
+QLabel#statusBadge[state="idle"], QPushButton#inputBadge[state="pending"],
 QLabel#algorithmState[state="pending"], QLabel#modelerStatus[state="waiting"] {{
     color: {c['warning']};
     background: {c['warning_soft']};
     border-color: {c['border']};
 }}
 QLabel#statusBadge[state="running"], QLabel#statusBadge[state="success"],
-QLabel#inputBadge[state="ready"], QLabel#algorithmState[state="ready"],
+QPushButton#inputBadge[state="ready"], QLabel#algorithmState[state="ready"],
 QLabel#modelerStatus[state="ready"] {{
     color: {c['success']};
     background: {c['success_soft']};
     border-color: {c['border']};
 }}
 QLabel#statusBadge[state="error"], QLabel#recordBadge[state="error"],
-QLabel#inputBadge[state="error"], QLabel#algorithmState[state="blocked"] {{
+QPushButton#inputBadge[state="error"], QLabel#algorithmState[state="blocked"] {{
     color: {c['danger']};
     background: {c['danger_soft']};
     border-color: {c['border']};
+}}
+QPushButton#inputBadge:hover, QPushButton#inputBadge:focus {{
+    border-color: {c['focus']};
+}}
+QPushButton#inputBadge:pressed {{
+    color: {c['text_strong']};
+    background: {c['primary_tint']};
+    border-color: {c['primary']};
+}}
+QLabel#resultFreshness[state="stale"] {{
+    color: {c['warning']};
+    background: {c['warning_soft']};
+    border: 1px solid {c['border']};
+}}
+QFrame#analysisEmptyState {{
+    background: {c['surface']};
+    border-color: {c['border']};
+}}
+QLabel#analysisEmptyEyebrow {{ color: {c['primary']}; }}
+QLabel#analysisEmptyTitle {{ color: {c['text_strong']}; }}
+QLabel#analysisEmptyDescription {{ color: {c['text_secondary']}; }}
+QLabel#analysisEmptyIssue {{ color: {c['text_muted']}; }}
+QFrame#analysisWorkflow {{ background: {c['surface_muted']}; }}
+QFrame#analysisStep[state="active"] {{
+    background: {c['surface']};
+    border-color: {c['focus']};
+}}
+QFrame#analysisStep[state="done"] {{ background: {c['success_soft']}; }}
+QLabel#analysisStepMarker {{
+    color: {c['text_secondary']};
+    background: {c['surface']};
+    border: 1px solid {c['border_strong']};
+}}
+QLabel#analysisStepMarker[state="active"] {{
+    color: {c['on_primary']};
+    background: {c['primary']};
+    border-color: {c['primary']};
+}}
+QLabel#analysisStepMarker[state="done"] {{
+    color: {c['success']};
+    background: {c['success_soft']};
+    border-color: {c['success']};
+}}
+QLabel#analysisStepLabel {{ color: {c['text_secondary']}; }}
+QPushButton#emptyStateAction {{
+    color: {c['on_primary']};
+    background: {c['primary']};
+    border-color: {c['primary_pressed']};
+}}
+QPushButton#emptyStateAction:hover {{
+    color: {c['on_primary']};
+    background: {c['primary_hover']};
+    border-color: {c['primary_pressed']};
+}}
+QPushButton#emptyStateAction:focus {{ border-color: {c['focus']}; }}
+QPushButton#emptyStateAction:pressed {{
+    color: {c['on_primary']};
+    background: {c['primary_pressed']};
+    border-color: {c['primary_pressed']};
 }}
 QFrame#themePicker {{
     background: {c['surface_subtle']};
