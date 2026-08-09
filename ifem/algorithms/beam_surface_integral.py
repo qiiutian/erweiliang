@@ -10,6 +10,7 @@ from ifem.domain.analysis import (
     AnalysisContext,
     AnalysisResult,
     CancellationToken,
+    InputValidationError,
     ProgressReporter,
     ValidationReport,
 )
@@ -22,6 +23,7 @@ class BeamSurfaceIntegralAlgorithm:
         display_name="积分型表面应变矩阵",
         version="1.0.0",
         description="二维 Euler-Bernoulli 梁直接表面应变积分重构。",
+        parameter_schema_version="1",
     )
     capabilities = AlgorithmCapabilities(
         model_dimensions=(1,),
@@ -67,6 +69,8 @@ class BeamSurfaceIntegralAlgorithm:
 
         try:
             validate_config(context.project_config)
+        except InputValidationError as exc:
+            return ValidationReport.invalid(str(exc), field=exc.field)
         except (KeyError, TypeError, ValueError) as exc:
             return ValidationReport.invalid(str(exc))
         return ValidationReport.valid()

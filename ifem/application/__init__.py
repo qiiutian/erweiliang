@@ -8,8 +8,11 @@ from ifem.application.algorithm_matching import (
 )
 from ifem.application.analysis_service import (
     DEFAULT_ALGORITHM_ID,
+    AlgorithmResolution,
+    AlgorithmResolutionStatus,
     AlgorithmRegistry,
     AlgorithmValidationError,
+    AnalysisPreparation,
     AnalysisService,
     create_default_analysis_service,
     get_default_analysis_service,
@@ -21,8 +24,11 @@ __all__ = [
     "match_project_algorithms",
     "profile_project",
     "DEFAULT_ALGORITHM_ID",
+    "AlgorithmResolution",
+    "AlgorithmResolutionStatus",
     "AlgorithmRegistry",
     "AlgorithmValidationError",
+    "AnalysisPreparation",
     "AnalysisService",
     "create_default_analysis_service",
     "get_default_analysis_service",

@@ -17,9 +17,9 @@ import gui_qt
 from config_adapter import get_sample_config
 from ifem.algorithms.beam_surface_integral import BeamSurfaceIntegralAlgorithm
 from ifem.application.analysis_service import AlgorithmRegistry, AnalysisService
-from ifem.domain.analysis import AlgorithmMetadata
+from ifem.domain.analysis import AlgorithmMetadata, ValidationReport
 from ifem.domain.project import AnalysisCase, empty_beam_project
-from ifem.infrastructure import load_project, project_from_legacy_config
+from ifem.infrastructure import load_project, project_from_legacy_config, save_project
 from ifem.modeling import BeamProjectEditor, PathBeamEditor
 from ifem.modeling.section_geometry import section_boundary_point
 from ifem.ui.modeler import BeamModelCanvas, BeamModelerDialog, SensorArrayDialog
@@ -177,6 +177,58 @@ class ModelerUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(window.left_tabs.currentIndex(), 0)
         self.assertTrue(window.node_x_edit.hasFocus())
+        window.close()
+
+    def test_structured_measurement_issue_focuses_exact_row_and_field(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        self.app.processEvents()
+        rows = window.measurement_editor.get_rows()
+        rows[2]["strain"] = "invalid"
+        window.measurement_editor.set_rows(rows)
+        self.app.processEvents()
+
+        self.assertEqual(
+            window._readiness_issues[0]["field"],
+            "/measurements/2/strain",
+        )
+        window.input_status_label.click()
+        self.app.processEvents()
+
+        self.assertEqual(window.left_tabs.currentIndex(), 1)
+        self.assertEqual(window.measurement_editor.table.currentRow(), 2)
+        self.assertTrue(window.measurement_editor.inputs["strain"].hasFocus())
+        window.close()
+
+    def test_plugin_validation_field_focuses_dynamic_parameter_editor(self):
+        class FieldFailingAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def validate(self, context):
+                return ValidationReport.invalid(
+                    "请检查高斯点数。",
+                    field="/analysis/parameters/gauss_n",
+                )
+
+        algorithm = FieldFailingAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        window.show()
+        self.app.processEvents()
+
+        editor = window.analysis_setup.parameter_editor("gauss_n")
+        self.assertIsNotNone(editor)
+        self.assertEqual(editor.property("validationState"), "error")
+        self.assertEqual(
+            window._readiness_issues[0]["field"],
+            "/analysis/parameters/gauss_n",
+        )
+        window.input_status_label.click()
+        self.app.processEvents()
+
+        self.assertEqual(window.left_tabs.currentIndex(), 0)
+        self.assertTrue(editor.hasFocus())
         window.close()
 
     def test_stale_result_is_preserved_and_visibly_marked_until_rerun(self):
@@ -750,6 +802,449 @@ class ModelerUiTests(unittest.TestCase):
             window._project_for_interactive_modeler().analysis_cases[0].algorithm_id,
             alternate.metadata.identifier,
         )
+        window.close()
+
+    def test_missing_algorithm_save_preserves_case_until_explicit_rebind(self):
+        window = gui_qt.ReconstructionMainWindow()
+        project = window.current_project_document
+        original_case = replace(
+            project.analysis_cases[0],
+            algorithm_id="vendor.missing.reconstruction",
+            algorithm_version="9.4.1",
+            parameter_schema_version="7",
+            parameters={
+                "gauss_n": "legacy-mode",
+                "points_per_element": {"adaptive": True},
+                "query_xs": {"adaptive": True},
+                "true_points": "opaque-future-format",
+                "legacy_extension": {"gain": 2.5},
+            },
+        )
+        project = project.revised(analysis_cases=(original_case,))
+
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="缺失插件项目已载入",
+        )
+        setup = window.analysis_setup
+
+        self.assertEqual(setup.recovery_status, setup.RECOVERY_MISSING)
+        self.assertEqual(setup.active_algorithm_id, original_case.algorithm_id)
+        self.assertIsNone(setup.active_algorithm)
+        self.assertFalse(setup.is_compatible)
+        self.assertFalse(window.run_button.isEnabled())
+        self.assertFalse(window.query_xs_edit.isEnabled())
+        self.assertFalse(window.true_point_editor.isEnabled())
+        self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
+
+        installed_id = BeamSurfaceIntegralAlgorithm.metadata.identifier
+        replacement_index = setup.algorithm_selector.findData(installed_id)
+        self.assertGreaterEqual(replacement_index, 0)
+        setup.algorithm_selector.setCurrentIndex(replacement_index)
+        rebound_case = window._project_for_save().analysis_cases[0]
+
+        self.assertTrue(window.query_xs_edit.isEnabled())
+        self.assertTrue(window.true_point_editor.isEnabled())
+        self.assertEqual(rebound_case.algorithm_id, installed_id)
+        self.assertEqual(
+            rebound_case.algorithm_version,
+            BeamSurfaceIntegralAlgorithm.metadata.version,
+        )
+        self.assertEqual(
+            rebound_case.parameter_schema_version,
+            BeamSurfaceIntegralAlgorithm.metadata.parameter_schema_version,
+        )
+        self.assertEqual(rebound_case.parameters["gauss_n"], 3)
+        self.assertEqual(rebound_case.parameters["points_per_element"], 120)
+        self.assertEqual(
+            rebound_case.parameters["legacy_extension"],
+            {"gain": 2.5},
+        )
+        self.assertEqual(rebound_case.parameters["query_xs"], [])
+        self.assertEqual(rebound_case.parameters["true_points"], [])
+        window.close()
+
+    def test_missing_plugin_opaque_parameters_load_from_file_without_interpretation(self):
+        window = gui_qt.ReconstructionMainWindow()
+        original_case = replace(
+            window.current_project_document.analysis_cases[0],
+            algorithm_id="vendor.missing.opaque-file",
+            algorithm_version="3.0.0",
+            parameter_schema_version="future-7",
+            parameters={
+                "query_xs": {"strategy": "adaptive"},
+                "true_points": "vendor-owned",
+                "nested": {"keep": [1, 2, 3]},
+            },
+        )
+        project = window.current_project_document.revised(
+            analysis_cases=(original_case,)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "opaque.ifemproj"
+            save_project(path, project)
+
+            self.assertTrue(window.load_project_path(path))
+            self.assertEqual(window.current_project_path, path)
+            self.assertEqual(
+                window._project_for_save().analysis_cases[0],
+                original_case,
+            )
+        window.close()
+
+    def test_failed_project_preflight_keeps_current_document_path_and_form(self):
+        window = gui_qt.ReconstructionMainWindow()
+        previous_project = window.current_project_document
+        previous_path = window.current_project_path
+        previous_node_text = window.node_x_edit.text()
+        invalid_case = replace(
+            previous_project.analysis_cases[0],
+            algorithm_version=BeamSurfaceIntegralAlgorithm.metadata.version,
+            parameter_schema_version=(
+                BeamSurfaceIntegralAlgorithm.metadata.parameter_schema_version
+            ),
+            parameters={
+                **previous_project.analysis_cases[0].parameters,
+                "query_xs": {"not": "a legacy list"},
+            },
+        )
+        invalid_project = previous_project.revised(analysis_cases=(invalid_case,))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-analysis.ifemproj"
+            save_project(path, invalid_project)
+            with patch.object(window, "_show_error") as show_error:
+                self.assertFalse(window.load_project_path(path))
+
+        show_error.assert_called_once()
+        self.assertIs(window.current_project_document, previous_project)
+        self.assertEqual(window.current_project_path, previous_path)
+        self.assertEqual(window.node_x_edit.text(), previous_node_text)
+        window.close()
+
+    def test_version_and_schema_mismatch_preserve_until_accept_current(self):
+        class UpdatedBeamAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier=BeamSurfaceIntegralAlgorithm.metadata.identifier,
+                display_name="积分型表面应变矩阵",
+                version="2.0.0",
+                description="用于验证插件升级恢复流程。",
+                parameter_schema_version="2",
+            )
+
+        algorithm = UpdatedBeamAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        project = window.current_project_document
+        original_case = replace(
+            project.analysis_cases[0],
+            algorithm_version="1.0.0",
+            parameter_schema_version="1",
+            parameters={
+                "gauss_n": 4,
+                "points_per_element": 160,
+                "future_parameter": "keep-me",
+            },
+        )
+        project = project.revised(analysis_cases=(original_case,))
+
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="旧版本插件项目已载入",
+        )
+        setup = window.analysis_setup
+
+        self.assertEqual(setup.recovery_status, setup.RECOVERY_SCHEMA)
+        self.assertFalse(setup.accept_current_button.isHidden())
+        self.assertFalse(setup.is_compatible)
+        self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
+
+        setup.accept_current_button.click()
+        accepted_case = window._project_for_save().analysis_cases[0]
+        self.assertEqual(setup.recovery_status, setup.RECOVERY_READY)
+        self.assertTrue(setup.is_compatible)
+        self.assertEqual(accepted_case.algorithm_version, "2.0.0")
+        self.assertEqual(accepted_case.parameter_schema_version, "2")
+        self.assertEqual(accepted_case.parameters["gauss_n"], 4)
+        self.assertEqual(accepted_case.parameters["points_per_element"], 160)
+        self.assertEqual(accepted_case.parameters["future_parameter"], "keep-me")
+        window.close()
+
+    def test_save_creates_active_analysis_case_when_project_has_none(self):
+        window = gui_qt.ReconstructionMainWindow()
+        project = window.current_project_document.revised(
+            analysis_cases=(),
+            active_analysis_id=None,
+        )
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="无工况项目已载入",
+        )
+
+        saved = window._project_for_save()
+
+        self.assertEqual(len(saved.analysis_cases), 1)
+        self.assertEqual(saved.active_analysis_id, saved.analysis_cases[0].identifier)
+        self.assertEqual(
+            saved.analysis_cases[0].algorithm_id,
+            BeamSurfaceIntegralAlgorithm.metadata.identifier,
+        )
+        self.assertEqual(
+            saved.analysis_cases[0].algorithm_version,
+            BeamSurfaceIntegralAlgorithm.metadata.version,
+        )
+        window.close()
+
+    def test_invalid_saved_parameters_are_not_silently_clamped(self):
+        window = gui_qt.ReconstructionMainWindow()
+        project = window.current_project_document
+        original_case = replace(
+            project.analysis_cases[0],
+            algorithm_version=BeamSurfaceIntegralAlgorithm.metadata.version,
+            parameter_schema_version=(
+                BeamSurfaceIntegralAlgorithm.metadata.parameter_schema_version
+            ),
+            parameters={
+                "gauss_n": 99,
+                "points_per_element": 1,
+                "unknown_parameter": [1, 2, 3],
+            },
+        )
+        project = project.revised(analysis_cases=(original_case,))
+
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="非法旧参数项目已载入",
+        )
+        setup = window.analysis_setup
+
+        self.assertEqual(setup.recovery_status, setup.RECOVERY_SCHEMA)
+        self.assertEqual(setup.parameter_values()["gauss_n"], 99)
+        self.assertEqual(setup.parameter_values()["points_per_element"], 1)
+        self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
+        self.assertIsNone(setup.parameter_editor("gauss_n"))
+        self.assertIn("等待算法", window.input_status_label.text())
+        window.show()
+        self.app.processEvents()
+        window.input_status_label.click()
+        self.app.processEvents()
+        self.assertTrue(setup.accept_current_button.hasFocus())
+        window.close()
+
+    def test_failed_recovery_activation_is_transactional(self):
+        class UpdatedBeamAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier=BeamSurfaceIntegralAlgorithm.metadata.identifier,
+                display_name="升级测试方法",
+                version="2.0.0",
+                parameter_schema_version="2",
+            )
+
+        algorithm = UpdatedBeamAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        original_case = replace(
+            window.current_project_document.analysis_cases[0],
+            algorithm_version="1.0.0",
+            parameter_schema_version="1",
+        )
+        project = window.current_project_document.revised(
+            analysis_cases=(original_case,)
+        )
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="待恢复项目已载入",
+        )
+        setup = window.analysis_setup
+
+        with patch.object(
+            setup,
+            "_activate_algorithm",
+            side_effect=RuntimeError("forced editor failure"),
+        ):
+            setup.accept_current_button.click()
+
+        self.assertTrue(setup.should_preserve_saved_case)
+        self.assertFalse(setup.configuration_modified)
+        self.assertFalse(setup.is_compatible)
+        self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
+        window.close()
+
+    def test_failed_alternative_activation_restores_ready_ui_and_values(self):
+        class UnstableAlternative(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier="ifem.beam2d.unstable-alternative.test",
+                display_name="不稳定替代方法",
+                version="0.1.0",
+            )
+
+        primary = BeamSurfaceIntegralAlgorithm()
+        alternative = UnstableAlternative()
+        service = AnalysisService(
+            AlgorithmRegistry((primary, alternative)),
+            default_algorithm_id=primary.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        setup = window.analysis_setup
+        setup.set_parameter_values({"gauss_n": 4, "points_per_element": 160})
+        original_activate = setup._activate_algorithm
+
+        def fail_only_for_alternative(identifier, *args, **kwargs):
+            if identifier == alternative.metadata.identifier:
+                raise RuntimeError("schema unavailable")
+            return original_activate(identifier, *args, **kwargs)
+
+        alternative_index = setup.algorithm_selector.findData(
+            alternative.metadata.identifier
+        )
+        with patch.object(
+            setup,
+            "_activate_algorithm",
+            side_effect=fail_only_for_alternative,
+        ):
+            setup.algorithm_selector.setCurrentIndex(alternative_index)
+
+        self.assertEqual(setup.active_algorithm_id, primary.metadata.identifier)
+        self.assertEqual(setup.requested_algorithm_id, primary.metadata.identifier)
+        self.assertEqual(setup.recovery_status, setup.RECOVERY_READY)
+        self.assertTrue(setup.is_compatible)
+        self.assertFalse(setup.should_preserve_saved_case)
+        self.assertEqual(
+            setup.parameter_values(),
+            {"gauss_n": 4, "points_per_element": 160},
+        )
+        self.assertGreaterEqual(
+            setup.algorithm_selector.findData(primary.metadata.identifier),
+            0,
+        )
+        self.assertGreaterEqual(
+            setup.algorithm_selector.findData(alternative.metadata.identifier),
+            0,
+        )
+        self.assertTrue(window.run_button.isEnabled())
+        window.close()
+
+    def test_dynamic_parameter_editors_preserve_scientific_values_and_unset(self):
+        class ScientificParameterAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier=BeamSurfaceIntegralAlgorithm.metadata.identifier,
+                display_name="科学参数测试方法",
+                version="1.0.0",
+                parameter_schema_version="scientific-1",
+            )
+
+            def parameter_schema(self):
+                return {
+                    "type": "object",
+                    "properties": {
+                        "big_int": {
+                            "type": "integer",
+                            "default": 10**20,
+                        },
+                        "big_num": {
+                            "type": "number",
+                            "default": 1.0e20,
+                        },
+                        "tolerance": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "default": 1.0e-12,
+                        },
+                        "automatic_gain": {"type": "number"},
+                    },
+                }
+
+        algorithm = ScientificParameterAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        setup = window.analysis_setup
+
+        self.assertEqual(
+            setup.parameter_values(),
+            {
+                "big_int": 10**20,
+                "big_num": 1.0e20,
+                "tolerance": 1.0e-12,
+            },
+        )
+        self.assertNotIn("automatic_gain", setup.parameter_values())
+
+        big_int_editor = setup.parameter_editor("big_int")
+        self.assertIsInstance(big_int_editor, gui_qt.QLineEdit)
+        big_int_editor.setText(str(10**21))
+        saved_case = window._project_for_save().analysis_cases[0]
+
+        self.assertEqual(saved_case.parameters["big_int"], 10**21)
+        self.assertEqual(saved_case.parameters["big_num"], 1.0e20)
+        self.assertEqual(saved_case.parameters["tolerance"], 1.0e-12)
+        self.assertNotIn("automatic_gain", saved_case.parameters)
+        window.close()
+
+    def test_missing_plugin_badge_focuses_explicit_replacement_selector(self):
+        window = gui_qt.ReconstructionMainWindow()
+        original_case = replace(
+            window.current_project_document.analysis_cases[0],
+            algorithm_id="vendor.missing.focus",
+            algorithm_version="1.0.0",
+            parameter_schema_version="1",
+        )
+        project = window.current_project_document.revised(
+            analysis_cases=(original_case,)
+        )
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="缺失插件项目已载入",
+        )
+        window.show()
+        self.app.processEvents()
+
+        window.input_status_label.click()
+        self.app.processEvents()
+
+        self.assertFalse(window.analysis_setup.algorithm_selector_row.isHidden())
+        self.assertTrue(window.analysis_setup.algorithm_selector.hasFocus())
+        window.close()
+
+    def test_legacy_unversioned_case_is_not_stamped_or_defaulted_by_save(self):
+        window = gui_qt.ReconstructionMainWindow()
+        project = window.current_project_document
+        parameters = dict(project.analysis_cases[0].parameters)
+        parameters.pop("points_per_element", None)
+        original_case = replace(
+            project.analysis_cases[0],
+            algorithm_version=None,
+            parameter_schema_version=None,
+            parameters=parameters,
+        )
+        project = project.revised(analysis_cases=(original_case,))
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="历史项目已载入",
+        )
+
+        saved_case = window._project_for_save().analysis_cases[0]
+
+        self.assertIsNone(saved_case.algorithm_version)
+        self.assertIsNone(saved_case.parameter_schema_version)
+        self.assertNotIn("points_per_element", saved_case.parameters)
         window.close()
 
     def test_result_context_bar_tracks_field_and_space(self):

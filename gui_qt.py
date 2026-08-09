@@ -1,6 +1,7 @@
 import re
 import sys
 from dataclasses import replace
+from math import ceil, floor
 from pathlib import Path
 
 import matplotlib
@@ -54,10 +55,14 @@ from config_adapter import (
     load_config_from_json,
     measurement_rows_from_config,
     true_point_rows_from_config,
-    validate_config,
 )
 from ifem.application import get_default_analysis_service, match_project_algorithms
-from ifem.domain.project import empty_beam_project
+from ifem.application.parameter_validation import (
+    parameter_field,
+    validate_parameters,
+)
+from ifem.domain.analysis import InputValidationError, ValidationIssue
+from ifem.domain.project import AnalysisCase, empty_beam_project, new_entity_id
 from ifem.infrastructure import ProjectLibrary, load_project, save_project
 from ifem.infrastructure.legacy_project import (
     legacy_config_from_project,
@@ -1504,40 +1509,62 @@ class EditableTable(QWidget):
         style.polish(self.count_label)
         self.count_label.update()
 
-    def focus_validation_issue(self, message=""):
-        """Reveal the row and form field most likely responsible for an error."""
+    def focus_validation_issue(self, message="", *, field_path=None):
+        """Reveal the exact row/field when a stable path is available."""
         text = str(message or "")
-        row_match = re.search(r"第\s*(\d+)\s*(?:条|个)", text)
-        row = int(row_match.group(1)) - 1 if row_match else self.table.currentRow()
+        field_path = str(field_path or "")
+        path_parts = [part for part in field_path.strip("/").split("/") if part]
+        row = -1
+        field_key = None
+        if len(path_parts) >= 2:
+            row_token = path_parts[1].replace("~1", "/").replace("~0", "~")
+            if row_token.isdigit():
+                row = int(row_token)
+            else:
+                for candidate, payload in enumerate(self.get_rows()):
+                    if str(payload.get("_entity_id", "")) == row_token:
+                        row = candidate
+                        break
+            tail = path_parts[2:]
+            field_key = self._field_key_from_path(tail)
+
+        if row < 0:
+            row_match = re.search(r"第\s*(\d+)\s*(?:条|个)", text)
+            row = (
+                int(row_match.group(1)) - 1
+                if row_match
+                else self.table.currentRow()
+            )
         if not 0 <= row < self.table.rowCount():
             row = 0 if self.table.rowCount() else -1
         if row >= 0:
             self.table.selectRow(row)
             self.on_selection_changed()
 
-        field_terms = (
-            ("量长起点", "zone_a"),
-            ("量长终点", "zone_b"),
-            ("单元号", "element"),
-            ("节点号", "node"),
-            ("自由度", "dof"),
-            ("约束值", "value"),
-            ("截面 y", "y"),
-            ("surface", "surface"),
-            ("应变", "strain"),
-            ("权重", "weight"),
-            ("的 u", "u"),
-            ("的 v", "v"),
-            ("的 x", "x"),
-        )
-        field_key = next(
-            (
-                key
-                for term, key in field_terms
-                if term in text and key in self.inputs
-            ),
-            None,
-        )
+        if field_key not in self.inputs:
+            field_terms = (
+                ("量长起点", "zone_a"),
+                ("量长终点", "zone_b"),
+                ("单元号", "element"),
+                ("节点号", "node"),
+                ("自由度", "dof"),
+                ("约束值", "value"),
+                ("截面 y", "y"),
+                ("surface", "surface"),
+                ("应变", "strain"),
+                ("权重", "weight"),
+                ("的 u", "u"),
+                ("的 v", "v"),
+                ("的 x", "x"),
+            )
+            field_key = next(
+                (
+                    key
+                    for term, key in field_terms
+                    if term in text and key in self.inputs
+                ),
+                None,
+            )
         if field_key is None:
             field_key = next(iter(self.inputs), None)
         target = self.inputs.get(field_key)
@@ -1552,6 +1579,41 @@ class EditableTable(QWidget):
         target.setFocus(Qt.FocusReason.OtherFocusReason)
         if isinstance(target, QLineEdit):
             target.selectAll()
+
+    def _field_key_from_path(self, tail):
+        if not tail:
+            return None
+        key = tail[0].replace("~1", "/").replace("~0", "~")
+        direct = {
+            "element": "element",
+            "x": "x",
+            "surface": "surface",
+            "y": "y",
+            "strain": "strain",
+            "measured_value": "strain",
+            "weight": "weight",
+            "zone_a": "zone_a",
+            "zone_b": "zone_b",
+            "node": "node",
+            "node_id": "node",
+            "dof": "dof",
+            "value": "value",
+            "label": "label",
+            "u": "u",
+            "v": "v",
+        }
+        if key in direct:
+            return direct[key]
+        if key != "attachment" or len(tail) < 2:
+            return None
+        attachment_key = tail[1]
+        if attachment_key == "local_coordinates":
+            return "x"
+        if attachment_key in {"surface_side", "surface_angle_degrees"}:
+            return "surface"
+        if attachment_key == "integration_bounds":
+            return "zone_b" if len(tail) >= 3 and tail[2] == "1" else "zone_a"
+        return None
 
     def _emit_change(self):
         if callable(self.on_change):
@@ -2010,12 +2072,31 @@ class MeasurementPreviewWidget(QWidget):
 class AnalysisSetupWidget(QWidget):
     """Adaptive analysis controls that stay compact while only one method exists."""
 
+    RECOVERY_UNBOUND = "unbound"
+    RECOVERY_READY = "ready"
+    RECOVERY_MISSING = "plugin_missing"
+    RECOVERY_VERSION = "version_mismatch"
+    RECOVERY_SCHEMA = "schema_mismatch"
+    RECOVERY_INCOMPATIBLE = "incompatible"
+    RECOVERY_INVALID_SCHEMA = "invalid_schema"
+
     def __init__(self, analysis_service, on_change=None, parent=None):
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName("分析方案")
         self.analysis_service = analysis_service
         self.on_change = on_change
         self._active_algorithm_id = analysis_service.default_algorithm_id
+        self._requested_algorithm_id = self._active_algorithm_id
+        self._active_case_id = None
+        self._saved_case = None
+        self._saved_parameters = {}
+        self._binding_accepted = True
+        self._configuration_modified = False
+        self._recovery_status = self.RECOVERY_UNBOUND
+        self._parameter_issues = ()
         self._parameter_editors = {}
+        self._parameter_schemas = {}
         self._parameter_cache = {}
         self._compatible_algorithm_ids = ()
         self.is_compatible = False
@@ -2024,9 +2105,9 @@ class AnalysisSetupWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(7)
 
-        method_card = QFrame()
-        method_card.setObjectName("analysisMethodCard")
-        method_layout = QHBoxLayout(method_card)
+        self.method_card = QFrame()
+        self.method_card.setObjectName("analysisMethodCard")
+        method_layout = QHBoxLayout(self.method_card)
         method_layout.setContentsMargins(11, 8, 9, 8)
         method_layout.setSpacing(9)
 
@@ -2045,7 +2126,7 @@ class AnalysisSetupWidget(QWidget):
         self.algorithm_state_label.setProperty("state", "pending")
         self.algorithm_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         method_layout.addWidget(self.algorithm_state_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        root.addWidget(method_card)
+        root.addWidget(self.method_card)
 
         self.algorithm_selector_row = QFrame()
         self.algorithm_selector_row.setObjectName("algorithmSelectorRow")
@@ -2055,6 +2136,7 @@ class AnalysisSetupWidget(QWidget):
         selector_label = QLabel("分析方法")
         selector_label.setObjectName("fieldLabel")
         self.algorithm_selector = QComboBox()
+        selector_label.setBuddy(self.algorithm_selector)
         self.algorithm_selector.currentIndexChanged.connect(
             self._on_algorithm_selected
         )
@@ -2066,6 +2148,19 @@ class AnalysisSetupWidget(QWidget):
         self.algorithm_feedback_label.setObjectName("hintLabel")
         self.algorithm_feedback_label.setWordWrap(True)
         root.addWidget(self.algorithm_feedback_label)
+
+        recovery_actions = QHBoxLayout()
+        recovery_actions.setContentsMargins(0, 0, 0, 0)
+        recovery_actions.addStretch(1)
+        self.accept_current_button = QPushButton("采用当前版本/配置")
+        self.accept_current_button.setObjectName("smallPrimaryButton")
+        self.accept_current_button.setToolTip(
+            "明确使用当前已安装插件及其参数模式；接受前项目中的原配置保持不变"
+        )
+        self.accept_current_button.clicked.connect(self._accept_current_binding)
+        self.accept_current_button.hide()
+        recovery_actions.addWidget(self.accept_current_button)
+        root.addLayout(recovery_actions)
 
         parameter_header = QLabel("求解参数")
         parameter_header.setObjectName("fieldLabel")
@@ -2081,7 +2176,11 @@ class AnalysisSetupWidget(QWidget):
         self.parameter_grid.setColumnStretch(3, 1)
         root.addWidget(self.parameter_panel)
 
-        self._activate_algorithm(self._active_algorithm_id)
+        self._activate_algorithm(
+            self._active_algorithm_id,
+            use_cache=False,
+            force_rebuild=True,
+        )
         self.set_project(None)
 
     @property
@@ -2089,26 +2188,150 @@ class AnalysisSetupWidget(QWidget):
         return self._active_algorithm_id
 
     @property
+    def requested_algorithm_id(self):
+        return self._requested_algorithm_id
+
+    @property
+    def active_case_id(self):
+        return self._active_case_id
+
+    @property
+    def recovery_status(self):
+        return self._recovery_status
+
+    @property
+    def should_preserve_saved_case(self):
+        return self._saved_case is not None and not self._binding_accepted
+
+    @property
+    def configuration_modified(self):
+        return self._configuration_modified
+
+    @property
     def active_algorithm(self):
+        if self._active_algorithm_id not in self.analysis_service.registry:
+            return None
         return self.analysis_service.registry.get(self._active_algorithm_id)
+
+    @property
+    def active_algorithm_display_name(self):
+        algorithm = self.active_algorithm
+        if algorithm is not None:
+            return algorithm.metadata.display_name
+        return self._requested_algorithm_id or "未指定算法"
+
+    @property
+    def active_algorithm_version(self):
+        algorithm = self.active_algorithm
+        return None if algorithm is None else algorithm.metadata.version
+
+    @property
+    def active_parameter_schema_version(self):
+        algorithm = self.active_algorithm
+        if algorithm is None:
+            return None
+        return algorithm.metadata.parameter_schema_version
+
+    @property
+    def parameter_issues(self):
+        return tuple(self._parameter_issues)
+
+    @staticmethod
+    def parameter_field_path(name):
+        return parameter_field(name)
+
+    def field_target(self, field_path):
+        """Resolve stable analysis field paths without inspecting translated text."""
+        field_path = str(field_path or "")
+        if field_path in {
+            "/analysis/algorithm/id",
+            "/analysis/algorithm/version",
+            "/analysis/algorithm/parameter-schema-version",
+        }:
+            if not self.accept_current_button.isHidden():
+                return self.accept_current_button
+            if not self.algorithm_selector_row.isHidden():
+                return self.algorithm_selector
+            return self
+        prefix = "/analysis/parameters/"
+        if not field_path.startswith(prefix):
+            return None
+        name = field_path[len(prefix) :].replace("~1", "/").replace("~0", "~")
+        return self.parameter_editor(name)
 
     def parameter_editor(self, name):
         return self._parameter_editors.get(name)
 
     def parameter_values(self):
+        if self.should_preserve_saved_case:
+            return dict(self._saved_parameters)
         values = {
             name: self._editor_value(editor)
             for name, editor in self._parameter_editors.items()
+            if editor.property("parameterHasValue") is not False
         }
-        self._parameter_cache[self._active_algorithm_id] = dict(values)
+        if self._active_algorithm_id:
+            self._parameter_cache[self._active_algorithm_id] = dict(values)
         return values
 
     def set_parameter_values(self, parameters):
+        if self.should_preserve_saved_case:
+            return
         for name, value in dict(parameters).items():
             editor = self._parameter_editors.get(name)
-            if editor is not None:
-                self._set_editor_value(editor, value)
-        self._parameter_cache[self._active_algorithm_id] = self.parameter_values()
+            schema = self._parameter_schemas.get(name)
+            if (
+                editor is not None
+                and schema is not None
+                and self._parameter_value_is_valid(name, schema, value)
+            ):
+                if self._set_editor_value(editor, value):
+                    editor.setProperty("parameterHasValue", True)
+        if self._active_algorithm_id:
+            self._parameter_cache[self._active_algorithm_id] = self.parameter_values()
+
+    @staticmethod
+    def _active_case(project):
+        if project is None or not project.analysis_cases:
+            return None
+        if project.active_analysis_id is not None:
+            return next(
+                (
+                    case
+                    for case in project.analysis_cases
+                    if case.identifier == project.active_analysis_id
+                ),
+                project.analysis_cases[0],
+            )
+        return project.analysis_cases[0]
+
+    def project_requires_recovery(self, project):
+        """Inspect binding safety without changing the current editor state."""
+        active_case = self._active_case(project)
+        if active_case is None:
+            return False
+        requested_id = active_case.algorithm_id
+        if requested_id not in self.analysis_service.registry:
+            return True
+        matches = match_project_algorithms(
+            project,
+            self.analysis_service.registry.list(),
+        )
+        match = next(
+            (item for item in matches if item.algorithm_id == requested_id),
+            None,
+        )
+        if match is None or not match.compatible:
+            return True
+        resolution = self.analysis_service.registry.resolve(
+            requested_id,
+            expected_version=active_case.algorithm_version,
+            expected_schema_version=active_case.parameter_schema_version,
+        )
+        if not resolution.is_ready:
+            return True
+        schema = self.analysis_service.registry.parameter_schema(requested_id)
+        return not validate_parameters(schema, active_case.parameters).is_valid
 
     def set_project(self, project):
         algorithms = self.analysis_service.registry.list()
@@ -2122,104 +2345,366 @@ class AnalysisSetupWidget(QWidget):
                 algorithm.metadata.identifier for algorithm in algorithms
             )
 
-        active_case = None
-        if project is not None and project.active_analysis_id is not None:
-            active_case = next(
-                (
-                    case
-                    for case in project.analysis_cases
-                    if case.identifier == project.active_analysis_id
-                ),
-                None,
-            )
-        preferred_id = None if active_case is None else active_case.algorithm_id
-        if preferred_id not in compatible_ids:
-            preferred_id = (
-                self._active_algorithm_id
-                if self._active_algorithm_id in compatible_ids
-                else (compatible_ids[0] if compatible_ids else None)
-            )
-
-        self._compatible_algorithm_ids = compatible_ids
-        self.algorithm_selector.blockSignals(True)
-        self.algorithm_selector.clear()
-        for algorithm in algorithms:
-            identifier = algorithm.metadata.identifier
-            if identifier in compatible_ids:
-                self.algorithm_selector.addItem(
-                    algorithm.metadata.display_name,
-                    identifier,
-                )
-        if preferred_id is not None:
-            selected_index = self.algorithm_selector.findData(preferred_id)
-            self.algorithm_selector.setCurrentIndex(max(selected_index, 0))
-        self.algorithm_selector.blockSignals(False)
-        self.algorithm_selector_row.setVisible(len(compatible_ids) > 1)
-
-        display_id = preferred_id or self._active_algorithm_id
-        if display_id not in {
-            algorithm.metadata.identifier for algorithm in algorithms
-        }:
-            display_id = self.analysis_service.default_algorithm_id
-        case_parameters = (
-            active_case.parameters
-            if active_case is not None and active_case.algorithm_id == display_id
-            else None
+        active_case = self._active_case(project)
+        self._parameter_cache = {}
+        self._parameter_issues = ()
+        self._saved_case = active_case
+        self._configuration_modified = False
+        self._active_case_id = None if active_case is None else active_case.identifier
+        self._saved_parameters = (
+            {} if active_case is None else dict(active_case.parameters)
         )
-        self._activate_algorithm(display_id, case_parameters)
+        self._compatible_algorithm_ids = compatible_ids
 
         if project is None:
+            self._requested_algorithm_id = self.analysis_service.default_algorithm_id
+            self._active_algorithm_id = self._requested_algorithm_id
+            self._binding_accepted = True
+            self._recovery_status = self.RECOVERY_UNBOUND
+            self._activate_algorithm(
+                self._active_algorithm_id,
+                use_cache=False,
+                force_rebuild=True,
+            )
+            self._configure_selector(algorithms, blocked=False)
             self.is_compatible = False
             self._set_state("待匹配", "pending")
             self.algorithm_feedback_label.setText("载入模型后自动检查适用性。")
             self.parameter_panel.setEnabled(True)
-        elif display_id in compatible_ids:
-            self.is_compatible = True
-            self._set_state("可运行", "ready")
-            if len(compatible_ids) == 1:
-                feedback = "已根据当前模型自动匹配，无需手动选择。"
+            self.accept_current_button.hide()
+            return
+
+        if active_case is None:
+            selected_id = (
+                self.analysis_service.default_algorithm_id
+                if self.analysis_service.default_algorithm_id in compatible_ids
+                else (compatible_ids[0] if compatible_ids else self.analysis_service.default_algorithm_id)
+            )
+            self._requested_algorithm_id = selected_id
+            self._active_algorithm_id = selected_id
+            self._binding_accepted = True
+            self._recovery_status = (
+                self.RECOVERY_READY
+                if selected_id in compatible_ids
+                else self.RECOVERY_INCOMPATIBLE
+            )
+            self._activate_algorithm(
+                selected_id,
+                use_cache=False,
+                force_rebuild=True,
+            )
+            self._configure_selector(algorithms, blocked=False)
+            self.is_compatible = selected_id in compatible_ids
+            if self.is_compatible:
+                self._set_state("可运行", "ready")
+                self.algorithm_feedback_label.setText(
+                    "当前项目尚无分析工况；保存时将创建活动工况。"
+                )
+                self.parameter_panel.setEnabled(True)
             else:
-                feedback = f"当前模型有 {len(compatible_ids)} 个适用方法，可按需切换。"
-            self.algorithm_feedback_label.setText(feedback)
-            self.parameter_panel.setEnabled(True)
-        else:
+                self._set_state("不适用", "blocked")
+                self.algorithm_feedback_label.setText(
+                    "当前模型没有已注册的适用算法。"
+                )
+                self.parameter_panel.setEnabled(False)
+            self.accept_current_button.hide()
+            return
+
+        requested_id = active_case.algorithm_id
+        self._requested_algorithm_id = requested_id
+        self._active_algorithm_id = requested_id
+        self._binding_accepted = False
+
+        if requested_id not in self.analysis_service.registry:
+            self._recovery_status = self.RECOVERY_MISSING
             self.is_compatible = False
+            self._set_missing_identity(active_case)
+            self._show_preserved_parameters()
+            self._set_state("插件缺失", "blocked")
+            version = getattr(active_case, "algorithm_version", None) or "未知"
+            self.algorithm_feedback_label.setText(
+                f"项目需要算法 {requested_id}（v{version}），但当前未安装。"
+                "原算法 ID 与参数已保留；请选择替代方法后才会改绑。"
+            )
+            self.accept_current_button.hide()
+            self._configure_selector(algorithms, blocked=True)
+            return
+
+        algorithm = self.analysis_service.registry.get(requested_id)
+        match = match_by_id.get(requested_id)
+        if match is None or not match.compatible:
+            self._recovery_status = self.RECOVERY_INCOMPATIBLE
+            self.is_compatible = False
+            self._set_installed_identity(algorithm)
+            self._show_preserved_parameters()
             self._set_state("不适用", "blocked")
-            match = match_by_id.get(display_id)
-            reason = "当前模型没有已注册的适用算法。"
+            reason = "当前模型不适用于项目保存的算法。"
             if match is not None and match.reasons:
                 reason = "；".join(match.reasons)
-            self.algorithm_feedback_label.setText(reason)
-            self.parameter_panel.setEnabled(False)
+            self.algorithm_feedback_label.setText(
+                f"{reason} 原工况保持不变；请选择兼容方法后才会改绑。"
+            )
+            self.accept_current_button.hide()
+            self._configure_selector(algorithms, blocked=True)
+            return
 
-    def _activate_algorithm(self, identifier, parameters=None):
-        if self._parameter_editors:
-            self._parameter_cache[self._active_algorithm_id] = self.parameter_values()
+        try:
+            schema = self.analysis_service.registry.parameter_schema(requested_id)
+        except (TypeError, ValueError) as exc:
+            self._recovery_status = self.RECOVERY_INVALID_SCHEMA
+            self.is_compatible = False
+            self._set_installed_identity(algorithm)
+            self._show_preserved_parameters()
+            self._set_state("模式错误", "blocked")
+            self.algorithm_feedback_label.setText(
+                f"插件参数模式无效：{exc} 原工况未修改。"
+            )
+            self.accept_current_button.hide()
+            self._configure_selector(algorithms, blocked=True)
+            return
+
+        report = validate_parameters(schema, self._saved_parameters)
+        self._parameter_issues = tuple(report.issues)
+        saved_algorithm_version = getattr(active_case, "algorithm_version", None)
+        saved_schema_version = getattr(active_case, "parameter_schema_version", None)
+        algorithm_version_changed = (
+            saved_algorithm_version not in (None, "")
+            and saved_algorithm_version != algorithm.metadata.version
+        )
+        schema_version_changed = (
+            saved_schema_version not in (None, "")
+            and saved_schema_version != algorithm.metadata.parameter_schema_version
+        )
+
+        if algorithm_version_changed or schema_version_changed or not report.is_valid:
+            self._recovery_status = (
+                self.RECOVERY_SCHEMA
+                if schema_version_changed or not report.is_valid
+                else self.RECOVERY_VERSION
+            )
+            self.is_compatible = False
+            self._set_installed_identity(algorithm, active_case=active_case)
+            self._show_preserved_parameters()
+            self._set_state("需确认", "pending")
+            details = []
+            if algorithm_version_changed:
+                details.append(
+                    f"算法版本：项目 {saved_algorithm_version} → 当前 {algorithm.metadata.version}"
+                )
+            if schema_version_changed:
+                details.append(
+                    "参数模式：项目 "
+                    f"{saved_schema_version} → 当前 {algorithm.metadata.parameter_schema_version}"
+                )
+            details.extend(issue.message for issue in report.issues[:3])
+            self.algorithm_feedback_label.setText(
+                "；".join(details)
+                + "。接受前普通保存不会修改原工况；采用后才切换到当前版本和配置。"
+            )
+            self.accept_current_button.show()
+            self._configure_selector(algorithms, blocked=True)
+            return
+
+        self._binding_accepted = True
+        self._configuration_modified = False
+        self._recovery_status = self.RECOVERY_READY
+        self._activate_algorithm(
+            requested_id,
+            self._saved_parameters,
+            use_cache=False,
+            force_rebuild=True,
+        )
+        self._configure_selector(algorithms, blocked=False)
+        self.is_compatible = True
+        self._set_state("可运行", "ready")
+        if len(compatible_ids) == 1:
+            feedback = "已恢复项目保存的分析方法和参数。"
+        else:
+            feedback = f"已恢复项目方法；当前模型另有 {len(compatible_ids) - 1} 个适用方法。"
+        self.algorithm_feedback_label.setText(feedback)
+        self.parameter_panel.setEnabled(True)
+        self.accept_current_button.hide()
+
+    def _configure_selector(self, algorithms, *, blocked):
+        compatible = [
+            algorithm
+            for algorithm in algorithms
+            if algorithm.metadata.identifier in self._compatible_algorithm_ids
+        ]
+        self.algorithm_selector.blockSignals(True)
+        self.algorithm_selector.clear()
+        if blocked:
+            candidates = [
+                algorithm
+                for algorithm in compatible
+                if algorithm.metadata.identifier != self._requested_algorithm_id
+            ]
+            if candidates:
+                self.algorithm_selector.addItem("选择替代算法…", None)
+                for algorithm in candidates:
+                    self.algorithm_selector.addItem(
+                        algorithm.metadata.display_name,
+                        algorithm.metadata.identifier,
+                    )
+            self.algorithm_selector_row.setVisible(bool(candidates))
+        else:
+            for algorithm in compatible:
+                self.algorithm_selector.addItem(
+                    algorithm.metadata.display_name,
+                    algorithm.metadata.identifier,
+                )
+            selected_index = self.algorithm_selector.findData(
+                self._active_algorithm_id
+            )
+            if selected_index >= 0:
+                self.algorithm_selector.setCurrentIndex(selected_index)
+            self.algorithm_selector_row.setVisible(len(compatible) > 1)
+        self.algorithm_selector.blockSignals(False)
+
+    def _set_missing_identity(self, active_case):
+        self.algorithm_name_label.setText("原算法未安装")
+        version = getattr(active_case, "algorithm_version", None) or "未知版本"
+        schema_version = (
+            getattr(active_case, "parameter_schema_version", None) or "未知模式"
+        )
+        self.algorithm_meta_label.setText(
+            f"{active_case.algorithm_id} · v{version} · 参数模式 {schema_version}"
+        )
+        self.algorithm_name_label.setToolTip(active_case.algorithm_id)
+
+    def _set_installed_identity(self, algorithm, *, active_case=None):
+        self.algorithm_name_label.setText(algorithm.metadata.display_name)
+        if active_case is None:
+            meta = (
+                f"已安装方法 · v{algorithm.metadata.version} · "
+                f"参数模式 {algorithm.metadata.parameter_schema_version}"
+            )
+        else:
+            saved_version = getattr(active_case, "algorithm_version", None) or "未知"
+            saved_schema = (
+                getattr(active_case, "parameter_schema_version", None) or "未知"
+            )
+            meta = (
+                f"项目 v{saved_version} / 当前 v{algorithm.metadata.version} · "
+                f"参数模式 {saved_schema} / {algorithm.metadata.parameter_schema_version}"
+            )
+        self.algorithm_meta_label.setText(meta)
+        self.algorithm_name_label.setToolTip(algorithm.metadata.description)
+
+    def _clear_parameter_panel(self):
+        while self.parameter_grid.count():
+            item = self.parameter_grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._parameter_editors = {}
+        self._parameter_schemas = {}
+
+    def _show_preserved_parameters(self):
+        self._clear_parameter_panel()
+        count = len(self._saved_parameters)
+        label = QLabel(f"已原样保留 {count} 个项目参数；确认恢复或替代前不会写入默认值。")
+        label.setObjectName("hintLabel")
+        label.setWordWrap(True)
+        label.setToolTip(repr(self._saved_parameters))
+        self.parameter_grid.addWidget(label, 0, 0, 1, 4)
+        self.parameter_panel.setEnabled(False)
+
+    def _known_valid_parameters(self, algorithm):
+        schema = self.analysis_service.registry.parameter_schema(
+            algorithm.metadata.identifier
+        )
+        properties = dict(schema.get("properties", {}))
+        values = {}
+        for name, value in self._saved_parameters.items():
+            property_schema = properties.get(name)
+            if property_schema is None:
+                continue
+            if self._parameter_value_is_valid(name, property_schema, value):
+                values[name] = value
+        return values
+
+    def _accept_current_binding(self, _checked=False):
+        if self._requested_algorithm_id not in self.analysis_service.registry:
+            return
+        if self._requested_algorithm_id not in self._compatible_algorithm_ids:
+            return
+        algorithm = self.analysis_service.registry.get(self._requested_algorithm_id)
+        values = self._known_valid_parameters(algorithm)
+        previous_status = self._recovery_status
+        try:
+            self._activate_algorithm(
+                self._requested_algorithm_id,
+                values,
+                use_cache=False,
+                force_rebuild=True,
+            )
+        except Exception as exc:
+            self._active_algorithm_id = self._requested_algorithm_id
+            self._binding_accepted = False
+            self._configuration_modified = False
+            self._recovery_status = previous_status
+            self.is_compatible = False
+            self._set_installed_identity(algorithm, active_case=self._saved_case)
+            self._show_preserved_parameters()
+            self._set_state("无法采用", "blocked")
+            self.algorithm_feedback_label.setText(
+                f"当前插件参数界面无法建立：{exc} 原工况保持不变。"
+            )
+            self.accept_current_button.hide()
+            self._configure_selector(
+                self.analysis_service.registry.list(),
+                blocked=True,
+            )
+            return
+        self._binding_accepted = True
+        self._configuration_modified = True
+        self._recovery_status = self.RECOVERY_READY
+        self.is_compatible = True
+        self._set_state("可运行", "ready")
+        self.algorithm_feedback_label.setText(
+            "已明确采用当前插件版本和参数模式；未知旧参数仍会原样保留。"
+        )
+        self.parameter_panel.setEnabled(True)
+        self.accept_current_button.hide()
+        self._configure_selector(self.analysis_service.registry.list(), blocked=False)
+        self._parameters_changed()
+
+    def _activate_algorithm(
+        self,
+        identifier,
+        parameters=None,
+        *,
+        use_cache=True,
+        force_rebuild=False,
+    ):
+        if identifier not in self.analysis_service.registry:
+            self._active_algorithm_id = identifier
+            return
+        if self._parameter_editors and self._active_algorithm_id:
+            self._parameter_cache[self._active_algorithm_id] = {
+                name: self._editor_value(editor)
+                for name, editor in self._parameter_editors.items()
+            }
         algorithm = self.analysis_service.registry.get(identifier)
-        same_algorithm = identifier == self._active_algorithm_id and bool(
-            self._parameter_editors
+        same_algorithm = (
+            not force_rebuild
+            and identifier == self._active_algorithm_id
+            and bool(self._parameter_editors)
         )
         self._active_algorithm_id = identifier
-        self.algorithm_name_label.setText(algorithm.metadata.display_name)
-        self.algorithm_meta_label.setText(
-            f"内置方法 · v{algorithm.metadata.version}"
-        )
-        self.algorithm_name_label.setToolTip(algorithm.metadata.description)
+        self._set_installed_identity(algorithm)
 
         if same_algorithm:
             if parameters is not None:
                 self.set_parameter_values(parameters)
             return
 
-        while self.parameter_grid.count():
-            item = self.parameter_grid.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
-        self._parameter_editors = {}
-
-        schema = dict(algorithm.parameter_schema())
+        self._clear_parameter_panel()
+        schema = self.analysis_service.registry.parameter_schema(identifier)
         properties = dict(schema.get("properties", {}))
-        initial_values = dict(self._parameter_cache.get(identifier, {}))
+        initial_values = (
+            dict(self._parameter_cache.get(identifier, {})) if use_cache else {}
+        )
         if parameters is not None:
             initial_values.update(parameters)
         for index, (name, field_schema) in enumerate(properties.items()):
@@ -2227,15 +2712,26 @@ class AnalysisSetupWidget(QWidget):
             label = QLabel(str(field_schema.get("title", name)))
             label.setObjectName("fieldLabel")
             editor = self._create_parameter_editor(field_schema)
+            editor.setAccessibleName(label.text())
+            editor.setProperty("fieldPath", parameter_field(name))
+            label.setBuddy(editor)
+            has_value = name in initial_values or "default" in field_schema
             value = initial_values.get(name, field_schema.get("default"))
-            if value is not None:
-                self._set_editor_value(editor, value)
+            if (
+                has_value
+                and self._parameter_value_is_valid(name, field_schema, value)
+            ):
+                has_value = self._set_editor_value(editor, value)
+            else:
+                has_value = False
+            editor.setProperty("parameterHasValue", bool(has_value))
             self._connect_parameter_editor(editor)
             row = index // 2
             column = (index % 2) * 2
             self.parameter_grid.addWidget(label, row, column)
             self.parameter_grid.addWidget(editor, row, column + 1)
             self._parameter_editors[name] = editor
+            self._parameter_schemas[name] = field_schema
 
         if not properties:
             empty_label = QLabel("此方法无需额外求解参数。")
@@ -2243,44 +2739,96 @@ class AnalysisSetupWidget(QWidget):
             self.parameter_grid.addWidget(empty_label, 0, 0, 1, 4)
         self._parameter_cache[identifier] = self.parameter_values()
 
+    @staticmethod
+    def _parameter_value_is_valid(name, schema, value):
+        report = validate_parameters(
+            {"type": "object", "properties": {name: dict(schema)}},
+            {name: value},
+        )
+        return report.is_valid
+
     def _create_parameter_editor(self, schema):
         values = schema.get("enum")
         if values:
             editor = QComboBox()
+            if "default" not in schema:
+                editor.addItem("— 未设置 —", None)
+                editor.setProperty("parameterAllowsUnset", True)
             for value in values:
                 editor.addItem(str(value), value)
             return editor
         value_type = schema.get("type", "string")
         if value_type == "integer":
+            has_complete_range = "minimum" in schema and "maximum" in schema
+            has_default = "default" in schema
+            if has_complete_range and has_default:
+                minimum = ceil(schema["minimum"])
+                maximum = floor(schema["maximum"])
+            else:
+                minimum = maximum = None
+            if (
+                minimum is None
+                or maximum is None
+                or minimum < -(2**31)
+                or maximum > 2**31 - 1
+            ):
+                editor = QLineEdit()
+                editor.setProperty("parameterValueType", "integer")
+                editor.setProperty("parameterAllowsUnset", not has_default)
+                editor.setPlaceholderText("输入整数")
+                return editor
             editor = QSpinBox()
-            editor.setRange(
-                int(schema.get("minimum", -1_000_000)),
-                int(schema.get("maximum", 1_000_000)),
-            )
+            editor.setRange(minimum, maximum)
             editor.setKeyboardTracking(False)
             return editor
         if value_type == "number":
-            editor = QDoubleSpinBox()
-            editor.setDecimals(8)
-            editor.setRange(
-                float(schema.get("minimum", -1.0e12)),
-                float(schema.get("maximum", 1.0e12)),
-            )
-            editor.setKeyboardTracking(False)
+            editor = QLineEdit()
+            editor.setProperty("parameterValueType", "number")
+            editor.setProperty("parameterAllowsUnset", "default" not in schema)
+            editor.setPlaceholderText("输入数值")
             return editor
         if value_type == "boolean":
+            if "default" not in schema:
+                editor = QComboBox()
+                editor.addItem("— 未设置 —", None)
+                editor.addItem("是", True)
+                editor.addItem("否", False)
+                editor.setProperty("parameterAllowsUnset", True)
+                return editor
             return QCheckBox()
-        return QLineEdit()
+        editor = QLineEdit()
+        editor.setProperty("parameterAllowsUnset", "default" not in schema)
+        if "default" not in schema:
+            editor.setPlaceholderText("未设置")
+        return editor
 
     def _connect_parameter_editor(self, editor):
         if isinstance(editor, QComboBox):
-            editor.currentIndexChanged.connect(self._parameters_changed)
+            editor.currentIndexChanged.connect(
+                lambda _index, target=editor: self._parameter_editor_changed(target)
+            )
         elif isinstance(editor, (QSpinBox, QDoubleSpinBox)):
-            editor.valueChanged.connect(self._parameters_changed)
+            editor.valueChanged.connect(
+                lambda _value, target=editor: self._parameter_editor_changed(target)
+            )
         elif isinstance(editor, QCheckBox):
-            editor.toggled.connect(self._parameters_changed)
+            editor.toggled.connect(
+                lambda _checked, target=editor: self._parameter_editor_changed(target)
+            )
         else:
-            editor.textChanged.connect(self._parameters_changed)
+            editor.textChanged.connect(
+                lambda _text, target=editor: self._parameter_editor_changed(target)
+            )
+
+    def _parameter_editor_changed(self, editor):
+        has_value = True
+        if editor.property("parameterAllowsUnset"):
+            if isinstance(editor, QComboBox):
+                has_value = editor.currentData() is not None
+            elif isinstance(editor, QLineEdit):
+                has_value = bool(editor.text().strip())
+        editor.setProperty("parameterHasValue", has_value)
+        self._parameters_changed()
 
     def _editor_value(self, editor):
         if isinstance(editor, QComboBox):
@@ -2289,6 +2837,19 @@ class AnalysisSetupWidget(QWidget):
             return editor.value()
         if isinstance(editor, QCheckBox):
             return editor.isChecked()
+        parameter_value_type = editor.property("parameterValueType")
+        if parameter_value_type == "integer":
+            text = editor.text().strip()
+            if text and text.lstrip("+-").isdigit():
+                return int(text)
+            return text
+        if parameter_value_type == "number":
+            text = editor.text().strip()
+            try:
+                value = float(text)
+            except ValueError:
+                return text
+            return value if np.isfinite(value) else text
         return editor.text()
 
     def _set_editor_value(self, editor, value):
@@ -2300,14 +2861,28 @@ class AnalysisSetupWidget(QWidget):
                     index = editor.findText(str(value))
                 if index >= 0:
                     editor.setCurrentIndex(index)
+                    return True
+                return False
             elif isinstance(editor, QSpinBox):
-                editor.setValue(int(value))
+                parsed = int(value)
+                if isinstance(value, bool) or parsed < editor.minimum() or parsed > editor.maximum():
+                    return False
+                editor.setValue(parsed)
+                return True
             elif isinstance(editor, QDoubleSpinBox):
-                editor.setValue(float(value))
+                parsed = float(value)
+                if not np.isfinite(parsed) or parsed < editor.minimum() or parsed > editor.maximum():
+                    return False
+                editor.setValue(parsed)
+                return True
             elif isinstance(editor, QCheckBox):
+                if not isinstance(value, bool):
+                    return False
                 editor.setChecked(bool(value))
+                return True
             else:
                 editor.setText(str(value))
+                return True
         finally:
             editor.blockSignals(False)
 
@@ -2315,12 +2890,120 @@ class AnalysisSetupWidget(QWidget):
         if index < 0:
             return
         identifier = self.algorithm_selector.itemData(index)
-        if not identifier or identifier == self._active_algorithm_id:
+        if not identifier:
             return
-        self._activate_algorithm(identifier)
+        if identifier == self._active_algorithm_id and self._binding_accepted:
+            return
+        previous_id = self._active_algorithm_id
+        previous_requested_id = self._requested_algorithm_id
+        previous_status = self._recovery_status
+        previous_binding_accepted = self._binding_accepted
+        previous_configuration_modified = self._configuration_modified
+        previous_is_compatible = self.is_compatible
+        previous_parameter_issues = self._parameter_issues
+        previous_parameter_values = (
+            self.parameter_values() if previous_binding_accepted else {}
+        )
+        previous_parameter_cache = {
+            algorithm_id: dict(values)
+            for algorithm_id, values in self._parameter_cache.items()
+        }
+        previous_state_text = self.algorithm_state_label.text()
+        previous_state_style = self.algorithm_state_label.property("state")
+        previous_accept_visible = not self.accept_current_button.isHidden()
+        previous_panel_enabled = self.parameter_panel.isEnabled()
+        previous_selector_index = self.algorithm_selector.findData(previous_id)
+        if previous_selector_index < 0:
+            previous_selector_index = 0
+        try:
+            self._activate_algorithm(
+                identifier,
+                use_cache=True,
+                force_rebuild=True,
+            )
+        except Exception as exc:
+            restore_error = None
+            self._parameter_cache = previous_parameter_cache
+            if (
+                previous_binding_accepted
+                and previous_id in self.analysis_service.registry
+            ):
+                try:
+                    self._activate_algorithm(
+                        previous_id,
+                        previous_parameter_values,
+                        use_cache=False,
+                        force_rebuild=True,
+                    )
+                except Exception as restore_exc:
+                    restore_error = restore_exc
+
+            self._active_algorithm_id = previous_id
+            self._requested_algorithm_id = previous_requested_id
+            self._parameter_issues = previous_parameter_issues
+            self.algorithm_selector.blockSignals(True)
+            self.algorithm_selector.setCurrentIndex(previous_selector_index)
+            self.algorithm_selector.blockSignals(False)
+
+            if restore_error is None and previous_binding_accepted:
+                self._binding_accepted = True
+                self._configuration_modified = previous_configuration_modified
+                self._recovery_status = previous_status
+                self.is_compatible = previous_is_compatible
+                self.parameter_panel.setEnabled(previous_panel_enabled)
+                self.accept_current_button.setVisible(previous_accept_visible)
+                self._set_state(previous_state_text, previous_state_style)
+                self.algorithm_feedback_label.setText(
+                    f"未能切换到所选插件：{exc} 已恢复原分析方法和参数。"
+                )
+                return
+
+            self._binding_accepted = False
+            self._configuration_modified = False
+            self._recovery_status = previous_status
+            self.is_compatible = False
+            if (
+                self._saved_case is not None
+                and previous_id not in self.analysis_service.registry
+            ):
+                self._set_missing_identity(self._saved_case)
+            elif previous_id in self.analysis_service.registry:
+                previous_algorithm = self.analysis_service.registry.get(previous_id)
+                active_case = (
+                    self._saved_case
+                    if previous_status
+                    in {self.RECOVERY_VERSION, self.RECOVERY_SCHEMA}
+                    else None
+                )
+                self._set_installed_identity(
+                    previous_algorithm,
+                    active_case=active_case,
+                )
+            self._show_preserved_parameters()
+            self.accept_current_button.setVisible(previous_accept_visible)
+            self._set_state(previous_state_text, previous_state_style)
+            detail = f"替代插件参数界面无法建立：{exc}"
+            if restore_error is not None:
+                detail += f"；原插件界面也无法恢复：{restore_error}"
+            self.algorithm_feedback_label.setText(
+                f"{detail}。原工况仍按原样保留。"
+            )
+            return
+        self._requested_algorithm_id = identifier
+        self._binding_accepted = True
+        self._recovery_status = self.RECOVERY_READY
+        self.is_compatible = identifier in self._compatible_algorithm_ids
+        self._set_state("可运行" if self.is_compatible else "不适用", "ready" if self.is_compatible else "blocked")
+        self.algorithm_feedback_label.setText(
+            "已明确改用所选算法；原工况中的未知参数仍会保留。"
+        )
+        self.parameter_panel.setEnabled(self.is_compatible)
+        self.accept_current_button.hide()
+        self._configure_selector(self.analysis_service.registry.list(), blocked=False)
         self._parameters_changed()
 
     def _parameters_changed(self, *_args):
+        self._configuration_modified = True
         self._parameter_cache[self._active_algorithm_id] = self.parameter_values()
         if callable(self.on_change):
             self.on_change()
@@ -3280,15 +3963,33 @@ class ReconstructionMainWindow(QMainWindow):
         self._mark_results_stale()
 
     def _on_analysis_setup_changed(self):
+        self._sync_analysis_parameter_controls()
         if hasattr(self, "analysis_metric_labels"):
             self.analysis_metric_labels["solver"].setText(
-                self.analysis_setup.active_algorithm.metadata.display_name
+                self.analysis_setup.active_algorithm_display_name
             )
         if self.current_project_document is not None:
+            config = None
+            if not self.analysis_setup.should_preserve_saved_case:
+                try:
+                    config = self._build_form_config(require_measurements=False)
+                except (KeyError, TypeError, ValueError):
+                    config = None
             self.current_project_document = self._apply_analysis_setup_to_project(
-                self.current_project_document
+                self.current_project_document,
+                config=config,
             )
         self._mark_results_stale()
+
+    def _sync_analysis_parameter_controls(self):
+        blocked = self.analysis_setup.should_preserve_saved_case
+        message = (
+            "当前插件绑定尚未恢复；这些分析参数按原工况不透明保留，"
+            "明确采用当前插件或替代算法后才可编辑。"
+        )
+        for widget in (self.query_xs_edit, self.true_point_editor):
+            widget.setEnabled(not blocked)
+            widget.setToolTip(message if blocked else "")
 
     def _on_plot_settings_changed(self, *_args):
         if self._loading_form:
@@ -3341,7 +4042,42 @@ class ReconstructionMainWindow(QMainWindow):
         style.polish(widget)
         widget.update()
 
-    def _readiness_issue_target(self, message):
+    def _readiness_issue_target(self, field_path=None, message=""):
+        field_path = str(field_path or "")
+        if field_path.startswith("/analysis/"):
+            return 0, self.analysis_setup.field_target(field_path) or self.analysis_setup
+        if field_path == "/model/node_x":
+            return 0, self.node_x_edit
+        if field_path.startswith("/sections/") and field_path.endswith("/thickness"):
+            return 0, self.thickness_edit
+        if field_path.startswith("/materials/") and field_path.endswith(
+            "/elastic_modulus"
+        ):
+            return 0, self.elastic_modulus_edit
+        if field_path == "/view_state/thickness_scale":
+            return 0, self.thickness_scale_combo
+        if field_path in {"/view_state/y_limits", "/view_state/y_limits/0"}:
+            return 0, self.y_min_edit
+        if field_path == "/view_state/y_limits/1":
+            return 0, self.y_max_edit
+        if field_path.startswith("/view_state/"):
+            return 0, self.display_settings_button
+        if field_path.startswith(("/measurements/", "/sensors/")) or field_path in {
+            "/measurements",
+            "/sensors",
+        }:
+            return 1, self.measurement_editor
+        if field_path.startswith("/boundary_conditions/") or field_path == "/boundary_conditions":
+            return 2, self.boundary_editor
+        if field_path.startswith("/true_points/") or field_path == "/true_points":
+            return 3, self.true_point_editor
+        if field_path.startswith("/data_exchange/"):
+            return 4, self.json_text
+        if field_path.startswith("/model/"):
+            return 0, self.analysis_setup
+
+        # Compatibility path for third-party plugins that have not yet attached
+        # a field. New built-in validation never depends on translated text.
         text = str(message)
         if "厚度显示倍率" in text:
             return 0, self.thickness_scale_combo
@@ -3427,7 +4163,10 @@ class ReconstructionMainWindow(QMainWindow):
             self.display_settings_button.setChecked(True)
         if widget is not None:
             if isinstance(widget, EditableTable):
-                widget.focus_validation_issue(issue["message"])
+                widget.focus_validation_issue(
+                    issue["message"],
+                    field_path=issue.get("field"),
+                )
             else:
                 widget.setFocus(Qt.FocusReason.OtherFocusReason)
             if isinstance(widget, QLineEdit):
@@ -3455,14 +4194,35 @@ class ReconstructionMainWindow(QMainWindow):
             self.true_point_editor,
         ):
             editor.set_validation_state()
+        for editor in self.analysis_setup._parameter_editors.values():
+            self._set_validation_state(editor)
 
         issues = []
         tab_counts = {index: 0 for index in range(len(self.left_tab_names))}
         tab_messages = {index: [] for index in range(len(self.left_tab_names))}
 
-        def add_issue(message):
-            tab_index, widget = self._readiness_issue_target(message)
-            issue = {"message": str(message), "tab": tab_index, "widget": widget}
+        def add_issue(value, *, field=None, severity="error"):
+            if isinstance(value, ValidationIssue):
+                message = value.message
+                field_path = value.field
+                issue_severity = value.severity
+            else:
+                message = str(value)
+                field_path = field or getattr(value, "field", None)
+                issue_severity = severity
+            if issue_severity != "error":
+                return
+            tab_index, widget = self._readiness_issue_target(
+                field_path,
+                message,
+            )
+            issue = {
+                "message": str(message),
+                "field": field_path,
+                "severity": issue_severity,
+                "tab": tab_index,
+                "widget": widget,
+            }
             issues.append(issue)
             tab_counts[tab_index] += 1
             tab_messages[tab_index].append(str(message))
@@ -3493,21 +4253,23 @@ class ReconstructionMainWindow(QMainWindow):
                 self.boundary_editor.set_validation_state("error", str(message))
             elif widget is self.true_point_editor:
                 self.true_point_editor.set_validation_state("error", str(message))
+            elif widget is not None:
+                self._set_validation_state(widget, "error", str(message))
 
         capability = None
         plot_options = None
         try:
             plot_options = self._collect_plot_options()
         except (TypeError, ValueError) as exc:
-            add_issue(str(exc))
+            add_issue(exc)
 
         if self.current_project_document is None:
-            add_issue("尚未载入项目模型。")
+            add_issue("尚未载入项目模型。", field="/model")
         else:
             try:
                 capability = PathBeamEditor.capability(self.current_project_document)
             except (TypeError, ValueError) as exc:
-                add_issue(str(exc))
+                add_issue(exc, field="/model/geometry")
 
             if (
                 capability is not None
@@ -3515,28 +4277,58 @@ class ReconstructionMainWindow(QMainWindow):
                 and plot_options is not None
             ):
                 try:
-                    validate_config(self._build_form_config(plot_options=plot_options))
+                    config = self._build_form_config(plot_options=plot_options)
+                    if self.analysis_setup.is_compatible:
+                        report = self.analysis_service.validate(
+                            config,
+                            algorithm_id=self.analysis_setup.active_algorithm_id,
+                            parameters=self.analysis_setup.parameter_values(),
+                        )
+                        for validation_issue in report.issues:
+                            add_issue(validation_issue)
                 except (TypeError, ValueError) as exc:
-                    add_issue(str(exc))
+                    add_issue(exc)
             elif capability is not None:
-                add_issue(f"{capability.kind}：{capability.reason}。当前求解入口暂未接入。")
+                add_issue(
+                    f"{capability.kind}：{capability.reason}。当前求解入口暂未接入。",
+                    field="/analysis/algorithm/id",
+                )
 
         if not self.analysis_setup.is_compatible:
             feedback = self.analysis_setup.algorithm_feedback_label.text().strip()
-            add_issue(feedback or "当前模型没有可用的兼容算法。")
+            recovery_fields = {
+                self.analysis_setup.RECOVERY_MISSING: "/analysis/algorithm/id",
+                self.analysis_setup.RECOVERY_VERSION: "/analysis/algorithm/version",
+                self.analysis_setup.RECOVERY_SCHEMA: "/analysis/algorithm/parameter-schema-version",
+                self.analysis_setup.RECOVERY_INVALID_SCHEMA: "/analysis/algorithm/parameter-schema-version",
+                self.analysis_setup.RECOVERY_INCOMPATIBLE: "/analysis/algorithm/id",
+            }
+            add_issue(
+                feedback or "当前模型没有可用的兼容算法。",
+                field=recovery_fields.get(
+                    self.analysis_setup.recovery_status,
+                    "/analysis/algorithm/id",
+                ),
+            )
+            for parameter_issue in self.analysis_setup.parameter_issues:
+                add_issue(parameter_issue)
 
         self._readiness_issues = issues
         self._update_readiness_tabs(tab_counts, tab_messages)
         if issues:
-            algorithm_terms = (
-                "算法",
-                "求解入口",
-                "插件",
-                "不适用",
-                "不支持",
-            )
+            recovery_parameter_gate = self.analysis_setup.recovery_status in {
+                self.analysis_setup.RECOVERY_VERSION,
+                self.analysis_setup.RECOVERY_SCHEMA,
+                self.analysis_setup.RECOVERY_INVALID_SCHEMA,
+            }
             has_algorithm_only = all(
-                any(term in issue["message"] for term in algorithm_terms)
+                str(issue.get("field") or "").startswith("/analysis/algorithm/")
+                or (
+                    recovery_parameter_gate
+                    and str(issue.get("field") or "").startswith(
+                        "/analysis/parameters/"
+                    )
+                )
                 for issue in issues
             )
             state = "pending" if has_algorithm_only else "error"
@@ -3741,7 +4533,7 @@ class ReconstructionMainWindow(QMainWindow):
         self.analysis_metric_labels["material"].setText(material_text)
         if config is not None:
             self.analysis_metric_labels["solver"].setText(
-                self.analysis_setup.active_algorithm.metadata.display_name
+                self.analysis_setup.active_algorithm_display_name
             )
 
     def _update_project_summary(self, project):
@@ -3843,13 +4635,45 @@ class ReconstructionMainWindow(QMainWindow):
         y_max_text = self.y_max_edit.text().strip()
         if y_min_text or y_max_text:
             if not (y_min_text and y_max_text):
-                raise ValueError("手动设置 Y 轴时，Y轴最小值和最大值必须同时填写。")
+                field = (
+                    "/view_state/y_limits/0"
+                    if not y_min_text
+                    else "/view_state/y_limits/1"
+                )
+                raise InputValidationError(
+                    "手动设置 Y 轴时，Y轴最小值和最大值必须同时填写。",
+                    field=field,
+                )
             try:
-                y_limits = [float(y_min_text), float(y_max_text)]
+                y_min = float(y_min_text)
             except ValueError as exc:
-                raise ValueError("Y 轴最小值和最大值必须是有效数值。") from exc
+                raise InputValidationError(
+                    "Y 轴最小值必须是有效数值。",
+                    field="/view_state/y_limits/0",
+                ) from exc
+            try:
+                y_max = float(y_max_text)
+            except ValueError as exc:
+                raise InputValidationError(
+                    "Y 轴最大值必须是有效数值。",
+                    field="/view_state/y_limits/1",
+                ) from exc
+            if not np.isfinite(y_min):
+                raise InputValidationError(
+                    "Y 轴最小值必须是有限数值。",
+                    field="/view_state/y_limits/0",
+                )
+            if not np.isfinite(y_max):
+                raise InputValidationError(
+                    "Y 轴最大值必须是有限数值。",
+                    field="/view_state/y_limits/1",
+                )
+            y_limits = [y_min, y_max]
             if y_limits[1] <= y_limits[0]:
-                raise ValueError("Y 轴范围不合法，要求最大值大于最小值。")
+                raise InputValidationError(
+                    "Y 轴范围不合法，要求最大值大于最小值。",
+                    field="/view_state/y_limits/1",
+                )
         else:
             y_limits = None
 
@@ -3864,9 +4688,15 @@ class ReconstructionMainWindow(QMainWindow):
                 try:
                     thickness_scale = float(thickness_scale_text)
                 except ValueError as exc:
-                    raise ValueError("厚度显示倍率必须是大于 0 的数值或自动增强。") from exc
-                if thickness_scale <= 0.0:
-                    raise ValueError("厚度显示倍率必须是大于 0 的数值或自动增强。")
+                    raise InputValidationError(
+                        "厚度显示倍率必须是大于 0 的数值或自动增强。",
+                        field="/view_state/thickness_scale",
+                    ) from exc
+                if not np.isfinite(thickness_scale) or thickness_scale <= 0.0:
+                    raise InputValidationError(
+                        "厚度显示倍率必须是大于 0 的有限数值或自动增强。",
+                        field="/view_state/thickness_scale",
+                    )
 
         return {
             "show_original": self.show_original_check.isChecked(),
@@ -3884,7 +4714,14 @@ class ReconstructionMainWindow(QMainWindow):
         }
 
     def _build_form_config(self, *, plot_options=None, require_measurements=True):
-        analysis_parameters = self.analysis_setup.parameter_values()
+        # A recovery-blocked case may contain values that the current (or missing)
+        # plugin cannot parse.  Keep those values in the case snapshot, but do not
+        # feed them through the legacy form adapter merely to save unrelated edits.
+        analysis_parameters = (
+            {}
+            if self.analysis_setup.should_preserve_saved_case
+            else self.analysis_setup.parameter_values()
+        )
         if plot_options is None:
             plot_options = self._collect_plot_options()
         return build_config_from_form_data(
@@ -3994,12 +4831,13 @@ class ReconstructionMainWindow(QMainWindow):
         try:
             project = load_project(path)
             PathBeamEditor.ordered_path(project)
-            self.current_project_path = Path(path)
             self._apply_project_document(
                 project,
                 dirty=False,
                 status_text="项目已打开 · 待运行",
             )
+            self.current_project_path = Path(path)
+            self._set_project_dirty(False)
             self.statusBar().showMessage(f"已打开项目：{path}", 6000)
             return True
         except (OSError, TypeError, ValueError) as exc:
@@ -4335,7 +5173,12 @@ class ReconstructionMainWindow(QMainWindow):
             return self._apply_view_state_to_project(project)
 
         config = self._build_form_config(require_measurements=False)
-        existing_config = legacy_config_from_project(current)
+        existing_config = legacy_config_from_project(
+            current,
+            include_analysis_parameters=(
+                not self.analysis_setup.should_preserve_saved_case
+            ),
+        )
         if self._model_config_projection(existing_config) == self._model_config_projection(config):
             project = current
         else:
@@ -4344,20 +5187,37 @@ class ReconstructionMainWindow(QMainWindow):
         return self._apply_view_state_to_project(project, config["plot_options"])
 
     def _apply_project_document(self, project, *, dirty, status_text):
+        capability = PathBeamEditor.capability(project)
+        config = None
+        config_json = None
+        if capability.legacy_solver_compatible:
+            preserve_analysis = self.analysis_setup.project_requires_recovery(project)
+            config = legacy_config_from_project(
+                project,
+                include_analysis_parameters=not preserve_analysis,
+            )
+            config_json = config_to_json(config)
+
+        previous_project = self.current_project_document
+        try:
+            self.analysis_setup.set_project(project)
+        except Exception:
+            if previous_project is not None:
+                self.analysis_setup.set_project(previous_project)
+            raise
+
         self.current_project_document = project
-        self.analysis_setup.set_project(project)
+        self._sync_analysis_parameter_controls()
         self.current_model = None
         self.current_config = None
         self._clear_result_views()
-        capability = PathBeamEditor.capability(project)
         if capability.legacy_solver_compatible:
-            config = legacy_config_from_project(project)
             self._loading_form = True
             try:
                 self._load_config_to_form(config)
             finally:
                 self._loading_form = False
-            self.json_text.setPlainText(config_to_json(config))
+            self.json_text.setPlainText(config_json)
             self._update_analysis_summary(config=config)
             self.run_button.setEnabled(True)
             self._set_run_status(status_text, "idle")
@@ -4438,24 +5298,62 @@ class ReconstructionMainWindow(QMainWindow):
         return self._project_for_save()
 
     def _apply_analysis_setup_to_project(self, project, *, config=None):
+        def merged_parameters(original=None, *, include_setup=True):
+            parameters = dict(original or {})
+            if include_setup:
+                parameters.update(self.analysis_setup.parameter_values())
+            if config is not None:
+                parameters["query_xs"] = list(config.get("query_xs", []))
+                parameters["true_points"] = list(config.get("true_points", []))
+            return parameters
+
         if not project.analysis_cases:
-            return project
+            analysis_case = AnalysisCase(
+                identifier=new_entity_id("analysis"),
+                name="重构分析工况",
+                algorithm_id=self.analysis_setup.active_algorithm_id,
+                parameters=merged_parameters(),
+                algorithm_version=self.analysis_setup.active_algorithm_version,
+                parameter_schema_version=(
+                    self.analysis_setup.active_parameter_schema_version
+                ),
+            )
+            return project.revised(
+                analysis_cases=(analysis_case,),
+                active_analysis_id=analysis_case.identifier,
+            )
+
         active_id = project.active_analysis_id or project.analysis_cases[0].identifier
+        if self.analysis_setup.should_preserve_saved_case:
+            if project.active_analysis_id == active_id:
+                return project
+            return project.revised(
+                active_analysis_id=active_id,
+            )
+
         updated_cases = []
         changed = False
         for analysis_case in project.analysis_cases:
             if analysis_case.identifier != active_id:
                 updated_cases.append(analysis_case)
                 continue
-            parameters = dict(analysis_case.parameters)
-            parameters.update(self.analysis_setup.parameter_values())
-            if config is not None:
-                parameters["query_xs"] = list(config.get("query_xs", []))
-                parameters["true_points"] = list(config.get("true_points", []))
             updated_case = replace(
                 analysis_case,
                 algorithm_id=self.analysis_setup.active_algorithm_id,
-                parameters=parameters,
+                parameters=merged_parameters(
+                    analysis_case.parameters,
+                    include_setup=self.analysis_setup.configuration_modified,
+                ),
+                algorithm_version=(
+                    self.analysis_setup.active_algorithm_version
+                    if self.analysis_setup.configuration_modified
+                    else analysis_case.algorithm_version
+                ),
+                parameter_schema_version=(
+                    self.analysis_setup.active_parameter_schema_version
+                    if self.analysis_setup.configuration_modified
+                    else analysis_case.parameter_schema_version
+                ),
             )
             changed = changed or updated_case != analysis_case
             updated_cases.append(updated_case)
@@ -4494,6 +5392,7 @@ class ReconstructionMainWindow(QMainWindow):
                 self.current_project_path = Path(dialog_path)
             self.current_project_document = project
             self.analysis_setup.set_project(project)
+            self._sync_analysis_parameter_controls()
             self._set_project_dirty(
                 not bool(getattr(dialog, "project_is_saved", False))
             )
@@ -4502,7 +5401,12 @@ class ReconstructionMainWindow(QMainWindow):
             self._clear_result_views()
             capability = PathBeamEditor.capability(project)
             if capability.legacy_solver_compatible:
-                config = legacy_config_from_project(project)
+                config = legacy_config_from_project(
+                    project,
+                    include_analysis_parameters=(
+                        not self.analysis_setup.should_preserve_saved_case
+                    ),
+                )
                 self._loading_form = True
                 try:
                     self._load_config_to_form(config)
@@ -4725,7 +5629,7 @@ class ReconstructionMainWindow(QMainWindow):
             self._set_run_status(f"重构完成 · {model.n_nodes} 节点 / {model.n_elems} 单元", "success")
             message_lines = [
                 "重构完成。",
-                f"分析方法: {self.analysis_setup.active_algorithm.metadata.display_name} "
+                f"分析方法: {self.analysis_setup.active_algorithm_display_name} "
                 f"v{result.algorithm_version}",
                 f"节点数: {model.n_nodes}",
                 f"单元数: {model.n_elems}",

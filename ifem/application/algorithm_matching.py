@@ -3,7 +3,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from ifem.domain.analysis import ReconstructionAlgorithm, ValidationReport
+from ifem.domain.analysis import (
+    ReconstructionAlgorithm,
+    ValidationIssue,
+    ValidationReport,
+)
 from ifem.domain.project import ProjectDocument
 
 
@@ -23,6 +27,7 @@ class AlgorithmMatch:
     display_name: str
     compatible: bool
     reasons: tuple[str, ...] = ()
+    issues: tuple[ValidationIssue, ...] = ()
 
     @property
     def reason_text(self) -> str:
@@ -56,35 +61,54 @@ def match_project_algorithms(
     for algorithm in algorithms:
         capabilities = algorithm.capabilities
         reasons = []
+        issues = []
+
+        def add_capability_issue(message, field):
+            reasons.append(message)
+            issues.append(ValidationIssue(message, field=field))
+
         if profile.topological_dimension not in capabilities.model_dimensions:
-            reasons.append("模型拓扑维度不受支持")
+            add_capability_issue("模型拓扑维度不受支持", "/model/topological-dimension")
         if profile.modeling_space not in capabilities.modeling_spaces:
-            reasons.append(f"不支持{profile.modeling_space.upper()}建模空间")
+            add_capability_issue(
+                f"不支持{profile.modeling_space.upper()}建模空间",
+                "/model/modeling-space",
+            )
 
         unsupported_geometry = sorted(
             set(profile.geometry_kinds) - set(capabilities.geometry_kinds)
         )
         if unsupported_geometry:
-            reasons.append(f"不支持几何类型：{', '.join(unsupported_geometry)}")
+            add_capability_issue(
+                f"不支持几何类型：{', '.join(unsupported_geometry)}",
+                "/model/geometry",
+            )
         if profile.mixed_geometry and not capabilities.supports_mixed_geometry:
-            reasons.append("不支持直线与曲线混合路径")
+            add_capability_issue("不支持直线与曲线混合路径", "/model/geometry")
 
         unsupported_families = sorted(
             set(profile.element_families) - set(capabilities.element_families)
         )
         if unsupported_families:
-            reasons.append(f"不支持单元族：{', '.join(unsupported_families)}")
+            add_capability_issue(
+                f"不支持单元族：{', '.join(unsupported_families)}",
+                "/model/element-families",
+            )
         unsupported_measurements = sorted(
             set(profile.measurement_types) - set(capabilities.measurement_types)
         )
         if unsupported_measurements:
-            reasons.append(f"不支持测量类型：{', '.join(unsupported_measurements)}")
+            add_capability_issue(
+                f"不支持测量类型：{', '.join(unsupported_measurements)}",
+                "/model/measurements",
+            )
 
         assessor = getattr(algorithm, "assess_project", None)
         if not reasons and callable(assessor):
             report = assessor(project)
             if not isinstance(report, ValidationReport):
                 raise TypeError("算法项目能力评估必须返回 ValidationReport。")
+            issues.extend(report.issues)
             reasons.extend(issue.message for issue in report.issues if issue.severity == "error")
 
         matches.append(
@@ -93,6 +117,7 @@ def match_project_algorithms(
                 display_name=algorithm.metadata.display_name,
                 compatible=not reasons,
                 reasons=tuple(dict.fromkeys(reasons)),
+                issues=tuple(issues),
             )
         )
     return tuple(matches)

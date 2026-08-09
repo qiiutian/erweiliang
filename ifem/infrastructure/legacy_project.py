@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from config_adapter import global_dof_to_pair, make_global_dof, normalize_config
+from config_adapter import (
+    global_dof_to_pair,
+    make_global_dof,
+    normalize_config,
+    validate_config,
+)
 from ifem.application.analysis_service import DEFAULT_ALGORITHM_ID
 from ifem.domain.project import (
     AnalysisCase,
@@ -33,6 +38,7 @@ def project_from_legacy_config(
     project_name: str | None = None,
 ) -> ProjectDocument:
     normalized = normalize_config(config)
+    validate_config(normalized, require_measurements=False)
     node_x = normalized["node_x"]
     if len(node_x) < 2 or any(right <= left for left, right in zip(node_x, node_x[1:])):
         raise ValueError("项目转换要求 node_x 至少包含两个严格递增坐标。")
@@ -163,7 +169,11 @@ def _ordered_beam(project: ProjectDocument):
     return nodes, tuple(ordered_elements)
 
 
-def legacy_config_from_project(project: ProjectDocument) -> dict[str, Any]:
+def legacy_config_from_project(
+    project: ProjectDocument,
+    *,
+    include_analysis_parameters: bool = True,
+) -> dict[str, Any]:
     if project.modeling_space != "2d":
         raise ValueError("当前二维梁算法不支持三维建模空间。")
     nodes, elements = _ordered_beam(project)
@@ -230,6 +240,8 @@ def legacy_config_from_project(project: ProjectDocument) -> dict[str, Any]:
     elif project.analysis_cases:
         analysis = project.analysis_cases[0]
     parameters = {} if analysis is None else dict(analysis.parameters)
+    if not include_analysis_parameters:
+        parameters = {}
 
     config = {
         "node_x": node_x,
@@ -243,4 +255,6 @@ def legacy_config_from_project(project: ProjectDocument) -> dict[str, Any]:
         "true_points": list(parameters.get("true_points", [])),
         "plot_options": dict(project.view_state),
     }
-    return normalize_config(config)
+    normalized = normalize_config(config)
+    validate_config(normalized, require_measurements=False)
+    return normalized

@@ -1,12 +1,69 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from math import isfinite, sqrt
-from typing import Any, Mapping
+from typing import Any
 from uuid import uuid4
 
 
-CURRENT_PROJECT_SCHEMA_VERSION = 5
+CURRENT_PROJECT_SCHEMA_VERSION = 6
+
+
+def _normalize_json_value(
+    value: Any,
+    *,
+    field_path: str,
+    active_containers: set[int] | None = None,
+) -> Any:
+    """Return a detached JSON-safe value or raise with its field path."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError(f"{field_path} 必须是有限数。")
+        return value
+
+    if active_containers is None:
+        active_containers = set()
+    if isinstance(value, Mapping):
+        container_id = id(value)
+        if container_id in active_containers:
+            raise ValueError(f"{field_path} 不能包含循环引用。")
+        active_containers.add(container_id)
+        try:
+            normalized = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{field_path} 的对象键必须是字符串。")
+                normalized[key] = _normalize_json_value(
+                    item,
+                    field_path=f"{field_path}.{key}",
+                    active_containers=active_containers,
+                )
+            return normalized
+        finally:
+            active_containers.remove(container_id)
+    if isinstance(value, list):
+        container_id = id(value)
+        if container_id in active_containers:
+            raise ValueError(f"{field_path} 不能包含循环引用。")
+        active_containers.add(container_id)
+        try:
+            return [
+                _normalize_json_value(
+                    item,
+                    field_path=f"{field_path}[{index}]",
+                    active_containers=active_containers,
+                )
+                for index, item in enumerate(value)
+            ]
+        finally:
+            active_containers.remove(container_id)
+    raise ValueError(
+        f"{field_path} 包含不支持的 JSON 值类型：{type(value).__name__}。"
+    )
 
 
 def new_entity_id(prefix: str) -> str:
@@ -317,11 +374,37 @@ class AnalysisCase:
     name: str
     algorithm_id: str
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    algorithm_version: str | None = None
+    parameter_schema_version: str | None = None
 
     def __post_init__(self):
         if not self.identifier.strip() or not self.name.strip() or not self.algorithm_id.strip():
             raise ValueError("分析工况 ID、名称和算法 ID 不能为空。")
-        object.__setattr__(self, "parameters", dict(self.parameters))
+        if self.algorithm_version is not None:
+            if not isinstance(self.algorithm_version, str) or not self.algorithm_version.strip():
+                raise ValueError("分析工况算法版本不能为空字符串。")
+            object.__setattr__(self, "algorithm_version", self.algorithm_version.strip())
+        if self.parameter_schema_version is not None:
+            if (
+                not isinstance(self.parameter_schema_version, str)
+                or not self.parameter_schema_version.strip()
+            ):
+                raise ValueError("分析工况参数模式版本不能为空字符串。")
+            object.__setattr__(
+                self,
+                "parameter_schema_version",
+                self.parameter_schema_version.strip(),
+            )
+        if not isinstance(self.parameters, Mapping):
+            raise ValueError("analysis_case.parameters 必须是 JSON 对象。")
+        object.__setattr__(
+            self,
+            "parameters",
+            _normalize_json_value(
+                self.parameters,
+                field_path="analysis_case.parameters",
+            ),
+        )
 
 
 def _infer_modeling_space(
@@ -430,14 +513,58 @@ class ProjectDocument:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ProjectDocument":
         data = dict(payload)
-        source_version = int(data.get("schema_version", 1))
-        if source_version in {1, 2, 3, 4}:
+        allowed_fields = {
+            "identifier",
+            "name",
+            "nodes",
+            "elements",
+            "modeling_space",
+            "sensors",
+            "boundary_conditions",
+            "materials",
+            "sections",
+            "analysis_cases",
+            "active_analysis_id",
+            "view_state",
+            "schema_version",
+            "revision",
+        }
+        unknown_fields = sorted(set(data) - allowed_fields)
+        if unknown_fields:
+            raise ValueError(
+                "项目文件包含当前版本不支持的字段："
+                + "、".join(unknown_fields)
+            )
+        raw_version = data.get("schema_version", 1)
+        if isinstance(raw_version, bool):
+            raise ValueError("项目 schema_version 必须是整数。")
+        if isinstance(raw_version, int):
+            source_version = raw_version
+        elif isinstance(raw_version, str) and raw_version.strip().lstrip("+-").isdigit():
+            source_version = int(raw_version.strip())
+        else:
+            raise ValueError("项目 schema_version 必须是整数。")
+        if source_version < 1 or source_version > CURRENT_PROJECT_SCHEMA_VERSION:
+            raise ValueError(f"不支持的项目版本：{source_version}")
+        if source_version in {1, 2, 3, 4, 5}:
             data["schema_version"] = CURRENT_PROJECT_SCHEMA_VERSION
         nodes = tuple(StructuralNode(**item) for item in data.get("nodes", []))
         elements = tuple(BeamElement(**item) for item in data.get("elements", []))
         modeling_space = data.get("modeling_space")
         if modeling_space is None:
             modeling_space = _infer_modeling_space(nodes, elements)
+        raw_analysis_cases = data.get("analysis_cases", [])
+        if not isinstance(raw_analysis_cases, (list, tuple)):
+            raise ValueError("analysis_cases 必须是列表。")
+        analysis_cases = []
+        for index, item in enumerate(raw_analysis_cases):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"analysis_cases[{index}] 必须是对象。")
+            try:
+                analysis_cases.append(AnalysisCase(**item))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"analysis_cases[{index}] 无效：{exc}") from exc
+
         return cls(
             identifier=str(data["identifier"]),
             name=str(data["name"]),
@@ -461,7 +588,7 @@ class ProjectDocument:
             ),
             materials=tuple(MaterialDefinition(**item) for item in data.get("materials", [])),
             sections=tuple(SectionDefinition(**item) for item in data.get("sections", [])),
-            analysis_cases=tuple(AnalysisCase(**item) for item in data.get("analysis_cases", [])),
+            analysis_cases=tuple(analysis_cases),
             active_analysis_id=data.get("active_analysis_id"),
             view_state=data.get("view_state", {}),
             schema_version=data.get("schema_version", CURRENT_PROJECT_SCHEMA_VERSION),

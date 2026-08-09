@@ -1,12 +1,15 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
 from config_adapter import get_sample_config, run_reconstruction
+from ifem.domain.analysis import AlgorithmMetadata, InputValidationError
 from ifem.domain.project import (
     CURRENT_PROJECT_SCHEMA_VERSION,
+    AnalysisCase,
     ProjectDocument,
     empty_beam_project,
 )
@@ -53,6 +56,129 @@ class ProjectDocumentTests(unittest.TestCase):
             save_project(path, self.project)
             loaded = load_project(path)
         self.assertEqual(loaded.to_dict(), self.project.to_dict())
+
+    def test_schema_v5_analysis_cases_migrate_without_inferred_plugin_versions(self):
+        payload = self.project.to_dict()
+        payload["schema_version"] = 5
+        for analysis_case in payload["analysis_cases"]:
+            analysis_case.pop("algorithm_version", None)
+            analysis_case.pop("parameter_schema_version", None)
+
+        restored = ProjectDocument.from_dict(payload)
+
+        self.assertEqual(restored.schema_version, CURRENT_PROJECT_SCHEMA_VERSION)
+        self.assertEqual(CURRENT_PROJECT_SCHEMA_VERSION, 6)
+        self.assertIsNone(restored.analysis_cases[0].algorithm_version)
+        self.assertIsNone(restored.analysis_cases[0].parameter_schema_version)
+        self.assertEqual(
+            restored.analysis_cases[0].parameters,
+            self.project.analysis_cases[0].parameters,
+        )
+
+    def test_project_schema_and_analysis_case_shapes_fail_before_partial_loading(self):
+        payload = self.project.to_dict()
+        payload["schema_version"] = 6.9
+        with self.assertRaisesRegex(ValueError, "schema_version 必须是整数"):
+            ProjectDocument.from_dict(payload)
+
+        payload = self.project.to_dict()
+        payload["schema_version"] = CURRENT_PROJECT_SCHEMA_VERSION + 1
+        payload["analysis_cases"] = [None]
+        with self.assertRaisesRegex(ValueError, "不支持的项目版本"):
+            ProjectDocument.from_dict(payload)
+
+        payload = self.project.to_dict()
+        payload["analysis_cases"] = [None]
+        with self.assertRaisesRegex(ValueError, r"analysis_cases\[0\] 必须是对象"):
+            ProjectDocument.from_dict(payload)
+
+        payload = self.project.to_dict()
+        payload["vendor_extension"] = {"opaque": True}
+        with self.assertRaisesRegex(ValueError, "不支持的字段.*vendor_extension"):
+            ProjectDocument.from_dict(payload)
+
+    def test_schema_v6_analysis_case_round_trip_preserves_opaque_parameters(self):
+        source_parameters = {
+            "gauss_n": 4,
+            "plugin_state": {
+                "enabled": True,
+                "weights": [1, 2.5, None, "原样保留"],
+            },
+        }
+        analysis_case = replace(
+            self.project.analysis_cases[0],
+            algorithm_version="1.0.0",
+            parameter_schema_version="2",
+            parameters=source_parameters,
+        )
+        source_parameters["plugin_state"]["weights"].append("外部修改")
+        versioned = self.project.revised(analysis_cases=(analysis_case,))
+
+        self.assertEqual(
+            analysis_case.parameters["plugin_state"]["weights"],
+            [1, 2.5, None, "原样保留"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "versioned.ifemproj"
+            save_project(path, versioned)
+            restored = load_project(path)
+
+        self.assertEqual(restored.to_dict(), versioned.to_dict())
+        self.assertEqual(restored.analysis_cases[0].algorithm_version, "1.0.0")
+        self.assertEqual(restored.analysis_cases[0].parameter_schema_version, "2")
+
+    def test_analysis_case_rejects_non_json_parameter_values(self):
+        invalid_parameters = (
+            ({1: "non-string-key"}, "对象键必须是字符串"),
+            ({"value": float("nan")}, "必须是有限数"),
+            ({"value": float("inf")}, "必须是有限数"),
+            ({"value": {1, 2}}, "不支持的 JSON 值类型"),
+        )
+        for parameters, message in invalid_parameters:
+            with self.subTest(parameters=parameters):
+                with self.assertRaisesRegex(ValueError, message):
+                    AnalysisCase(
+                        identifier="analysis_invalid",
+                        name="非法参数工况",
+                        algorithm_id="example.algorithm",
+                        parameters=parameters,
+                    )
+
+        cyclic = []
+        cyclic.append(cyclic)
+        with self.assertRaisesRegex(ValueError, "循环引用"):
+            AnalysisCase(
+                identifier="analysis_cyclic",
+                name="循环参数工况",
+                algorithm_id="example.algorithm",
+                parameters={"value": cyclic},
+            )
+
+    def test_save_project_rejects_late_non_finite_values_without_replacing_file(self):
+        path_contents = "existing-project"
+        self.project.analysis_cases[0].parameters["late_nan"] = float("nan")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "existing.ifemproj"
+            path.write_text(path_contents, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                save_project(path, self.project)
+            self.assertEqual(path.read_text(encoding="utf-8"), path_contents)
+
+    def test_analysis_domain_versions_and_field_errors_are_stable(self):
+        metadata = AlgorithmMetadata("example.algorithm", "示例算法", "1.2.3")
+        self.assertEqual(metadata.parameter_schema_version, "1")
+        with self.assertRaisesRegex(ValueError, "参数模式版本不能为空"):
+            AlgorithmMetadata(
+                "example.algorithm",
+                "示例算法",
+                "1.2.3",
+                parameter_schema_version=" ",
+            )
+
+        error = InputValidationError("输入无效", "sensors[0].measured_value")
+        self.assertEqual(str(error), "输入无效")
+        self.assertEqual(error.field, "sensors[0].measured_value")
 
     def test_schema_v1_straight_elements_migrate_to_line_geometry(self):
         payload = self.project.to_dict()

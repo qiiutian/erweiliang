@@ -11,7 +11,12 @@ def save_project(path, project: ProjectDocument) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(project.to_dict(), ensure_ascii=False, indent=2),
+        json.dumps(
+            project.to_dict(),
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
     temporary.replace(destination)

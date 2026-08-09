@@ -1,5 +1,6 @@
 import copy
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
@@ -7,12 +8,20 @@ from config_adapter import get_sample_config, run_reconstruction
 from ifem.algorithms.beam_surface_integral import BeamSurfaceIntegralAlgorithm
 from ifem.application.analysis_service import (
     DEFAULT_ALGORITHM_ID,
+    AlgorithmResolutionStatus,
     AlgorithmRegistry,
     AlgorithmValidationError,
+    AnalysisService,
     create_default_analysis_service,
 )
 from ifem.application.algorithm_matching import match_project_algorithms
-from ifem.domain.analysis import AnalysisCancelled, CancellationToken
+from ifem.domain.analysis import (
+    AnalysisCancelled,
+    AlgorithmMetadata,
+    CancellationToken,
+    ValidationIssue,
+    ValidationReport,
+)
 from ifem.domain.project import empty_beam_project
 from ifem.infrastructure import project_from_legacy_config
 from ifem.modeling import PathBeamEditor
@@ -157,6 +166,293 @@ class AlgorithmPluginTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "已注册"):
             registry.register(BeamSurfaceIntegralAlgorithm())
+
+    def test_registry_resolve_reports_missing_version_and_schema_without_fallback(self):
+        algorithm = self.service.registry.get(DEFAULT_ALGORITHM_ID)
+
+        missing = self.service.registry.resolve("vendor.missing")
+        self.assertEqual(missing.status, AlgorithmResolutionStatus.MISSING)
+        self.assertIsNone(missing.algorithm)
+        self.assertEqual(missing.issues[0].field, "/analysis/algorithm/id")
+
+        version_mismatch = self.service.registry.resolve(
+            DEFAULT_ALGORITHM_ID,
+            expected_version="0.0.0",
+        )
+        self.assertEqual(
+            version_mismatch.status,
+            AlgorithmResolutionStatus.VERSION_MISMATCH,
+        )
+        self.assertIs(version_mismatch.algorithm, algorithm)
+        self.assertEqual(
+            version_mismatch.issues[0].field,
+            "/analysis/algorithm/version",
+        )
+
+        schema_version = str(
+            getattr(algorithm.metadata, "parameter_schema_version", "1")
+        )
+        schema_mismatch = self.service.registry.resolve(
+            DEFAULT_ALGORITHM_ID,
+            expected_schema_version=f"{schema_version}.mismatch",
+        )
+        self.assertEqual(
+            schema_mismatch.status,
+            AlgorithmResolutionStatus.SCHEMA_MISMATCH,
+        )
+        self.assertEqual(
+            schema_mismatch.issues[0].field,
+            "/analysis/algorithm/parameter-schema-version",
+        )
+
+    def test_metadata_version_is_normalized_before_resolution(self):
+        class SpacedVersionAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier=DEFAULT_ALGORITHM_ID,
+                display_name="  空格版本测试  ",
+                version=" 1.0.0 ",
+                parameter_schema_version=" 1 ",
+            )
+
+        algorithm = SpacedVersionAlgorithm()
+        registry = AlgorithmRegistry((algorithm,))
+        resolution = registry.resolve(
+            DEFAULT_ALGORITHM_ID,
+            expected_version="1.0.0",
+            expected_schema_version="1",
+        )
+
+        self.assertEqual(algorithm.metadata.display_name, "空格版本测试")
+        self.assertEqual(algorithm.metadata.version, "1.0.0")
+        self.assertTrue(resolution.is_ready)
+
+    def test_registry_rejects_malformed_parameter_schema(self):
+        class InvalidSchemaAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def parameter_schema(self):
+                return {"type": "array", "properties": {}}
+
+        with self.assertRaisesRegex(ValueError, "顶层 type"):
+            AlgorithmRegistry((InvalidSchemaAlgorithm(),))
+
+    def test_registry_rejects_nonfinite_parameter_schema_numbers(self):
+        invalid_properties = (
+            {"type": "number", "minimum": float("nan")},
+            {"type": "number", "maximum": float("inf")},
+            {"type": "number", "default": float("nan")},
+            {"type": "number", "enum": [1.0, float("inf")]},
+        )
+        for property_schema in invalid_properties:
+            with self.subTest(property_schema=property_schema):
+                class NonfiniteSchemaAlgorithm(BeamSurfaceIntegralAlgorithm):
+                    def parameter_schema(self):
+                        return {
+                            "type": "object",
+                            "properties": {"gain": property_schema},
+                        }
+
+                with self.assertRaisesRegex(ValueError, "有限数值"):
+                    AlgorithmRegistry((NonfiniteSchemaAlgorithm(),))
+
+    def test_service_structurally_validates_parameter_schema_subset(self):
+        class SchemaAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def parameter_schema(self):
+                return {
+                    "type": "object",
+                    "required": ["count", "mode"],
+                    "properties": {
+                        "count": {
+                            "type": "integer",
+                            "minimum": 2,
+                            "maximum": 4,
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["fast", "precise"],
+                        },
+                        "ratio": {"type": "number", "maximum": 1.0},
+                        "enabled": {"type": "boolean"},
+                    },
+                }
+
+        algorithm = SchemaAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+        report = service.validate(
+            get_sample_config(),
+            parameters={"mode": "unknown", "ratio": 2.0, "enabled": "yes"},
+        )
+
+        self.assertFalse(report.is_valid)
+        self.assertEqual(
+            {issue.field for issue in report.issues},
+            {
+                "/analysis/parameters/count",
+                "/analysis/parameters/mode",
+                "/analysis/parameters/ratio",
+                "/analysis/parameters/enabled",
+            },
+        )
+
+        minimum_report = service.validate(
+            get_sample_config(),
+            parameters={
+                "count": 1,
+                "mode": "fast",
+                "ratio": 0.5,
+                "enabled": True,
+            },
+        )
+        self.assertFalse(minimum_report.is_valid)
+        self.assertEqual(
+            [issue.field for issue in minimum_report.issues],
+            ["/analysis/parameters/count"],
+        )
+
+    def test_invalid_dynamic_parameter_is_rejected_before_solve(self):
+        progress_events = []
+        preparation = self.service.prepare(
+            get_sample_config(),
+            parameters={"gauss_n": 99, "future_parameter": 42},
+        )
+
+        self.assertFalse(preparation.can_run)
+        self.assertEqual(
+            [issue.field for issue in preparation.issues],
+            ["/analysis/parameters/gauss_n"],
+        )
+        self.assertEqual(preparation.effective_parameters["future_parameter"], 42)
+
+        with self.assertRaisesRegex(AlgorithmValidationError, "gauss_n") as raised:
+            self.service.run(
+                get_sample_config(),
+                parameters={"gauss_n": 99, "future_parameter": 42},
+                progress=lambda fraction, message: progress_events.append(
+                    (fraction, message)
+                ),
+            )
+        self.assertEqual(progress_events, [])
+        self.assertIs(raised.exception.report, raised.exception.preparation.report)
+        self.assertEqual(
+            raised.exception.issues[0].field,
+            "/analysis/parameters/gauss_n",
+        )
+
+    def test_nonfinite_dynamic_parameter_is_rejected_with_exact_field(self):
+        class NumberParameterAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def parameter_schema(self):
+                return {
+                    "type": "object",
+                    "properties": {"gain": {"type": "number"}},
+                }
+
+        algorithm = NumberParameterAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+
+        report = service.validate(
+            get_sample_config(),
+            parameters={"gain": float("nan")},
+        )
+
+        self.assertFalse(report.is_valid)
+        self.assertEqual(
+            [issue.field for issue in report.issues],
+            ["/analysis/parameters/gain"],
+        )
+        with self.assertRaises(AlgorithmValidationError) as raised:
+            service.run(
+                get_sample_config(),
+                parameters={"gain": float("inf")},
+            )
+        self.assertEqual(
+            raised.exception.issues[0].field,
+            "/analysis/parameters/gain",
+        )
+
+    def test_unknown_parameters_are_preserved_without_rejection(self):
+        preparation = self.service.prepare(
+            get_sample_config(),
+            parameters={"future_parameter": {"nested": True}},
+        )
+
+        self.assertTrue(preparation.can_run)
+        self.assertEqual(
+            preparation.effective_parameters["future_parameter"],
+            {"nested": True},
+        )
+
+    def test_service_preserves_plugin_validation_report_on_error(self):
+        class FieldFailingAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def validate(self, context):
+                return ValidationReport.invalid(
+                    "高斯点数校验失败。",
+                    field="/analysis/parameters/gauss_n",
+                )
+
+        algorithm = FieldFailingAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+
+        report = service.validate(get_sample_config())
+        self.assertEqual(report.issues[0].field, "/analysis/parameters/gauss_n")
+        with self.assertRaisesRegex(AlgorithmValidationError, "高斯点数") as raised:
+            service.run(get_sample_config())
+        self.assertEqual(raised.exception.report.issues[0], report.issues[0])
+
+    def test_service_rejects_result_with_wrong_algorithm_version(self):
+        class WrongResultVersionAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def solve(self, context, *, progress, cancellation):
+                result = super().solve(
+                    context,
+                    progress=progress,
+                    cancellation=cancellation,
+                )
+                return replace(result, algorithm_version="0.0.0")
+
+        algorithm = WrongResultVersionAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "版本"):
+            service.run(get_sample_config())
+
+    def test_algorithm_match_preserves_assessor_validation_issues(self):
+        class AssessedAlgorithm(BeamSurfaceIntegralAlgorithm):
+            def assess_project(self, project):
+                return ValidationReport(
+                    (
+                        ValidationIssue(
+                            "路径配置不受支持",
+                            field="/model/path",
+                        ),
+                        ValidationIssue(
+                            "兼容模式提示",
+                            field="/model/path",
+                            severity="warning",
+                        ),
+                    )
+                )
+
+        project = project_from_legacy_config(get_sample_config())
+        match = match_project_algorithms(project, (AssessedAlgorithm(),))[0]
+
+        self.assertFalse(match.compatible)
+        self.assertEqual(match.reasons, ("路径配置不受支持",))
+        self.assertEqual(
+            [(issue.message, issue.field, issue.severity) for issue in match.issues],
+            [
+                ("路径配置不受支持", "/model/path", "error"),
+                ("兼容模式提示", "/model/path", "warning"),
+            ],
+        )
 
 
 if __name__ == "__main__":

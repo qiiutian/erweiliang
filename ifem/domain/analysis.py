@@ -14,16 +14,40 @@ class AlgorithmMetadata:
     display_name: str
     version: str
     description: str = ""
+    parameter_schema_version: str = "1"
 
     def __post_init__(self):
         identifier = self.identifier.strip()
+        display_name = self.display_name.strip()
+        version = self.version.strip()
         if not identifier:
             raise ValueError("算法标识不能为空。")
-        if not self.display_name.strip():
+        if not display_name:
             raise ValueError("算法显示名称不能为空。")
-        if not self.version.strip():
+        if not version:
             raise ValueError("算法版本不能为空。")
+        parameter_schema_version = self.parameter_schema_version
+        if (
+            not isinstance(parameter_schema_version, str)
+            or not parameter_schema_version.strip()
+        ):
+            raise ValueError("算法参数模式版本不能为空。")
         object.__setattr__(self, "identifier", identifier)
+        object.__setattr__(self, "display_name", display_name)
+        object.__setattr__(self, "version", version)
+        object.__setattr__(
+            self,
+            "parameter_schema_version",
+            parameter_schema_version.strip(),
+        )
+
+
+class InputValidationError(ValueError):
+    """An input validation failure tied to a stable field path."""
+
+    def __init__(self, message: str, field: str | None = None):
+        super().__init__(str(message))
+        self.field = field
 
 
 @dataclass(frozen=True)
