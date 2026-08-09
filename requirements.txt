@@ -1,3 +1,8 @@
 numpy
 matplotlib
 PySide6
+Pillow
+pyqtgraph
+pyvista
+pyvistaqt
+vtk

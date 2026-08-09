@@ -3,12 +3,11 @@ import json
 
 import numpy as np
 
-from reconstruction import IBeam3SurfaceIntegralReconstruction2D
-
 
 SAMPLE_CONFIG = {
     "node_x": [0.0, 1.0, 2.0, 3.0],
     "thickness": 0.0016,
+    "material": {"elastic_modulus": 2.06e11},
     "gauss_n": 3,
     "points_per_element": 120,
     "elements_sensor_data": [
@@ -121,10 +120,12 @@ SAMPLE_CONFIG = {
         "equal_axis": False,
         "annotate_points": False,
         "connect_pairs": True,
-        "title": "直接表面应变矩阵法二维梁形状重构结果（积分型，手动分区）",
+        "title": "二维梁重构形态",
         "legend_loc": "best",
         "label_offset_scale": 0.04,
         "figsize": [11.0, 4.5],
+        "thickness_scale": "auto",
+        "field_representation": "nodal_average",
     },
 }
 
@@ -155,6 +156,26 @@ def parse_float_list(text, field_name):
     return values
 
 
+def _parse_form_float(value, field_name):
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field_name} 不能为空。")
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 必须是有效数值。") from exc
+
+
+def _parse_form_int(value, field_name):
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field_name} 不能为空。")
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} 必须是有效整数。") from exc
+
+
 def serialize_config(config):
     safe = copy.deepcopy(config)
     if "prescribed_dofs" in safe:
@@ -183,6 +204,7 @@ def normalize_config(config):
     normalized.setdefault("points_per_element", 120)
     normalized.setdefault("query_xs", [])
     normalized.setdefault("true_points", [])
+    normalized.setdefault("material", {})
     normalized.setdefault("plot_options", {})
     normalized["plot_options"].setdefault("show_original", True)
     normalized["plot_options"].setdefault("show_nodes", True)
@@ -190,12 +212,27 @@ def normalize_config(config):
     normalized["plot_options"].setdefault("annotate_points", False)
     normalized["plot_options"].setdefault("connect_pairs", True)
     normalized["plot_options"].setdefault(
-        "title", "直接表面应变矩阵法二维梁形状重构结果"
+        "title", "二维梁重构形态"
     )
     normalized["plot_options"].setdefault("legend_loc", "best")
     normalized["plot_options"].setdefault("label_offset_scale", 0.04)
     normalized["plot_options"].setdefault("figsize", [11.0, 4.5])
     normalized["plot_options"].setdefault("y_limits", None)
+    normalized["plot_options"].setdefault("thickness_scale", "auto")
+    normalized["plot_options"].setdefault("field_representation", "nodal_average")
+
+    field_representation = normalized["plot_options"].get("field_representation")
+    if field_representation not in {"raw", "nodal_average"}:
+        raise ValueError("plot_options.field_representation 必须是 raw 或 nodal_average。")
+
+    thickness_scale = normalized["plot_options"].get("thickness_scale", "auto")
+    if thickness_scale in (None, "", "auto"):
+        normalized["plot_options"]["thickness_scale"] = "auto"
+    else:
+        thickness_scale = float(thickness_scale)
+        if thickness_scale <= 0.0:
+            raise ValueError("plot_options.thickness_scale 必须大于 0 或为 auto。")
+        normalized["plot_options"]["thickness_scale"] = thickness_scale
 
     y_limits = normalized["plot_options"].get("y_limits")
     if y_limits not in (None, ""):
@@ -208,6 +245,18 @@ def normalize_config(config):
         normalized["plot_options"]["y_limits"] = [y_min, y_max]
     else:
         normalized["plot_options"]["y_limits"] = None
+
+    material = normalized.get("material") or {}
+    if not isinstance(material, dict):
+        raise ValueError("material 必须是对象。")
+    elastic_modulus = material.get("elastic_modulus")
+    if elastic_modulus in (None, ""):
+        elastic_modulus = None
+    else:
+        elastic_modulus = float(elastic_modulus)
+        if elastic_modulus <= 0.0:
+            raise ValueError("material.elastic_modulus 必须大于 0。")
+    normalized["material"] = {"elastic_modulus": elastic_modulus}
 
     prescribed = normalized.get("prescribed_dofs", {})
     if prescribed is None:
@@ -269,7 +318,7 @@ def global_dof_to_pair(global_dof):
     return node, dof
 
 
-def validate_config(config):
+def validate_config(config, *, require_measurements=True):
     config = normalize_config(config)
 
     node_x = config["node_x"]
@@ -296,7 +345,7 @@ def validate_config(config):
 
     for e, edata in enumerate(elements_sensor_data):
         measurements = edata.get("measurements", [])
-        if not measurements:
+        if require_measurements and not measurements:
             raise ValueError(f"第 {e} 个单元至少需要一条 measurement。")
         Le = node_x[e + 1] - node_x[e]
         for idx, measurement in enumerate(measurements):
@@ -370,12 +419,22 @@ def build_config_from_form_data(
     boundary_rows,
     true_point_rows,
     plot_options,
+    elastic_modulus_gpa_text="",
+    require_measurements=True,
 ):
     node_x = parse_float_list(node_x_text, "node_x")
-    thickness = float(str(thickness_text).strip())
-    gauss_n = int(str(gauss_n_text).strip())
-    points_per_element = int(str(points_per_element_text).strip())
+    thickness = _parse_form_float(thickness_text, "梁厚度 thickness")
+    gauss_n = _parse_form_int(gauss_n_text, "高斯点数 gauss_n")
+    points_per_element = _parse_form_int(
+        points_per_element_text, "曲线采样数 points_per_element"
+    )
     query_xs = parse_float_list(query_xs_text, "query_xs")
+    elastic_modulus_value = str(elastic_modulus_gpa_text).strip()
+    elastic_modulus = (
+        _parse_form_float(elastic_modulus_value, "弹性模量") * 1.0e9
+        if elastic_modulus_value
+        else None
+    )
 
     if len(node_x) < 2:
         raise ValueError("node_x 至少需要两个节点坐标。")
@@ -387,16 +446,26 @@ def build_config_from_form_data(
         element_text = str(row.get("element", "")).strip()
         if not element_text:
             raise ValueError(f"第 {idx} 条测量数据缺少单元号。")
-        element = int(element_text)
+        element = _parse_form_int(element_text, f"第 {idx} 条测量数据的单元号")
         if element < 0 or element >= n_elems:
             raise ValueError(f"第 {idx} 条测量数据的单元号超出范围。")
 
-        x_loc = float(str(row.get("x", "")).strip())
-        strain = float(str(row.get("strain", "")).strip())
+        x_loc = _parse_form_float(row.get("x", ""), f"第 {idx} 条测量数据的 x")
+        strain = _parse_form_float(
+            row.get("strain", ""), f"第 {idx} 条测量数据的应变"
+        )
         weight_text = str(row.get("weight", "")).strip()
-        weight = float(weight_text) if weight_text else 1.0
-        zone_a = float(str(row.get("zone_a", "")).strip())
-        zone_b = float(str(row.get("zone_b", "")).strip())
+        weight = (
+            _parse_form_float(weight_text, f"第 {idx} 条测量数据的权重")
+            if weight_text
+            else 1.0
+        )
+        zone_a = _parse_form_float(
+            row.get("zone_a", ""), f"第 {idx} 条测量数据的量长起点"
+        )
+        zone_b = _parse_form_float(
+            row.get("zone_b", ""), f"第 {idx} 条测量数据的量长终点"
+        )
 
         measurement = {
             "x": x_loc,
@@ -410,7 +479,9 @@ def build_config_from_form_data(
         if surface_text:
             measurement["surface"] = surface_text
         elif y_text:
-            measurement["y"] = float(y_text)
+            measurement["y"] = _parse_form_float(
+                y_text, f"第 {idx} 条测量数据的截面 y"
+            )
         else:
             raise ValueError(f"第 {idx} 条测量数据需要填写 surface 或 y。")
 
@@ -423,29 +494,46 @@ def build_config_from_form_data(
         value_text = str(row.get("value", "")).strip()
         if not node_text or not dof_text or not value_text:
             raise ValueError(f"第 {idx} 条边界条件未填写完整。")
-        global_dof = make_global_dof(int(node_text), dof_text)
+        try:
+            global_dof = make_global_dof(
+                _parse_form_int(node_text, f"第 {idx} 条边界条件的节点号"),
+                dof_text,
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"第 {idx} 条边界条件的节点号或自由度不合法。") from exc
         if global_dof in prescribed_dofs:
             raise ValueError(f"存在重复边界条件：节点 {node_text} 的 {dof_text}。")
-        prescribed_dofs[global_dof] = float(value_text)
+        prescribed_dofs[global_dof] = _parse_form_float(
+            value_text, f"第 {idx} 条边界条件的约束值"
+        )
 
     true_points = []
     for idx, row in enumerate(true_point_rows, start=1):
         x_text = str(row.get("x", "")).strip()
         if not x_text:
             raise ValueError(f"第 {idx} 条实测点缺少 x。")
-        point = {"x": float(x_text)}
+        point = {"x": _parse_form_float(x_text, f"第 {idx} 条实测对比点的 x")}
         label = str(row.get("label", "")).strip()
         if label:
             point["label"] = label
         u_text = str(row.get("u", "")).strip()
         v_text = str(row.get("v", "")).strip()
-        point["u"] = float(u_text) if u_text else 0.0
-        point["v"] = float(v_text) if v_text else 0.0
+        point["u"] = (
+            _parse_form_float(u_text, f"第 {idx} 条实测对比点的 u")
+            if u_text
+            else 0.0
+        )
+        point["v"] = (
+            _parse_form_float(v_text, f"第 {idx} 条实测对比点的 v")
+            if v_text
+            else 0.0
+        )
         true_points.append(point)
 
     config = {
         "node_x": node_x,
         "thickness": thickness,
+        "material": {"elastic_modulus": elastic_modulus},
         "gauss_n": gauss_n,
         "points_per_element": points_per_element,
         "elements_sensor_data": elements_sensor_data,
@@ -454,7 +542,7 @@ def build_config_from_form_data(
         "true_points": true_points,
         "plot_options": plot_options,
     }
-    return validate_config(config)
+    return validate_config(config, require_measurements=require_measurements)
 
 
 def boundary_rows_from_prescribed_dofs(prescribed_dofs):
@@ -511,16 +599,13 @@ def build_model_inputs(config):
         "points_per_element": int(config["points_per_element"]),
         "query_xs": [float(x) for x in config["query_xs"]],
         "true_points": config["true_points"] or None,
+        "material": config["material"],
         "plot_options": config["plot_options"],
     }
 
 
 def run_reconstruction(config):
-    inputs = build_model_inputs(config)
-    model = IBeam3SurfaceIntegralReconstruction2D(
-        node_x=inputs["node_x"],
-        thickness=inputs["thickness"],
-        elements_sensor_data=inputs["elements_sensor_data"],
-    )
-    model.solve(prescribed_dofs=inputs["prescribed_dofs"], gauss_n=inputs["gauss_n"])
-    return model, inputs
+    from ifem.application.analysis_service import get_default_analysis_service
+
+    result = get_default_analysis_service().run(config)
+    return result.native_model, dict(result.inputs)

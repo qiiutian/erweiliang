@@ -1,0 +1,35 @@
+#!/bin/zsh
+
+set -u
+
+PROJECT_DIR="/Users/qiutian/Desktop/codex"
+PYTHON_BIN="/Users/qiutian/miniconda3/envs/venv/bin/python"
+LOG_DIR="${HOME}/Library/Logs/iFEM Reconstruction"
+LOG_FILE="${LOG_DIR}/launcher.log"
+
+show_error() {
+    /usr/bin/osascript -e "display alert \"iFEM 重构软件\" message \"$1\" as critical"
+}
+
+if [[ ! -d "${PROJECT_DIR}" ]]; then
+    show_error "找不到项目目录：${PROJECT_DIR}"
+    exit 1
+fi
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    show_error "找不到 Python 环境：${PYTHON_BIN}"
+    exit 1
+fi
+
+/bin/mkdir -p "${LOG_DIR}" "${PROJECT_DIR}/.mplconfig"
+export MPLCONFIGDIR="${PROJECT_DIR}/.mplconfig"
+export PYTHONUNBUFFERED=1
+
+if ! "${PYTHON_BIN}" -c "import numpy, matplotlib, PySide6" >>"${LOG_FILE}" 2>&1; then
+    show_error "运行依赖不完整。请在终端执行 ${PROJECT_DIR}/install_in_venv.sh"
+    exit 1
+fi
+
+cd "${PROJECT_DIR}" || exit 1
+printf '\n[%s] launching iFEM\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" >>"${LOG_FILE}"
+exec "${PYTHON_BIN}" "${PROJECT_DIR}/main.py" >>"${LOG_FILE}" 2>&1

@@ -1,0 +1,949 @@
+import os
+import tempfile
+import unittest
+from dataclasses import replace
+from unittest.mock import patch
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(__file__), ".mplconfig"))
+
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
+
+import gui_qt
+from config_adapter import get_sample_config
+from ifem.algorithms.beam_surface_integral import BeamSurfaceIntegralAlgorithm
+from ifem.application.analysis_service import AlgorithmRegistry, AnalysisService
+from ifem.domain.analysis import AlgorithmMetadata
+from ifem.domain.project import AnalysisCase, empty_beam_project
+from ifem.infrastructure import load_project, project_from_legacy_config
+from ifem.modeling import BeamProjectEditor, PathBeamEditor
+from ifem.modeling.section_geometry import section_boundary_point
+from ifem.ui.modeler import BeamModelCanvas, BeamModelerDialog, SensorArrayDialog
+from ifem.ui.modeler_3d import BeamGeometry3DView
+from visualization_3d import Structure3DView
+
+
+class ModelerUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self._question_patcher = patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Discard,
+        )
+        self._question_patcher.start()
+        self.addCleanup(self._question_patcher.stop)
+
+    def test_canvas_click_inserts_node_and_undo_restores_model(self):
+        project = project_from_legacy_config(get_sample_config())
+        dialog = BeamModelerDialog(project)
+        dialog.resize(1100, 700)
+        dialog.show()
+        self.app.processEvents()
+
+        before_node_ids = {node.identifier for node in dialog.project.nodes}
+        dialog.mode_buttons[BeamModelCanvas.MODE_ADD_NODE].click()
+        click_position = QPoint(
+            round(dialog.canvas._x_to_pixel(1.5)),
+            round(dialog.canvas._beam_y()),
+        )
+        QTest.mouseClick(
+            dialog.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            click_position,
+        )
+        self.app.processEvents()
+
+        self.assertEqual(len(dialog.project.nodes), 5)
+        self.assertEqual(len(dialog.project.elements), 4)
+        self.assertEqual(len(dialog.project.sensors), 12)
+        self.assertNotEqual(
+            {node.identifier for node in dialog.project.nodes},
+            before_node_ids,
+        )
+
+        dialog.undo_stack.undo()
+        self.assertEqual(len(dialog.project.nodes), 4)
+        self.assertEqual(
+            {node.identifier for node in dialog.project.nodes},
+            before_node_ids,
+        )
+        dialog.close()
+
+    def test_main_window_applies_modeler_project_and_can_reconstruct(self):
+        window = gui_qt.ReconstructionMainWindow()
+        edited_project = BeamProjectEditor.add_node(
+            window.current_project_document,
+            0.5,
+        )
+
+        class AcceptedModeler:
+            def __init__(self, _project, _parent=None):
+                self.project = edited_project
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        with patch.object(gui_qt, "BeamModelerDialog", AcceptedModeler):
+            window.open_interactive_modeler()
+
+        self.assertEqual(window.node_x_edit.text(), "0, 0.5, 1, 2, 3")
+        self.assertEqual(len(window.measurement_editor.get_rows()), 12)
+        self.assertEqual(window.run_status_label.text(), "模型已更新 · 待运行")
+
+        window.run_reconstruction()
+        self.assertEqual(window.current_model.n_nodes, 5)
+        self.assertEqual(window.current_model.n_elems, 4)
+        self.assertEqual(window.run_status_label.property("state"), "success")
+        window.close()
+
+    def test_main_window_exposes_primary_action_shortcuts(self):
+        window = gui_qt.ReconstructionMainWindow()
+
+        self.assertEqual(window.modeler_button.shortcut().toString(), "Ctrl+M")
+        self.assertEqual(window.run_button.shortcut().toString(), "Ctrl+Return")
+        self.assertEqual(window.appearance_action.shortcut().toString(), "Ctrl+,")
+        self.assertTrue(window.measurement_editor.header_action_button.toolTip())
+        window.close()
+
+    def test_single_algorithm_is_auto_selected_without_redundant_selector(self):
+        window = gui_qt.ReconstructionMainWindow()
+        setup = window.analysis_setup
+
+        self.assertTrue(setup.algorithm_selector_row.isHidden())
+        self.assertEqual(setup.algorithm_state_label.text(), "可运行")
+        self.assertEqual(
+            setup.algorithm_name_label.text(),
+            "积分型表面应变矩阵",
+        )
+        self.assertEqual(
+            setup.parameter_values(),
+            {"gauss_n": 3, "points_per_element": 120},
+        )
+
+        setup.set_parameter_values({"gauss_n": 4, "points_per_element": 160})
+        config = window._build_form_config()
+        self.assertEqual(config["gauss_n"], 4)
+        self.assertEqual(config["points_per_element"], 160)
+        window.close()
+
+    def test_input_readiness_marks_invalid_field_without_modal_error(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        self.app.processEvents()
+
+        self.assertFalse(window.project_dirty)
+        window.node_x_edit.setText("0, 1, invalid")
+        self.app.processEvents()
+
+        self.assertTrue(window.project_dirty)
+        self.assertFalse(window.run_button.isEnabled())
+        self.assertEqual(window.node_x_edit.property("validationState"), "error")
+        self.assertIn("·", window.left_tabs.tabText(0))
+        self.assertEqual(window.left_tabs.currentIndex(), 0)
+
+        window.run_reconstruction()
+        self.assertTrue(window.node_x_edit.hasFocus())
+        window.close()
+
+    def test_field_feedback_targets_thickness_and_clears_stale_tooltip(self):
+        window = gui_qt.ReconstructionMainWindow()
+        base_tooltip = window.thickness_edit.toolTip()
+
+        window.thickness_edit.setText("not-a-number")
+        self.app.processEvents()
+
+        self.assertEqual(window.thickness_edit.property("validationState"), "error")
+        self.assertIn("厚度", window.thickness_edit.toolTip())
+        self.assertFalse(window.run_button.isEnabled())
+
+        window.thickness_edit.setText("0.0016")
+        self.app.processEvents()
+
+        self.assertNotEqual(window.thickness_edit.property("validationState"), "error")
+        self.assertEqual(window.thickness_edit.toolTip(), base_tooltip)
+        window.close()
+
+    def test_measurement_parse_error_is_reported_on_sensor_tab(self):
+        window = gui_qt.ReconstructionMainWindow()
+        editor = window.measurement_editor
+        editor.table.selectRow(0)
+        editor.inputs["strain"].setText("invalid")
+        editor.update_selected()
+        self.app.processEvents()
+
+        self.assertEqual(editor.count_label.property("state"), "error")
+        self.assertIn("测量数据", editor.count_label.toolTip())
+        self.assertIn("·", window.left_tabs.tabText(1))
+        self.assertFalse(window.run_button.isEnabled())
+        window.close()
+
+    def test_display_settings_are_saved_in_view_state(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.title_edit.setText("持久化结果标题")
+        window.equal_axis_check.setChecked(True)
+        self.app.processEvents()
+
+        self.assertTrue(window.project_dirty)
+        self.assertEqual(
+            window.current_project_document.view_state["title"],
+            "持久化结果标题",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "view-state.ifemproj"
+            self.assertTrue(window._save_project_to(path))
+            restored = load_project(path)
+
+        self.assertEqual(restored.view_state["title"], "持久化结果标题")
+        self.assertTrue(restored.view_state["equal_axis"])
+        self.assertFalse(window.project_dirty)
+        window.close()
+
+    def test_spatial_project_save_keeps_entity_ids(self):
+        window = gui_qt.ReconstructionMainWindow()
+        spatial_project = PathBeamEditor.create_circular_arc(
+            empty_beam_project(modeling_space="3d"),
+            radius=2.0,
+            sweep_degrees=90.0,
+            plane="xz",
+        )
+        window._apply_project_document(
+            spatial_project,
+            dirty=True,
+            status_text="三维项目已载入 · 待运行",
+        )
+        expected_ids = {
+            key: tuple(getattr(spatial_project, key)[index].identifier for index in range(len(getattr(spatial_project, key))))
+            for key in ("nodes", "elements", "materials", "sections")
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "spatial.ifemproj"
+            self.assertTrue(window._save_project_to(path))
+            restored = load_project(path)
+
+        for key, identifiers in expected_ids.items():
+            self.assertEqual(
+                tuple(item.identifier for item in getattr(restored, key)),
+                identifiers,
+            )
+        self.assertEqual(restored.modeling_space, "3d")
+        window.close()
+
+    def test_spatial_project_rejects_invalid_unsaved_display_settings(self):
+        window = gui_qt.ReconstructionMainWindow()
+        spatial_project = PathBeamEditor.create_circular_arc(
+            empty_beam_project(modeling_space="3d"),
+            radius=2.0,
+            sweep_degrees=90.0,
+            plane="xz",
+        )
+        window._apply_project_document(
+            spatial_project,
+            dirty=False,
+            status_text="三维项目已载入 · 待运行",
+        )
+        window.y_min_edit.setText("invalid")
+        window.y_max_edit.setText("1")
+        self.app.processEvents()
+
+        self.assertEqual(window.display_settings_button.property("validationState"), "error")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-view.ifemproj"
+            self.assertFalse(window._save_project_to(path))
+            self.assertFalse(path.exists())
+        self.assertTrue(window.project_dirty)
+        window.close()
+
+    def test_legacy_form_save_preserves_ids_labels_and_analysis_cases(self):
+        window = gui_qt.ReconstructionMainWindow()
+        project = window.current_project_document
+        renamed_sensor = replace(project.sensors[0], label="SG-CUSTOM")
+        secondary_case = AnalysisCase(
+            identifier="analysis_secondary_test",
+            name="备用分析工况",
+            algorithm_id=project.analysis_cases[0].algorithm_id,
+            parameters={"gauss_n": 2, "points_per_element": 80},
+        )
+        project = project.revised(
+            sensors=(renamed_sensor, *project.sensors[1:]),
+            analysis_cases=(*project.analysis_cases, secondary_case),
+        )
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="项目已载入 · 待运行",
+        )
+        expected_ids = {
+            key: tuple(item.identifier for item in getattr(project, key))
+            for key in (
+                "nodes",
+                "elements",
+                "sensors",
+                "boundary_conditions",
+                "materials",
+                "sections",
+                "analysis_cases",
+            )
+        }
+
+        window.thickness_edit.setText("0.002")
+        window.measurement_editor.table.selectRow(0)
+        window.measurement_editor.inputs["strain"].setText("2.5e-4")
+        window.measurement_editor.update_selected()
+        saved_project = window._project_for_save()
+
+        self.assertEqual(saved_project.identifier, project.identifier)
+        for key, identifiers in expected_ids.items():
+            self.assertEqual(
+                tuple(item.identifier for item in getattr(saved_project, key)),
+                identifiers,
+            )
+        self.assertEqual(saved_project.sensors[0].label, "SG-CUSTOM")
+        self.assertEqual(saved_project.active_analysis_id, project.active_analysis_id)
+        self.assertEqual(len(saved_project.analysis_cases), 2)
+        window.close()
+
+    def test_measurement_add_and_delete_preserve_unmodified_entity_ids(self):
+        window = gui_qt.ReconstructionMainWindow()
+        project = window.current_project_document
+        renamed_sensor = replace(project.sensors[0], label="SG-PERSIST")
+        project = project.revised(sensors=(renamed_sensor, *project.sensors[1:]))
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="项目已载入 · 待运行",
+        )
+        original_ids = {sensor.identifier for sensor in project.sensors}
+
+        window.measurement_editor.set_form_values(
+            {
+                "element": "0",
+                "x": "0.1",
+                "surface": "top",
+                "y": "",
+                "strain": "1e-4",
+                "weight": "1",
+                "zone_a": "0.05",
+                "zone_b": "0.15",
+            }
+        )
+        window.measurement_editor.add_row()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sensor-cycle.ifemproj"
+            self.assertTrue(window._save_project_to(path))
+            added_project = window.current_project_document
+            added_ids = {sensor.identifier for sensor in added_project.sensors}
+            added_row_id = window.measurement_editor.get_rows()[-1]["_entity_id"]
+
+            self.assertTrue(original_ids.issubset(added_ids))
+            self.assertEqual(len(added_ids - original_ids), 1)
+            self.assertIn(added_row_id, added_ids - original_ids)
+            self.assertEqual(
+                next(
+                    sensor
+                    for sensor in added_project.sensors
+                    if sensor.identifier == renamed_sensor.identifier
+                ).label,
+                "SG-PERSIST",
+            )
+            self.assertNotIn(
+                "_entity_id",
+                gui_qt.config_to_json(window._build_form_config()),
+            )
+
+            deleted_id = window.measurement_editor.get_rows()[1]["_entity_id"]
+            window.measurement_editor.table.selectRow(1)
+            window.measurement_editor.delete_selected()
+            self.assertTrue(window._save_project_to(path))
+            deleted_project = window.current_project_document
+        remaining_ids = {sensor.identifier for sensor in deleted_project.sensors}
+
+        self.assertEqual(remaining_ids, added_ids - {deleted_id})
+        self.assertIn(added_row_id, remaining_ids)
+        self.assertEqual(
+            next(sensor for sensor in deleted_project.sensors if sensor.identifier == renamed_sensor.identifier).label,
+            "SG-PERSIST",
+        )
+        window.close()
+
+    def test_new_boundary_id_survives_second_save_without_reload(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.boundary_editor.set_form_values(
+            {"node": "1", "dof": "u", "value": "0"}
+        )
+        window.boundary_editor.add_row()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "boundary-cycle.ifemproj"
+            self.assertTrue(window._save_project_to(path))
+            row = window.boundary_editor.table.rowCount() - 1
+            created_id = window.boundary_editor.get_rows()[row]["_entity_id"]
+
+            window.boundary_editor.table.selectRow(row)
+            window.boundary_editor.inputs["dof"].setCurrentText("phi")
+            window.boundary_editor.update_selected()
+            self.assertTrue(window._save_project_to(path))
+
+        updated = next(
+            boundary
+            for boundary in window.current_project_document.boundary_conditions
+            if boundary.identifier == created_id
+        )
+        self.assertEqual(updated.dof, "phi")
+        self.assertEqual(
+            window.boundary_editor.get_rows()[-1]["_entity_id"],
+            created_id,
+        )
+        window.close()
+
+    def test_boundary_attachment_edit_preserves_row_entity_id(self):
+        window = gui_qt.ReconstructionMainWindow()
+        original_project = window.current_project_document
+        original_boundary_id = window.boundary_editor.get_rows()[0]["_entity_id"]
+
+        window.boundary_editor.table.selectRow(0)
+        window.boundary_editor.inputs["node"].setText("1")
+        window.boundary_editor.inputs["dof"].setCurrentText("u")
+        window.boundary_editor.update_selected()
+        updated_project = window._project_for_save()
+
+        updated_boundary = next(
+            boundary
+            for boundary in updated_project.boundary_conditions
+            if boundary.identifier == original_boundary_id
+        )
+        ordered_nodes = sorted(updated_project.nodes, key=lambda node: node.coordinates[0])
+        self.assertEqual(updated_boundary.node_id, ordered_nodes[1].identifier)
+        self.assertEqual(updated_boundary.dof, "u")
+        self.assertEqual(
+            len(updated_project.boundary_conditions),
+            len(original_project.boundary_conditions),
+        )
+        window.close()
+
+    def test_invalid_thickness_scale_targets_display_settings_not_beam_thickness(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.thickness_scale_combo.setEditText("invalid")
+        self.app.processEvents()
+
+        self.assertEqual(window.display_settings_button.property("validationState"), "error")
+        self.assertNotEqual(window.thickness_edit.property("validationState"), "error")
+        self.assertFalse(window.run_button.isEnabled())
+        window.close()
+
+    def test_destructive_project_actions_honor_unsaved_cancel(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.title_edit.setText("尚未保存的标题")
+        self.app.processEvents()
+
+        with patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ), patch.object(gui_qt, "BeamModelerDialog") as modeler_dialog:
+            window.new_project()
+            modeler_dialog.assert_not_called()
+
+        with patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ), patch.object(
+            gui_qt.ProjectLibraryDialog, "choose_project"
+        ) as open_dialog:
+            window.open_project()
+            open_dialog.assert_not_called()
+
+        with patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ):
+            self.assertFalse(window.load_sample_data())
+        self.assertEqual(window.title_edit.text(), "尚未保存的标题")
+
+        with patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Discard,
+        ):
+            self.assertTrue(window.load_sample_data())
+        self.assertTrue(window.project_dirty)
+        window.close()
+
+    def test_programmatic_close_honors_unsaved_cancel(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        window.title_edit.setText("尚未保存的标题")
+        self.app.processEvents()
+
+        with patch.object(window.structure_3d_view, "shutdown") as shutdown, patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as confirm:
+            self.assertFalse(window.close())
+            confirm.assert_called_once()
+            shutdown.assert_not_called()
+        self.assertTrue(window.isVisible())
+
+        with patch.object(window.structure_3d_view, "shutdown") as shutdown, patch.object(
+            gui_qt.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Discard,
+        ):
+            self.assertTrue(window.close())
+            shutdown.assert_called_once()
+
+    def test_modeler_reject_shuts_down_embedded_3d_view(self):
+        dialog = BeamModelerDialog(empty_beam_project())
+
+        with patch.object(dialog.geometry_3d_view, "shutdown") as shutdown:
+            dialog.reject()
+
+        shutdown.assert_called_once()
+
+    def test_focus_mode_hides_and_restores_input_and_result_panels(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        self.app.processEvents()
+        window.focus_mode_button.setChecked(True)
+        self.assertFalse(window.left_panel.isVisible())
+        self.assertFalse(window.result_group.isVisible())
+
+        window.focus_mode_button.setChecked(False)
+        self.assertTrue(window.left_panel.isVisible())
+        self.assertTrue(window.result_group.isVisible())
+        window.close()
+
+    def test_algorithm_selector_appears_when_multiple_methods_are_compatible(self):
+        class AlternateBeamAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier="ifem.beam2d.alternate.test",
+                display_name="测试梁重构方法",
+                version="0.1.0",
+                description="用于验证分析方案界面的插件发现行为。",
+            )
+
+        primary = BeamSurfaceIntegralAlgorithm()
+        alternate = AlternateBeamAlgorithm()
+        registry = AlgorithmRegistry((primary, alternate))
+        service = AnalysisService(
+            registry,
+            default_algorithm_id=primary.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        setup = window.analysis_setup
+
+        self.assertFalse(setup.algorithm_selector_row.isHidden())
+        self.assertEqual(setup.algorithm_selector.count(), 2)
+        alternate_index = setup.algorithm_selector.findData(
+            alternate.metadata.identifier
+        )
+        setup.algorithm_selector.setCurrentIndex(alternate_index)
+        self.assertEqual(
+            setup.active_algorithm_id,
+            alternate.metadata.identifier,
+        )
+        self.assertEqual(
+            window.analysis_metric_labels["solver"].text(),
+            alternate.metadata.display_name,
+        )
+        active_case = next(
+            case
+            for case in window.current_project_document.analysis_cases
+            if case.identifier == window.current_project_document.active_analysis_id
+        )
+        self.assertEqual(active_case.algorithm_id, alternate.metadata.identifier)
+        self.assertEqual(
+            window._project_for_interactive_modeler().analysis_cases[0].algorithm_id,
+            alternate.metadata.identifier,
+        )
+        window.close()
+
+    def test_result_context_bar_tracks_field_and_space(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.run_reconstruction()
+
+        self.assertEqual(window.view_context_label.text(), "二维结果 · 轴向应力")
+        self.assertIn("节点平均连续化", window.view_meta_label.text())
+
+        window.visualization_stack.setCurrentIndex(1)
+        window._refresh_view_context()
+        self.assertEqual(window.view_context_label.text(), "三维交互 · 轴向应力")
+
+        window.current_view = "shape"
+        window._refresh_view_context()
+        self.assertEqual(window.view_context_label.text(), "三维交互 · 重构形态")
+        window.close()
+
+    def test_canvas_click_adds_surface_sensor_and_opens_properties(self):
+        project = project_from_legacy_config(get_sample_config())
+        dialog = BeamModelerDialog(project)
+        dialog.resize(1100, 700)
+        dialog.show()
+        self.app.processEvents()
+
+        dialog.mode_buttons[BeamModelCanvas.MODE_ADD_TOP_SENSOR].click()
+        click_position = QPoint(
+            round(dialog.canvas._x_to_pixel(1.45)),
+            round(dialog.canvas._beam_y()),
+        )
+        QTest.mouseClick(
+            dialog.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            click_position,
+        )
+        self.app.processEvents()
+
+        self.assertEqual(len(dialog.project.sensors), 13)
+        self.assertEqual(dialog.selected_kind, "sensor")
+        self.assertEqual(dialog.inspector_tabs.currentIndex(), 1)
+        self.assertEqual(dialog.property_stack.currentIndex(), 2)
+        self.assertEqual(dialog.sensor_config_tabs.count(), 3)
+        sensor = dialog.project.sensors[-1]
+        self.assertEqual(sensor.attachment.surface_side, "top")
+        self.assertAlmostEqual(
+            BeamProjectEditor.sensor_location(dialog.project, sensor.identifier).global_x,
+            1.45,
+            places=2,
+        )
+
+        dialog.sensor_surface_angle_edit.setText("90")
+        dialog.sensor_orientation_angle_edit.setText("30")
+        dialog._update_sensor_property()
+        updated = next(
+            item for item in dialog.project.sensors if item.identifier == sensor.identifier
+        )
+        self.assertEqual(updated.attachment.surface_angle_degrees, 90.0)
+        self.assertEqual(updated.attachment.orientation_angle_degrees, 30.0)
+        self.assertEqual(dialog.sensor_surface_combo.currentData(), "custom")
+        _polygons, centers, directions = dialog.canvas._sensor_polygons()
+        self.assertAlmostEqual(centers[sensor.identifier].y(), dialog.canvas._beam_y(), places=6)
+        self.assertGreater(directions[sensor.identifier].y(), 0.0)
+        dialog.close()
+
+    def test_sensor_quick_layout_actions_are_undoable(self):
+        project = project_from_legacy_config(get_sample_config())
+        dialog = BeamModelerDialog(project)
+        source = dialog.project.sensors[0]
+        dialog._selection_changed("sensor", source.identifier)
+
+        self.assertTrue(dialog.sensor_copy_button.isEnabled())
+        self.assertTrue(dialog.sensor_opposite_button.isEnabled())
+        self.assertTrue(dialog.sensor_array_button.isEnabled())
+        self.assertEqual(
+            dialog.sensor_move_button.isEnabled(),
+            BeamGeometry3DView.backend_available,
+        )
+
+        original_count = len(dialog.project.sensors)
+        dialog._copy_selected_sensor()
+        copied = dialog.project.sensors[-1]
+        self.assertEqual(len(dialog.project.sensors), original_count + 1)
+        self.assertEqual(dialog.selected_id, copied.identifier)
+        self.assertEqual(copied.measured_value, 0.0)
+        dialog.undo_stack.undo()
+        self.assertEqual(len(dialog.project.sensors), original_count)
+        self.assertEqual(dialog.selected_kind, "")
+
+        dialog._selection_changed("sensor", source.identifier)
+        dialog._add_opposite_sensor()
+        opposite = dialog.project.sensors[-1]
+        expected_angle = (source.attachment.surface_angle_degrees + 180.0) % 360.0
+        self.assertAlmostEqual(opposite.attachment.surface_angle_degrees, expected_angle)
+        dialog.undo_stack.undo()
+
+        dialog._selection_changed("sensor", source.identifier)
+        source_distance = PathBeamEditor.sensor_location(
+            dialog.project,
+            source.identifier,
+        ).path_distance
+        direction = 1 if source_distance + 0.3 <= 3.0 else -1
+        dialog._array_selected_sensor(count=3, spacing=0.1, direction=direction)
+        self.assertEqual(len(dialog.project.sensors), original_count + 3)
+        distances = [
+            PathBeamEditor.sensor_location(dialog.project, sensor.identifier).path_distance
+            for sensor in dialog.project.sensors[-3:]
+        ]
+        expected = [source_distance + direction * 0.1 * index for index in range(1, 4)]
+        for actual, target in zip(distances, expected):
+            self.assertAlmostEqual(actual, target, places=10)
+        dialog.undo_stack.undo()
+        self.assertEqual(len(dialog.project.sensors), original_count)
+        dialog.close()
+
+    def test_surface_sensor_move_handler_preserves_id_and_is_undoable(self):
+        project = project_from_legacy_config(get_sample_config())
+        dialog = BeamModelerDialog(project)
+        sensor = dialog.project.sensors[0]
+        target_element = PathBeamEditor.ordered_elements(dialog.project)[1]
+        centerline = PathBeamEditor.point_on_element(dialog.project, target_element, 0.65)
+        _tangent, normal, binormal = PathBeamEditor.section_frame(
+            dialog.project,
+            target_element,
+            0.65,
+        )
+        section = next(
+            item
+            for item in dialog.project.sections
+            if item.identifier == target_element.section_id
+        )
+        boundary = section_boundary_point(section, 210.0)
+        picked = tuple(
+            center
+            + boundary.local_position[0] * normal_value
+            + boundary.local_position[1] * binormal_value
+            for center, normal_value, binormal_value in zip(
+                centerline,
+                normal,
+                binormal,
+            )
+        )
+        location = PathBeamEditor.surface_location_from_point(dialog.project, picked)
+
+        dialog._move_surface_sensor_from_3d(sensor.identifier, location)
+        moved = next(
+            item for item in dialog.project.sensors if item.identifier == sensor.identifier
+        )
+        self.assertEqual(moved.identifier, sensor.identifier)
+        self.assertEqual(moved.attachment.entity_id, target_element.identifier)
+        self.assertAlmostEqual(moved.attachment.local_coordinates[0], 0.65, places=10)
+        self.assertAlmostEqual(moved.attachment.surface_angle_degrees, 210.0, places=8)
+
+        dialog.undo_stack.undo()
+        restored = next(
+            item for item in dialog.project.sensors if item.identifier == sensor.identifier
+        )
+        self.assertEqual(restored.attachment, sensor.attachment)
+        dialog.close()
+
+    def test_sensor_array_dialog_prevents_out_of_path_creation(self):
+        dialog = SensorArrayDialog("M1", 0.8, 1.0)
+        dialog.direction_combo.setCurrentIndex(dialog.direction_combo.findData(1))
+        dialog.count_spin.setValue(3)
+        dialog.spacing_spin.setValue(0.1)
+
+        create_button = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.assertFalse(create_button.isEnabled())
+        self.assertIn("超出梁路径", dialog.preview_label.text())
+
+        dialog.direction_combo.setCurrentIndex(dialog.direction_combo.findData(-1))
+        self.assertTrue(create_button.isEnabled())
+        dialog.close()
+
+    def test_sensor_configuration_uses_compact_table_and_sectioned_editor(self):
+        window = gui_qt.ReconstructionMainWindow()
+        editor = window.measurement_editor
+
+        self.assertEqual(editor.count_label.text(), "12 个测点")
+        self.assertEqual(editor.editor_tabs.count(), 3)
+        self.assertFalse(editor.table.isColumnHidden(0))
+        self.assertFalse(editor.table.isColumnHidden(1))
+        self.assertFalse(editor.table.isColumnHidden(2))
+        self.assertTrue(editor.table.isColumnHidden(3))
+        self.assertFalse(editor.table.isColumnHidden(4))
+        self.assertTrue(editor.table.isColumnHidden(5))
+        self.assertTrue(editor.table.isColumnHidden(6))
+        self.assertTrue(editor.table.isColumnHidden(7))
+
+        editor.table.selectRow(0)
+        self.app.processEvents()
+        self.assertEqual(editor.table.item(0, 2).text(), "上")
+        self.assertEqual(editor.get_rows()[0]["surface"], "top")
+        self.assertEqual(editor.inputs["element"].text(), "0")
+        self.assertEqual(editor.inputs["surface"].currentText(), "top")
+        self.assertNotEqual(editor.inputs["zone_b"].text(), "")
+        window.close()
+
+    def test_arc_generator_and_property_editor_keep_one_geometry_entity(self):
+        dialog = BeamModelerDialog(empty_beam_project())
+        dialog.resize(1100, 700)
+        dialog.show()
+        self.app.processEvents()
+
+        dialog.model_space_buttons["3d"].click()
+        dialog.geometry_combo.setCurrentIndex(dialog.geometry_combo.findData("arc"))
+        dialog.primary_spin.setValue(2.5)
+        dialog.sweep_spin.setValue(120.0)
+        dialog.orientation_combo.setCurrentIndex(
+            dialog.orientation_combo.findData("yz")
+        )
+        dialog._generate_geometry()
+
+        self.assertEqual(len(dialog.project.nodes), 2)
+        self.assertEqual(len(dialog.project.elements), 1)
+        element = dialog.project.elements[0]
+        self.assertEqual(element.geometry.kind, "circular_arc")
+        self.assertEqual(element.geometry.parameters["plane"], "yz")
+
+        dialog._selection_changed("element", element.identifier)
+        self.assertEqual(dialog.property_stack.currentIndex(), 3)
+        self.assertEqual(dialog.element_geometry_label.text(), "参数化圆弧")
+        dialog.arc_radius_edit.setText("3.25")
+        dialog.arc_sweep_edit.setText("-75")
+        dialog.arc_plane_combo.setCurrentIndex(dialog.arc_plane_combo.findData("xz"))
+        dialog._update_element_property()
+
+        updated = dialog.project.elements[0]
+        self.assertEqual(len(dialog.project.nodes), 2)
+        self.assertEqual(len(dialog.project.elements), 1)
+        self.assertEqual(updated.geometry.parameters["radius"], 3.25)
+        self.assertEqual(updated.geometry.parameters["sweep_degrees"], -75.0)
+        self.assertEqual(updated.geometry.parameters["plane"], "xz")
+        dialog.close()
+
+    def test_modeler_builds_a_mixed_2d_path_without_discretizing_the_arc(self):
+        dialog = BeamModelerDialog(empty_beam_project(modeling_space="2d"))
+        dialog.resize(1100, 700)
+        dialog.show()
+        self.app.processEvents()
+
+        dialog.geometry_combo.setCurrentIndex(dialog.geometry_combo.findData("straight"))
+        dialog.primary_spin.setValue(2.0)
+        dialog.element_count_spin.setValue(1)
+        dialog.orientation_combo.setCurrentIndex(
+            dialog.orientation_combo.findData("x")
+        )
+        dialog._generate_geometry()
+        dialog.geometry_combo.setCurrentIndex(dialog.geometry_combo.findData("arc"))
+        dialog.primary_spin.setValue(1.0)
+        dialog.sweep_spin.setValue(90.0)
+        dialog._append_geometry()
+
+        capability = PathBeamEditor.capability(dialog.project)
+        self.assertEqual(dialog.project.modeling_space, "2d")
+        self.assertEqual(len(dialog.project.elements), 2)
+        self.assertEqual(
+            [element.geometry.kind for element in dialog.project.elements],
+            ["line", "circular_arc"],
+        )
+        self.assertEqual(capability.kind, "二维直线/圆弧组合梁")
+        self.assertEqual(dialog.capability_label.text(), "无可用算法")
+        dialog.close()
+
+    def test_main_window_keeps_spatial_model_but_disables_legacy_solver(self):
+        window = gui_qt.ReconstructionMainWindow()
+        spatial_project = PathBeamEditor.create_circular_arc(
+            window.current_project_document,
+            radius=2.0,
+            sweep_degrees=90.0,
+            plane="xz",
+        )
+
+        class AcceptedModeler:
+            def __init__(self, _project, _parent=None):
+                self.project = spatial_project
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        with patch.object(gui_qt, "BeamModelerDialog", AcceptedModeler):
+            window.open_interactive_modeler()
+
+        self.assertIs(window.current_project_document, spatial_project)
+        self.assertFalse(window.run_button.isEnabled())
+        self.assertEqual(window.analysis_metric_labels["solver"].text(), "等待匹配算法")
+        self.assertEqual(window.run_status_label.text(), "模型已保存 · 算法待接入")
+        window.close()
+
+    def test_uniform_section_form_switches_shape_and_updates_project(self):
+        dialog = BeamModelerDialog(empty_beam_project())
+        dialog.section_shape_combo.setCurrentIndex(
+            dialog.section_shape_combo.findData("box")
+        )
+        values = ("0.24", "0.12", "0.015")
+        for edit, value in zip(dialog.section_parameter_edits, values):
+            edit.setText(value)
+        dialog.material_e_edit.setText("70")
+
+        dialog._update_primary_properties()
+
+        section = dialog.project.sections[0]
+        self.assertEqual(section.shape, "box")
+        self.assertEqual(
+            section.parameters,
+            {"outer_height": 0.24, "outer_width": 0.12, "wall_thickness": 0.015},
+        )
+        self.assertTrue(
+            all(element.section_id == section.identifier for element in dialog.project.elements)
+        )
+        dialog.close()
+
+    def test_3d_surface_pick_adds_sensor_selects_it_and_supports_undo(self):
+        project = PathBeamEditor.create_straight_beam(
+            empty_beam_project(),
+            length=2.0,
+            element_count=1,
+        )
+        project = PathBeamEditor.update_primary_properties(
+            project,
+            thickness=0.2,
+            width=0.1,
+            elastic_modulus=70.0e9,
+        )
+        dialog = BeamModelerDialog(project)
+        element = project.elements[0]
+        centerline = PathBeamEditor.point_on_element(project, element, 0.4)
+        _tangent, normal, binormal = PathBeamEditor.section_frame(project, element, 0.4)
+        boundary = section_boundary_point(project.sections[0], 35.0)
+        picked = tuple(
+            center
+            + normal_value * boundary.local_position[0]
+            + binormal_value * boundary.local_position[1]
+            for center, normal_value, binormal_value in zip(
+                centerline,
+                normal,
+                binormal,
+            )
+        )
+
+        dialog._set_mode(BeamGeometry3DView.MODE_ADD_SURFACE_SENSOR)
+        dialog.geometry_3d_view._picked(picked)
+        self.app.processEvents()
+
+        self.assertEqual(dialog.view_stack.currentIndex(), 1)
+        self.assertEqual(len(dialog.project.sensors), 1)
+        sensor = dialog.project.sensors[0]
+        self.assertEqual(dialog.selected_kind, "sensor")
+        self.assertEqual(dialog.selected_id, sensor.identifier)
+        self.assertAlmostEqual(sensor.attachment.local_coordinates[0], 0.4, places=10)
+        self.assertAlmostEqual(sensor.attachment.surface_angle_degrees, 35.0, places=10)
+        self.assertIn("表面", dialog.sensor_position_label.text())
+        self.assertIn("s=", dialog.sensor_position_label.text())
+
+        dialog.undo_stack.undo()
+        self.assertEqual(len(dialog.project.sensors), 0)
+        dialog.close()
+
+    def test_escape_exits_3d_surface_placement_mode(self):
+        dialog = BeamModelerDialog(empty_beam_project())
+        dialog._set_mode(BeamGeometry3DView.MODE_ADD_SURFACE_SENSOR)
+
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+
+        self.assertEqual(dialog.canvas.mode, BeamModelCanvas.MODE_SELECT)
+        self.assertEqual(dialog.geometry_3d_view.mode, BeamGeometry3DView.MODE_SELECT)
+        self.assertTrue(dialog.mode_buttons[BeamModelCanvas.MODE_SELECT].isChecked())
+        dialog.close()
+
+    def test_result_3d_view_keeps_sensor_overlays_in_modeler_only(self):
+        view = Structure3DView()
+
+        self.assertIn("测点布置请在建模视图查看", view.interaction_hint.text())
+        self.assertFalse(hasattr(view, "show_sensors_check"))
+        view.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

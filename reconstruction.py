@@ -509,7 +509,7 @@ class IBeam3SurfaceIntegralReconstruction2D:
         show_original=True,
         show_nodes=True,
         equal_axis=False,
-        title="直接表面应变矩阵法二维梁形状重构结果",
+        title="二维梁重构形态",
         annotate_points=True,
         connect_pairs=True,
         label_offset_scale=0.04,
@@ -517,12 +517,12 @@ class IBeam3SurfaceIntegralReconstruction2D:
         show_legend=True,
         y_limits=None,
     ):
-        original_color = "#6b7280"
-        shape_color = "#1d4ed8"
-        node_face_color = "#3b82f6"
-        true_face_color = "#ef4444"
-        rec_face_color = "#16a34a"
-        pair_line_color = "#94a3b8"
+        original_color = "#9a958b"
+        shape_color = "#536a5a"
+        node_face_color = "#7f927f"
+        true_face_color = "#c9684d"
+        rec_face_color = "#d3a24c"
+        pair_line_color = "#b7afa2"
 
         X, _, _, X_def, Y_def = self.reconstruct_full_shape(
             points_per_element=points_per_element
@@ -530,8 +530,8 @@ class IBeam3SurfaceIntegralReconstruction2D:
         u_node, v_node, _ = self.nodal_results()
 
         ax.clear()
-        ax.set_facecolor("#fbfdff")
-        ax.figure.set_facecolor("white")
+        ax.set_facecolor("#ffffff")
+        ax.figure.set_facecolor("#ffffff")
 
         if show_original:
             ax.plot(
@@ -547,7 +547,7 @@ class IBeam3SurfaceIntegralReconstruction2D:
             X_def,
             Y_def,
             color=shape_color,
-            lw=2.4,
+            lw=2.6,
             solid_capstyle="round",
             label="重构后形状",
         )
@@ -677,8 +677,8 @@ class IBeam3SurfaceIntegralReconstruction2D:
                         xytext=(x_true + dx, y_true + dy),
                         textcoords="data",
                         fontsize=9,
-                        color="black",
-                        arrowprops={"arrowstyle": "-", "lw": 0.8, "color": "red"},
+                        color="#4a514a",
+                        arrowprops={"arrowstyle": "-", "lw": 0.8, "color": true_face_color},
                     )
                     ax.annotate(
                         f"重构{i}",
@@ -686,19 +686,19 @@ class IBeam3SurfaceIntegralReconstruction2D:
                         xytext=(x_rec - dx, y_rec - dy),
                         textcoords="data",
                         fontsize=9,
-                        color="#111827",
+                        color="#4a514a",
                         arrowprops={"arrowstyle": "-", "lw": 0.8, "color": rec_face_color},
                     )
 
-        ax.set_xlabel("变形后 x 坐标", color="#334155")
-        ax.set_ylabel("y 坐标", color="#334155")
-        ax.set_title(title, pad=10, fontsize=16, color="#0f172a", fontweight="semibold")
-        ax.grid(True, linestyle=(0, (4, 4)), linewidth=0.8, color="#cbd5e1", alpha=0.65)
-        ax.tick_params(colors="#334155")
+        ax.set_xlabel("变形后 x 坐标", color="#3d463f")
+        ax.set_ylabel("y 坐标", color="#3d463f")
+        ax.set_title(title, pad=10, fontsize=16, color="#29342d", fontweight="semibold")
+        ax.grid(True, linestyle=(0, (4, 4)), linewidth=0.8, color="#e1e6e1", alpha=0.76)
+        ax.tick_params(colors="#5f675f")
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color("#94a3b8")
-        ax.spines["bottom"].set_color("#94a3b8")
+        ax.spines["left"].set_color("#aaa397")
+        ax.spines["bottom"].set_color("#aaa397")
         ax.spines["left"].set_linewidth(1.0)
         ax.spines["bottom"].set_linewidth(1.0)
         ax.margins(x=0.04, y=0.12)
@@ -711,7 +711,7 @@ class IBeam3SurfaceIntegralReconstruction2D:
             ax.set_aspect("equal", adjustable="datalim")
 
         if show_legend:
-            ax.legend(loc=legend_loc)
+            ax.legend(loc=legend_loc, frameon=False, labelcolor="#4a514a")
 
     def plot_shape(self, **kwargs):
         try:

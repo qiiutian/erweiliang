@@ -1,0 +1,41 @@
+# macOS and editor state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local Codex/runtime configuration
+.codex/
+.mplconfig/
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments and local secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+
+# Local review renders and temporary files
+artifacts/
+*.log
+*.tmp
+*.bak

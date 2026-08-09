@@ -11,7 +11,7 @@ DEPENDENCY_HINT = (
     "缺少运行桌面工具所需的 Python 依赖。\n\n"
     "请先在当前环境安装：\n"
     "  python -m pip install -r requirements.txt\n\n"
-    "当前 GUI 需要的核心依赖：numpy、matplotlib、PySide6。"
+    "当前 GUI 需要的核心依赖：numpy、matplotlib、PySide6；三维视图使用 PyVista/VTK。"
 )
 
 

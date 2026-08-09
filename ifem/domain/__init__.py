@@ -1,0 +1,53 @@
+"""UI-independent domain contracts."""
+
+from ifem.domain.analysis import (
+    AlgorithmCapabilities,
+    AlgorithmMetadata,
+    AnalysisCancelled,
+    AnalysisContext,
+    AnalysisResult,
+    CancellationToken,
+    ReconstructionAlgorithm,
+    ValidationIssue,
+    ValidationReport,
+)
+from ifem.domain.project import (
+    CURRENT_PROJECT_SCHEMA_VERSION,
+    AnalysisCase,
+    BeamElement,
+    BeamGeometryDefinition,
+    BoundaryCondition,
+    MaterialDefinition,
+    ProjectDocument,
+    SectionDefinition,
+    SensorAttachment,
+    SensorDefinition,
+    StructuralNode,
+    empty_beam_project,
+    new_entity_id,
+)
+
+__all__ = [
+    "AlgorithmCapabilities",
+    "AlgorithmMetadata",
+    "AnalysisCancelled",
+    "AnalysisContext",
+    "AnalysisResult",
+    "CancellationToken",
+    "ReconstructionAlgorithm",
+    "ValidationIssue",
+    "ValidationReport",
+    "CURRENT_PROJECT_SCHEMA_VERSION",
+    "AnalysisCase",
+    "BeamElement",
+    "BeamGeometryDefinition",
+    "BoundaryCondition",
+    "MaterialDefinition",
+    "ProjectDocument",
+    "SectionDefinition",
+    "SensorAttachment",
+    "SensorDefinition",
+    "StructuralNode",
+    "empty_beam_project",
+    "new_entity_id",
+]
