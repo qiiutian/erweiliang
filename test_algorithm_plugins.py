@@ -202,6 +202,26 @@ class AlgorithmPluginTests(unittest.TestCase):
             any("3D建模空间" in reason for reason in spatial_match.reasons)
         )
 
+        alternate_section = replace(
+            straight.sections[0],
+            identifier="section_mixed",
+            thickness=0.25,
+            parameters={},
+        )
+        mixed_sections = straight.revised(
+            sections=straight.sections + (alternate_section,),
+            elements=(
+                replace(
+                    straight.elements[0],
+                    section_id=alternate_section.identifier,
+                ),
+            )
+            + straight.elements[1:],
+        )
+        section_match = match_project_algorithms(mixed_sections, (algorithm,))[0]
+        self.assertFalse(section_match.compatible)
+        self.assertTrue(any("同一截面" in reason for reason in section_match.reasons))
+
     def test_default_service_preserves_sample_numeric_baseline(self):
         progress_events = []
         result = self.service.run(
@@ -506,6 +526,27 @@ class AlgorithmPluginTests(unittest.TestCase):
             service.run(get_sample_config())
         self.assertEqual(raised.exception.report.issues[0], report.issues[0])
 
+        class BrokenValidationAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = replace(
+                BeamSurfaceIntegralAlgorithm.metadata,
+                identifier="ifem.test.broken-validation",
+            )
+
+            def validate(self, context):
+                raise RuntimeError("third-party validation failed")
+
+        broken = BrokenValidationAlgorithm()
+        broken_service = AnalysisService(
+            AlgorithmRegistry((broken,)),
+            default_algorithm_id=broken.metadata.identifier,
+        )
+        broken_report = broken_service.validate(get_sample_config())
+        self.assertFalse(broken_report.is_valid)
+        self.assertEqual(broken_report.issues[0].field, "/analysis/algorithm/id")
+        self.assertIn("RuntimeError", broken_report.error_message)
+        with self.assertRaises(AlgorithmValidationError):
+            broken_service.run(get_sample_config())
+
     def test_service_rejects_result_with_wrong_algorithm_version(self):
         class WrongResultVersionAlgorithm(BeamSurfaceIntegralAlgorithm):
             def solve(self, context, *, progress, cancellation):
@@ -554,6 +595,26 @@ class AlgorithmPluginTests(unittest.TestCase):
                 ("兼容模式提示", "/model/path", "warning"),
             ],
         )
+
+        class BrokenAssessmentAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = replace(
+                BeamSurfaceIntegralAlgorithm.metadata,
+                identifier="ifem.test.broken-assessment",
+                display_name="损坏的候选方法",
+            )
+
+            def assess_project(self, project):
+                raise RuntimeError("third-party assessor failed")
+
+        matches = match_project_algorithms(
+            project,
+            (BrokenAssessmentAlgorithm(), BeamSurfaceIntegralAlgorithm()),
+        )
+        self.assertEqual(len(matches), 2)
+        self.assertFalse(matches[0].compatible)
+        self.assertEqual(matches[0].issues[0].field, "/analysis/algorithm/id")
+        self.assertIn("RuntimeError", matches[0].reason_text)
+        self.assertTrue(matches[1].compatible)
 
 
 if __name__ == "__main__":

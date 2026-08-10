@@ -2805,10 +2805,10 @@ class BeamModelerDialog(QDialog):
             QMessageBox.warning(self, "参数化生成", str(exc))
 
     def _create_spatial_curve(self):
+        if not self._confirm_geometry_replacement():
+            return
         dialog = SpatialCurveDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if not self._confirm_geometry_replacement():
             return
         try:
             definition = dialog.curve_definition

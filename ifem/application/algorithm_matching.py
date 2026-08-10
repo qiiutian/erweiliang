@@ -143,8 +143,18 @@ def assess_project_algorithm(
                 str(exc),
                 field="/model/geometry",
             )
+        except Exception as exc:
+            report = ValidationReport.invalid(
+                "重构方法能力评估失败："
+                f"{algorithm.metadata.identifier}（{type(exc).__name__}: {exc}）",
+                field="/analysis/algorithm/id",
+            )
         if not isinstance(report, ValidationReport):
-            raise TypeError("算法项目能力评估必须返回 ValidationReport。")
+            report = ValidationReport.invalid(
+                "重构方法能力评估返回了无效结果："
+                f"{algorithm.metadata.identifier}（{type(report).__name__}）",
+                field="/analysis/algorithm/id",
+            )
         issues.extend(report.issues)
     return ValidationReport(tuple(issues))
 

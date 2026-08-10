@@ -851,9 +851,20 @@ class ModelerUiTests(unittest.TestCase):
                 description="用于验证分析方案界面的插件发现行为。",
             )
 
+        class BrokenValidationAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier="ifem.beam2d.broken-validation.test",
+                display_name="校验异常测试方法",
+                version="0.1.0",
+            )
+
+            def validate(self, context):
+                raise RuntimeError("third-party validation failed")
+
         primary = BeamSurfaceIntegralAlgorithm()
         alternate = AlternateBeamAlgorithm()
-        registry = AlgorithmRegistry((primary, alternate))
+        broken = BrokenValidationAlgorithm()
+        registry = AlgorithmRegistry((primary, alternate, broken))
         service = AnalysisService(
             registry,
             default_algorithm_id=primary.metadata.identifier,
@@ -882,7 +893,7 @@ class ModelerUiTests(unittest.TestCase):
             setup.algorithm_selector,
         )
         self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
-        self.assertEqual(setup.algorithm_selector.count(), 1)
+        self.assertEqual(setup.algorithm_selector.count(), 2)
         self.assertEqual(
             setup.algorithm_selector.findData(primary.metadata.identifier),
             -1,
@@ -937,9 +948,48 @@ class ModelerUiTests(unittest.TestCase):
             if case.identifier == window.current_project_document.active_analysis_id
         )
         self.assertEqual(active_case.algorithm_id, alternate.metadata.identifier)
+        self.assertEqual(active_case.algorithm_version, alternate.metadata.version)
+        self.assertEqual(
+            active_case.parameter_schema_version,
+            alternate.metadata.parameter_schema_version,
+        )
         self.assertEqual(
             window._project_for_interactive_modeler().analysis_cases[0].algorithm_id,
             alternate.metadata.identifier,
+        )
+
+        project_snapshot = window._project_for_save()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "selected-method.ifemproj"
+            save_project(path, project_snapshot)
+            reopened = load_project(path)
+        reopened_case = next(
+            case
+            for case in reopened.analysis_cases
+            if case.identifier == reopened.active_analysis_id
+        )
+        self.assertEqual(reopened_case.algorithm_id, alternate.metadata.identifier)
+        self.assertEqual(reopened_case.algorithm_version, alternate.metadata.version)
+        self.assertEqual(
+            reopened_case.parameter_schema_version,
+            alternate.metadata.parameter_schema_version,
+        )
+        self.assertEqual(reopened_case.parameters, active_case.parameters)
+
+        broken_index = setup.algorithm_selector.findData(
+            broken.metadata.identifier
+        )
+        self.assertGreaterEqual(broken_index, 0)
+        setup.algorithm_selector.setCurrentIndex(broken_index)
+        self.app.processEvents()
+        self.assertEqual(setup.active_algorithm_id, broken.metadata.identifier)
+        self.assertFalse(window.run_button.isEnabled())
+        self.assertTrue(
+            any(
+                issue.get("field") == "/analysis/algorithm/id"
+                and "RuntimeError" in issue.get("message", "")
+                for issue in window._readiness_issues
+            )
         )
         window.close()
 
@@ -1334,6 +1384,66 @@ class ModelerUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(setup.accept_current_button.hasFocus())
         window.close()
+
+        class OptionalParameterAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier=BeamSurfaceIntegralAlgorithm.metadata.identifier,
+                display_name="可选参数升级方法",
+                version="2.0.0",
+                parameter_schema_version="2",
+            )
+
+            def parameter_schema(self):
+                return {
+                    "type": "object",
+                    "properties": {"gain": {"type": "number"}},
+                }
+
+        algorithm = OptionalParameterAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((algorithm,)),
+            default_algorithm_id=algorithm.metadata.identifier,
+        )
+        recovery_window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        recovery_case = replace(
+            recovery_window.current_project_document.analysis_cases[0],
+            algorithm_version="1.0.0",
+            parameter_schema_version="1",
+            parameters={
+                "gain": "invalid-old-value",
+                "unknown_parameter": {"keep": True},
+            },
+        )
+        recovery_project = recovery_window.current_project_document.revised(
+            analysis_cases=(recovery_case,)
+        )
+        recovery_window._apply_project_document(
+            recovery_project,
+            dirty=False,
+            status_text="可选参数迁移测试项目已载入",
+        )
+
+        recovery_window.analysis_setup.accept_current_button.click()
+        migrated = recovery_window._project_for_save()
+        migrated_case = migrated.analysis_cases[0]
+        self.assertNotIn("gain", migrated_case.parameters)
+        self.assertEqual(
+            migrated_case.parameters["unknown_parameter"],
+            {"keep": True},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "optional-parameter.ifemproj"
+            save_project(path, migrated)
+            reopened = load_project(path)
+        reopened_case = reopened.analysis_cases[0]
+        resolution = service.registry.resolve(
+            reopened_case.algorithm_id,
+            expected_version=reopened_case.algorithm_version,
+            expected_schema_version=reopened_case.parameter_schema_version,
+        )
+        self.assertTrue(resolution.is_ready)
+        self.assertTrue(service.validate_project(reopened).is_valid)
+        recovery_window.close()
 
     def test_failed_recovery_activation_is_transactional(self):
         class UpdatedBeamAlgorithm(BeamSurfaceIntegralAlgorithm):
@@ -2114,14 +2224,27 @@ class ModelerUiTests(unittest.TestCase):
         self.assertTrue(project.boundary_conditions)
         dialog = BeamModelerDialog(project)
 
-        with patch(
-            "ifem.ui.modeler.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.No,
-        ) as confirm:
+        with (
+            patch(
+                "ifem.ui.modeler.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ) as confirm,
+            patch("ifem.ui.modeler.SpatialCurveDialog") as spatial_dialog,
+        ):
             dialog._generate_geometry()
 
         confirm.assert_called_once()
         self.assertIn("边界约束", confirm.call_args.args[2])
+        self.assertEqual(dialog.project.to_dict(), project.to_dict())
+
+        with patch(
+            "ifem.ui.modeler.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as confirm:
+            dialog._create_spatial_curve()
+
+        confirm.assert_called_once()
+        spatial_dialog.assert_not_called()
         self.assertEqual(dialog.project.to_dict(), project.to_dict())
         dialog.close()
 

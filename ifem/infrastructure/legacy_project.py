@@ -9,6 +9,7 @@ from config_adapter import (
     validate_config,
 )
 from ifem.application.analysis_service import DEFAULT_ALGORITHM_ID
+from ifem.domain.analysis import InputValidationError
 from ifem.domain.project import (
     AnalysisCase,
     BeamElement,
@@ -23,13 +24,70 @@ from ifem.domain.project import (
 )
 
 
-def _surface_side(measurement: Mapping[str, Any]) -> str:
+def _surface_side(
+    measurement: Mapping[str, Any],
+    *,
+    half_thickness: float,
+    measurement_index: int,
+) -> str:
+    if measurement.get("y") not in (None, ""):
+        y = float(measurement["y"])
+        tolerance = max(abs(half_thickness), 1.0) * 1.0e-10
+        if abs(y - half_thickness) <= tolerance:
+            return "top"
+        if abs(y + half_thickness) <= tolerance:
+            return "bottom"
+        raise InputValidationError(
+            "当前项目格式只能无损表示上下表面测点；"
+            f"y 必须等于 ±{half_thickness:.12g}。",
+            field=f"/measurements/{measurement_index}/y",
+        )
     surface = str(measurement.get("surface", "")).strip().lower()
     if surface in {"top", "upper", "up", "上", "上表面"}:
         return "top"
     if surface in {"bot", "bottom", "lower", "down", "下", "下表面"}:
         return "bottom"
-    return "top" if float(measurement.get("y", 0.0)) > 0.0 else "bottom"
+    raise InputValidationError(
+        "测点 surface 无法识别。",
+        field=f"/measurements/{measurement_index}/surface",
+    )
+
+
+def _uniform_element_definition(
+    elements,
+    definitions,
+    *,
+    reference_name: str,
+    display_name: str,
+    field: str,
+    required: bool,
+):
+    references = {getattr(element, reference_name) for element in elements}
+    if len(references) > 1:
+        raise InputValidationError(
+            f"当前二维方法要求全部梁单元使用同一{display_name}。",
+            field=field,
+        )
+    reference = next(iter(references), None)
+    if reference is None:
+        if len(definitions) == 1:
+            return definitions[0]
+        if required or definitions:
+            raise InputValidationError(
+                f"梁单元没有唯一可恢复的{display_name}引用。",
+                field=field,
+            )
+        return None
+    definition = next(
+        (item for item in definitions if item.identifier == reference),
+        None,
+    )
+    if definition is None:
+        raise InputValidationError(
+            f"梁单元引用的{display_name}不存在：{reference}",
+            field=field,
+        )
+    return definition
 
 
 def project_from_legacy_config(
@@ -88,7 +146,11 @@ def project_from_legacy_config(
                     attachment=SensorAttachment(
                         entity_id=element.identifier,
                         local_coordinates=(local_x / length,),
-                        surface_side=_surface_side(measurement),
+                        surface_side=_surface_side(
+                            measurement,
+                            half_thickness=float(normalized["thickness"]) / 2.0,
+                            measurement_index=sequence - 1,
+                        ),
                         gauge_length=zone_b - zone_a,
                         integration_bounds=(zone_a / length, zone_b / length),
                     ),
@@ -182,10 +244,22 @@ def legacy_config_from_project(
     element_index = {element.identifier: index for index, element in enumerate(elements)}
     node_x = [float(node.coordinates[0]) for node in nodes]
 
-    section = project.sections[0] if project.sections else None
-    if section is None:
-        raise ValueError("项目缺少梁截面。")
-    material = project.materials[0] if project.materials else None
+    section = _uniform_element_definition(
+        elements,
+        project.sections,
+        reference_name="section_id",
+        display_name="截面",
+        field="/sections",
+        required=True,
+    )
+    material = _uniform_element_definition(
+        elements,
+        project.materials,
+        reference_name="material_id",
+        display_name="材料",
+        field="/materials",
+        required=False,
+    )
     elastic_modulus = None if material is None else material.elastic_modulus
 
     elements_sensor_data = [{"measurements": []} for _ in elements]

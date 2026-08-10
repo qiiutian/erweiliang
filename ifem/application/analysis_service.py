@@ -21,6 +21,7 @@ from ifem.domain.analysis import (
     AnalysisResult,
     CancellationToken,
     DeformationRegime,
+    InputValidationError,
     ProgressReporter,
     ReconstructionAlgorithm,
     ResultField,
@@ -361,9 +362,25 @@ class AnalysisService:
                 report=ValidationReport(tuple(preflight_issues)),
             )
 
-        algorithm_report = algorithm.validate(context)
+        try:
+            algorithm_report = algorithm.validate(context)
+        except InputValidationError as exc:
+            algorithm_report = ValidationReport.invalid(
+                str(exc),
+                field=exc.field or "/analysis/algorithm/id",
+            )
+        except Exception as exc:
+            algorithm_report = ValidationReport.invalid(
+                "重构方法输入校验失败："
+                f"{algorithm.metadata.identifier}（{type(exc).__name__}: {exc}）",
+                field="/analysis/algorithm/id",
+            )
         if not isinstance(algorithm_report, ValidationReport):
-            raise TypeError("算法 validate() 必须返回 ValidationReport。")
+            algorithm_report = ValidationReport.invalid(
+                "重构方法 validate() 返回了无效结果："
+                f"{algorithm.metadata.identifier}（{type(algorithm_report).__name__}）",
+                field="/analysis/algorithm/id",
+            )
         preflight_issues.extend(algorithm_report.issues)
         return AnalysisPreparation(
             resolution=resolution,

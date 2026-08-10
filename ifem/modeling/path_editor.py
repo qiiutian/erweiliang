@@ -15,7 +15,7 @@ from ifem.domain.project import (
     StructuralNode,
     new_entity_id,
 )
-from ifem.modeling.parametric_curves import (
+from ifem.domain.parametric_curves import (
     clamped_uniform_knots,
     nurbs_arc_length,
     nurbs_parameter_at_arc_length,
@@ -1216,7 +1216,10 @@ class PathBeamEditor:
             normal = normals[plane]
         else:
             normal = _normalize(normal)
-            if plane not in normals:
+            if (
+                plane not in normals
+                or abs(abs(_dot(normal, normals[plane])) - 1.0) > 1.0e-8
+            ):
                 plane = PathBeamEditor._plane_label_from_normal(normal)
         if abs(_dot(tangent, normal)) > 1.0e-8:
             raise ValueError("所选圆弧平面必须包含当前路径末端切线。")
@@ -2272,10 +2275,14 @@ class PathBeamEditor:
             end,
         )
         modeling_space = (
-            "2d"
-            if geometry.parameters["plane"] == "xy"
-            and all(abs(point[2]) <= _GEOMETRY_TOLERANCE for point in (start, through, end))
-            else "3d"
+            "3d"
+            if project.modeling_space == "3d"
+            or geometry.parameters["plane"] != "xy"
+            or any(
+                abs(point[2]) > _GEOMETRY_TOLERANCE
+                for point in (start, through, end)
+            )
+            else "2d"
         )
         nodes = (
             StructuralNode(new_entity_id("node"), start),
@@ -2591,10 +2598,31 @@ class PathBeamEditor:
             and abs(sensor.attachment.direction[2]) <= 1.0e-8
             for sensor in project.sensors
         )
+        section_references = {element.section_id for element in elements}
+        material_references = {element.material_id for element in elements}
+        section_configuration_compatible = (
+            len(section_references) == 1
+            and (
+                next(iter(section_references)) is not None
+                or len(project.sections) == 1
+            )
+        )
+        material_configuration_compatible = (
+            len(material_references) == 1
+            and (
+                next(iter(material_references)) is not None
+                or len(project.materials) <= 1
+            )
+        )
+        property_configuration_compatible = (
+            section_configuration_compatible
+            and material_configuration_compatible
+        )
         compatible = (
             modeling_space == "2d"
             and geometry_compatible
             and sensor_configuration_compatible
+            and property_configuration_compatible
         )
 
         vectors = [
@@ -2613,11 +2641,12 @@ class PathBeamEditor:
         )
         if modeling_space == "2d" and geometry_compatible:
             kind = "二维直梁"
-            reason = (
-                "可直接使用当前二维直梁算法"
-                if sensor_configuration_compatible
-                else "当前算法仅接受上下表面的轴向应变测点"
-            )
+            if not sensor_configuration_compatible:
+                reason = "当前算法仅接受上下表面的轴向应变测点"
+            elif not property_configuration_compatible:
+                reason = "当前算法要求全部梁单元使用同一截面和材料"
+            else:
+                reason = "可直接使用当前二维直梁算法"
         else:
             if modeling_space == "2d":
                 if mixed_geometry:

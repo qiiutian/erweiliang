@@ -1,3 +1,4 @@
+import copy
 import tempfile
 import unittest
 from dataclasses import replace
@@ -38,6 +39,121 @@ class ProjectDocumentTests(unittest.TestCase):
             sum(len(item["measurements"]) for item in converted["elements_sensor_data"]),
             12,
         )
+
+    def test_legacy_projection_uses_element_references_and_preserves_surface_depth(self):
+        referenced_section = replace(
+            self.project.sections[0],
+            identifier="section_referenced",
+            thickness=0.25,
+            parameters={},
+        )
+        referenced_material = replace(
+            self.project.materials[0],
+            identifier="material_referenced",
+            elastic_modulus=123.0e9,
+        )
+        referenced_project = self.project.revised(
+            sections=self.project.sections + (referenced_section,),
+            materials=self.project.materials + (referenced_material,),
+            elements=tuple(
+                replace(
+                    element,
+                    section_id=referenced_section.identifier,
+                    material_id=referenced_material.identifier,
+                )
+                for element in self.project.elements
+            ),
+        )
+
+        projected = legacy_config_from_project(referenced_project)
+
+        self.assertEqual(projected["thickness"], referenced_section.thickness)
+        self.assertEqual(
+            projected["material"]["elastic_modulus"],
+            referenced_material.elastic_modulus,
+        )
+
+        surface_config = copy.deepcopy(self.config)
+        half_thickness = float(surface_config["thickness"]) / 2.0
+        measurement = surface_config["elements_sensor_data"][0]["measurements"][0]
+        measurement["surface"] = "top"
+        measurement["y"] = -half_thickness
+        surface_project = project_from_legacy_config(surface_config)
+        self.assertEqual(surface_project.sensors[0].attachment.surface_side, "bottom")
+        self.assertEqual(
+            legacy_config_from_project(surface_project)["elements_sensor_data"][0][
+                "measurements"
+            ][0]["surface"],
+            "bot",
+        )
+
+        measurement["y"] = half_thickness * 0.4
+        with self.assertRaises(InputValidationError) as captured:
+            project_from_legacy_config(surface_config)
+        self.assertEqual(captured.exception.field, "/measurements/0/y")
+
+    def test_geometry_contract_rejects_disconnected_arcs_and_nurbs_breaks(self):
+        arc = PathBeamEditor.create_circular_arc(
+            empty_beam_project(modeling_space="2d"),
+            radius=1.5,
+            sweep_degrees=90.0,
+            plane="xy",
+        )
+        disconnected = arc.to_dict()
+        endpoint = disconnected["nodes"][1]["coordinates"]
+        disconnected["nodes"][1]["coordinates"] = (
+            endpoint[0] + 0.25,
+            endpoint[1],
+            endpoint[2],
+        )
+        with self.assertRaisesRegex(ValueError, "几何端点必须与结构节点一致"):
+            ProjectDocument.from_dict(disconnected)
+
+        wrong_plane = arc.to_dict()
+        wrong_plane["elements"][0]["geometry"]["parameters"]["normal"] = (
+            2.0**-0.5,
+            0.0,
+            2.0**-0.5,
+        )
+        with self.assertRaisesRegex(ValueError, "法向与 XY 平面不一致"):
+            ProjectDocument.from_dict(wrong_plane)
+
+        with self.assertRaisesRegex(ValueError, "内部节点重数"):
+            PathBeamEditor.create_nurbs_curve(
+                empty_beam_project(modeling_space="3d"),
+                control_points=(
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (10.0, 0.0, 0.0),
+                    (11.0, 0.0, 0.0),
+                ),
+                degree=1,
+                knots=(0.0, 0.0, 0.5, 0.5, 1.0, 1.0),
+            )
+
+        with self.assertRaisesRegex(ValueError, "零速点或尖点"):
+            PathBeamEditor.create_nurbs_curve(
+                empty_beam_project(modeling_space="3d"),
+                control_points=(
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    (0.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                ),
+                degree=3,
+            )
+
+        with self.assertRaisesRegex(ValueError, "比例不能超过 1e6"):
+            PathBeamEditor.create_nurbs_curve(
+                empty_beam_project(modeling_space="3d"),
+                control_points=(
+                    (0.0, 0.0, 0.0),
+                    (1.0, 1.0, 0.0),
+                    (2.0, 0.0, 0.0),
+                ),
+                degree=2,
+                weights=(1.0, 1.0e7, 1.0),
+            )
 
     def test_project_dictionary_and_file_round_trip_keep_ids(self):
         restored = ProjectDocument.from_dict(self.project.to_dict())
@@ -175,6 +291,9 @@ class ProjectDocumentTests(unittest.TestCase):
                 "1.2.3",
                 parameter_schema_version=" ",
             )
+
+        case = AnalysisCase("case", "示例工况", "  example.algorithm  ")
+        self.assertEqual(case.algorithm_id, "example.algorithm")
 
         error = InputValidationError("输入无效", "sensors[0].measured_value")
         self.assertEqual(str(error), "输入无效")

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from math import isfinite, sqrt
+from math import cos, isfinite, radians, sin, sqrt
 from typing import Any
 from uuid import uuid4
+
+from ifem.domain.parametric_curves import validate_nurbs_regularity
 
 
 CURRENT_PROJECT_SCHEMA_VERSION = 6
@@ -77,6 +79,26 @@ def _finite_tuple(values, *, size: int, field_name: str) -> tuple[float, ...]:
     return result
 
 
+def _rotate_about_axis(vector, axis, angle_degrees):
+    angle = radians(float(angle_degrees))
+    cosine = cos(angle)
+    sine = sin(angle)
+    dot = sum(left * right for left, right in zip(axis, vector))
+    cross = (
+        axis[1] * vector[2] - axis[2] * vector[1],
+        axis[2] * vector[0] - axis[0] * vector[2],
+        axis[0] * vector[1] - axis[1] * vector[0],
+    )
+    return tuple(
+        cosine * value + sine * cross_value + (1.0 - cosine) * dot * axis_value
+        for value, cross_value, axis_value in zip(vector, cross, axis)
+    )
+
+
+def _point_distance(left, right) -> float:
+    return sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
+
+
 @dataclass(frozen=True)
 class StructuralNode:
     identifier: str
@@ -142,6 +164,18 @@ class BeamGeometryDefinition:
                 raise ValueError("圆弧起始半径向量长度必须等于半径。")
             if abs(sum(a * b for a, b in zip(normal, start_vector))) > radius * 1.0e-8:
                 raise ValueError("圆弧起始半径向量必须位于圆弧平面内。")
+            plane_normal = {
+                "xy": (0.0, 0.0, 1.0),
+                "xz": (0.0, 1.0, 0.0),
+                "yz": (1.0, 0.0, 0.0),
+            }.get(plane)
+            if plane_normal is not None and (
+                abs(abs(sum(a * b for a, b in zip(normal, plane_normal))) - 1.0)
+                > 1.0e-8
+            ):
+                raise ValueError(
+                    f"圆弧法向与 {plane.upper()} 平面不一致；任意平面圆弧必须标记为 custom。"
+                )
             parameters.update(
                 {
                     "radius": radius,
@@ -189,6 +223,10 @@ class BeamGeometryDefinition:
                 or not all(isfinite(value) and value > 0.0 for value in weights)
             ):
                 raise ValueError("NURBS 权重必须与控制点一一对应且全部大于 0。")
+            if max(weights) / min(weights) > 1.0e6:
+                raise ValueError(
+                    "NURBS 权重最大值与最小值的比例不能超过 1e6。"
+                )
 
             expected_knot_count = len(control_points) + degree + 1
             raw_knots = parameters.get("knots")
@@ -225,6 +263,24 @@ class BeamGeometryDefinition:
                 raise ValueError("NURBS 起点必须使用夹持节点向量。")
             if any(abs(value - domain_end) > 1.0e-10 for value in knots[-degree - 1 :]):
                 raise ValueError("NURBS 终点必须使用夹持节点向量。")
+            knot_tolerance = max(abs(domain_end - domain_start), 1.0) * 1.0e-12
+            group_start = 0
+            while group_start < len(knots):
+                group_end = group_start + 1
+                while (
+                    group_end < len(knots)
+                    and abs(knots[group_end] - knots[group_start]) <= knot_tolerance
+                ):
+                    group_end += 1
+                knot = knots[group_start]
+                if (
+                    domain_start + knot_tolerance < knot < domain_end - knot_tolerance
+                    and group_end - group_start >= degree
+                ):
+                    raise ValueError(
+                        "NURBS 内部节点重数必须小于次数，以保持切向连续。"
+                    )
+                group_start = group_end
             if sqrt(
                 sum(
                     (right - left) ** 2
@@ -245,6 +301,7 @@ class BeamGeometryDefinition:
                     "knots": knots,
                 }
             )
+            validate_nurbs_regularity(parameters)
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "parameters", parameters)
 
@@ -473,6 +530,7 @@ class AnalysisCase:
     def __post_init__(self):
         if not self.identifier.strip() or not self.name.strip() or not self.algorithm_id.strip():
             raise ValueError("分析工况 ID、名称和算法 ID 不能为空。")
+        object.__setattr__(self, "algorithm_id", self.algorithm_id.strip())
         if self.algorithm_version is not None:
             if not isinstance(self.algorithm_version, str) or not self.algorithm_version.strip():
                 raise ValueError("分析工况算法版本不能为空字符串。")
@@ -589,6 +647,36 @@ class ProjectDocument:
         for element in elements:
             if any(node_id not in node_ids for node_id in element.node_ids):
                 raise ValueError(f"梁单元 {element.identifier} 引用了不存在的节点。")
+            if element.geometry.kind == "circular_arc":
+                parameters = element.geometry.parameters
+                start_point = tuple(
+                    center + offset
+                    for center, offset in zip(
+                        parameters["center"],
+                        parameters["start_vector"],
+                    )
+                )
+                end_vector = _rotate_about_axis(
+                    parameters["start_vector"],
+                    parameters["normal"],
+                    parameters["sweep_degrees"],
+                )
+                end_point = tuple(
+                    center + offset
+                    for center, offset in zip(parameters["center"], end_vector)
+                )
+                tolerance = max(float(parameters["radius"]), 1.0) * 1.0e-8
+                if any(
+                    _point_distance(nodes_by_id[node_id].coordinates, expected)
+                    > tolerance
+                    for node_id, expected in zip(
+                        element.node_ids,
+                        (start_point, end_point),
+                    )
+                ):
+                    raise ValueError(
+                        f"圆弧梁单元 {element.identifier} 的几何端点必须与结构节点一致。"
+                    )
             if element.geometry.kind == "nurbs_curve":
                 control_points = element.geometry.parameters["control_points"]
                 endpoint_pairs = zip(

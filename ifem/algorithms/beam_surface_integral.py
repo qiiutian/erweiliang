@@ -48,12 +48,22 @@ class BeamSurfaceIntegralAlgorithm:
     )
 
     def assess_project(self, project) -> ValidationReport:
+        from ifem.infrastructure.legacy_project import legacy_config_from_project
         from ifem.modeling.path_editor import PathBeamEditor
 
         capability = PathBeamEditor.capability(project)
-        if capability.legacy_solver_compatible:
-            return ValidationReport.valid()
-        return ValidationReport.invalid(capability.reason)
+        if not capability.legacy_solver_compatible:
+            return ValidationReport.invalid(capability.reason)
+        try:
+            legacy_config_from_project(
+                project,
+                include_analysis_parameters=False,
+            )
+        except InputValidationError as exc:
+            return ValidationReport.invalid(str(exc), field=exc.field)
+        except (KeyError, TypeError, ValueError) as exc:
+            return ValidationReport.invalid(str(exc), field="/model")
+        return ValidationReport.valid()
 
     def parameter_schema(self) -> Mapping[str, Any]:
         return {

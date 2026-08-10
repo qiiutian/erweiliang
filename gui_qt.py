@@ -2253,6 +2253,10 @@ class AnalysisSetupWidget(QWidget):
     def parameter_issues(self):
         return tuple(self._parameter_issues)
 
+    @property
+    def declared_parameter_names(self):
+        return frozenset(self._parameter_schemas)
+
     @staticmethod
     def parameter_field_path(name):
         return parameter_field(name)
@@ -2598,27 +2602,12 @@ class AnalysisSetupWidget(QWidget):
             str(tooltip or ""),
         )
 
-    def _set_active_option_solvability(self, status, detail):
-        index = self.algorithm_selector.findData(self._active_algorithm_id)
-        algorithm = self.active_algorithm
-        if index < 0 or algorithm is None:
-            return
-        self.algorithm_selector.setItemText(
-            index,
-            f"{algorithm.metadata.display_name} · {status}",
-        )
-        self.algorithm_selector.setItemData(
-            index,
-            f"{algorithm.metadata.display_name}\n{status}：{detail}",
-            Qt.ItemDataRole.ToolTipRole,
-        )
-        if index == self.algorithm_selector.currentIndex():
-            self._sync_algorithm_selector_tooltip()
-
     def _configure_selector(self, algorithms, *, blocked):
         algorithms = tuple(algorithms)
         self.algorithm_selector.blockSignals(True)
         self.algorithm_selector.clear()
+        # The method card is the source of truth for the active selection.
+        # This action-only selector deliberately contains alternatives only.
         if blocked:
             candidates = [
                 algorithm
@@ -3146,18 +3135,10 @@ class AnalysisSetupWidget(QWidget):
             self.algorithm_feedback_label.setText(
                 message if "不可求解" in message else f"不可求解：{message}"
             )
-            self._set_active_option_solvability(
-                "不可求解",
-                solvability_issue["message"],
-            )
         elif error_issues:
             self._set_state("适用", "pending")
             self.algorithm_feedback_label.setText(
                 "重构方法能力范围适用；修正当前输入后继续检查可解性。"
-            )
-            self._set_active_option_solvability(
-                "适用 · 待校验",
-                "修正当前输入后继续检查可解性。",
             )
         else:
             self._set_state("可求解", "ready")
@@ -3166,10 +3147,6 @@ class AnalysisSetupWidget(QWidget):
             else:
                 message = "当前方法的能力与可解性检查均已通过。"
             self.algorithm_feedback_label.setText(message)
-            self._set_active_option_solvability(
-                "可求解",
-                "能力、输入、观测与约束检查均已通过。",
-            )
 
     def sync_accessibility(self):
         details = [
@@ -5507,6 +5484,8 @@ class ReconstructionMainWindow(QMainWindow):
         def merged_parameters(original=None, *, include_setup=True):
             parameters = dict(original or {})
             if include_setup:
+                for name in self.analysis_setup.declared_parameter_names:
+                    parameters.pop(name, None)
                 parameters.update(self.analysis_setup.parameter_values())
             if config is not None:
                 parameters["query_xs"] = list(config.get("query_xs", []))

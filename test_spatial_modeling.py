@@ -110,6 +110,14 @@ class PathBeamEditorTests(unittest.TestCase):
         restored = ProjectDocument.from_dict(project.to_dict())
         self.assertEqual(restored.elements[0].geometry, element.geometry)
 
+        planar_in_3d = PathBeamEditor.create_circular_arc_through_points(
+            empty_beam_project(modeling_space="3d"),
+            start=(1.0, 0.0, 0.0),
+            through=(2.0**-0.5, 2.0**-0.5, 0.0),
+            end=(0.0, 1.0, 0.0),
+        )
+        self.assertEqual(planar_in_3d.modeling_space, "3d")
+
         updated = PathBeamEditor.update_circular_arc(
             project,
             element.identifier,
@@ -210,6 +218,80 @@ class PathBeamEditorTests(unittest.TestCase):
         restored = ProjectDocument.from_dict(project.to_dict())
         self.assertEqual(restored.elements[0].geometry, project.elements[0].geometry)
         self.assertEqual(restored.sensors[0].attachment, project.sensors[0].attachment)
+
+        uniformly_scaled = PathBeamEditor.create_nurbs_curve(
+            empty_beam_project(modeling_space="3d"),
+            control_points=control_points,
+            degree=3,
+            weights=(1.0e-250,) * len(control_points),
+        )
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(
+                uniformly_scaled,
+                uniformly_scaled.elements[0],
+                expected_xi,
+            ),
+            PathBeamEditor.point_on_element(project, element, expected_xi),
+            atol=1.0e-12,
+        )
+        self.assertAlmostEqual(
+            PathBeamEditor.element_length(
+                uniformly_scaled,
+                uniformly_scaled.elements[0],
+            ),
+            PathBeamEditor.element_length(project, element),
+            places=10,
+        )
+
+        knot_origin = 1.0e12
+        shifted_knots = PathBeamEditor.create_nurbs_curve(
+            empty_beam_project(modeling_space="3d"),
+            control_points=control_points,
+            degree=2,
+            knots=(
+                knot_origin,
+                knot_origin,
+                knot_origin,
+                knot_origin + 0.5,
+                knot_origin + 1.0,
+                knot_origin + 1.0,
+                knot_origin + 1.0,
+            ),
+        )
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(
+                shifted_knots,
+                shifted_knots.elements[0],
+                1.0,
+            ),
+            control_points[-1],
+            atol=1.0e-12,
+        )
+
+        sharply_weighted = PathBeamEditor.create_nurbs_curve(
+            empty_beam_project(modeling_space="3d"),
+            control_points=((0.0, 0.0, 0.0), (1.0, 10.0, 0.0), (2.0, 0.0, 0.0)),
+            degree=2,
+            weights=(1.0, 1.0e6, 1.0),
+        )
+        sharply_weighted_element = sharply_weighted.elements[0]
+        weighted_length = PathBeamEditor.element_length(
+            sharply_weighted,
+            sharply_weighted_element,
+        )
+        split_length = PathBeamEditor.element_arc_length(
+            sharply_weighted,
+            sharply_weighted_element,
+            0.0,
+            0.5,
+        ) + PathBeamEditor.element_arc_length(
+            sharply_weighted,
+            sharply_weighted_element,
+            0.5,
+            1.0,
+        )
+        self.assertAlmostEqual(weighted_length, 20.09973156, places=7)
+        self.assertAlmostEqual(weighted_length, split_length, places=8)
 
     def test_nurbs_surface_pick_recovers_curve_and_section_coordinates(self):
         project = PathBeamEditor.create_nurbs_curve(
