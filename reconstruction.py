@@ -3,7 +3,7 @@ import numpy as np
 
 class IBeam3SurfaceIntegralReconstruction2D:
     """
-    二维梁直接表面应变矩阵法形状重构（积分型，方案 B，手动积分分区版）
+    二维梁局部积分 ASP-iFEM 形状重构（原积分型方案 B，手动积分分区版）
 
     采用：
         ε(x, y) = ε0(x) - y κ(x)

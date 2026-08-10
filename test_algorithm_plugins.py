@@ -55,6 +55,7 @@ class AlgorithmPluginTests(unittest.TestCase):
         self.assertEqual(len(algorithms), 1)
         algorithm = algorithms[0]
         self.assertEqual(algorithm.metadata.identifier, DEFAULT_ALGORITHM_ID)
+        self.assertEqual(algorithm.metadata.display_name, "局部积分 ASP-iFEM")
         self.assertEqual(algorithm.metadata.contract_version, "1")
         self.assertEqual(algorithm.capabilities.model_dimensions, (1,))
         self.assertIn("surface_axial_strain", algorithm.capabilities.measurement_types)
@@ -66,6 +67,101 @@ class AlgorithmPluginTests(unittest.TestCase):
         self.assertEqual(
             algorithm.capabilities.deformation_regimes,
             ("small_deformation",),
+        )
+
+    def test_local_integral_method_reports_rank_deficiency_before_solve(self):
+        config = copy.deepcopy(get_sample_config())
+        for element in config["elements_sensor_data"]:
+            for measurement in element["measurements"]:
+                measurement["surface"] = "top"
+
+        report = self.service.validate(config)
+
+        self.assertFalse(report.is_valid)
+        issue = next(
+            issue
+            for issue in report.issues
+            if issue.field == "/analysis/solvability"
+        )
+        self.assertIn("不可求解", issue.message)
+        self.assertIn("秩", issue.message)
+        with self.assertRaises(AlgorithmValidationError) as raised:
+            self.service.run(config)
+        self.assertIn(
+            "/analysis/solvability",
+            {item.field for item in raised.exception.issues},
+        )
+
+    def test_local_integral_method_checks_boundary_observability(self):
+        unconstrained = copy.deepcopy(get_sample_config())
+        unconstrained["prescribed_dofs"] = {}
+        report = self.service.validate(unconstrained)
+        self.assertFalse(report.is_valid)
+        self.assertIn(
+            "/analysis/solvability",
+            {issue.field for issue in report.issues},
+        )
+
+        fully_prescribed = copy.deepcopy(get_sample_config())
+        fully_prescribed["prescribed_dofs"] = {
+            index: 0.0 for index in range(len(fully_prescribed["node_x"]) * 3)
+        }
+        self.assertTrue(self.service.validate(fully_prescribed).is_valid)
+
+    def test_local_integral_method_rejects_nonfinite_trial_solution(self):
+        config = copy.deepcopy(get_sample_config())
+        config["thickness"] = 1.0e-150
+        for element in config["elements_sensor_data"]:
+            for measurement in element["measurements"]:
+                measurement["strain"] = 1.0e308
+        config["prescribed_dofs"] = {
+            index: 0.0 for index in (0, 1, 3, 6, 9, 10)
+        }
+
+        report = self.service.validate(config)
+
+        self.assertFalse(report.is_valid)
+        issue = next(
+            issue
+            for issue in report.issues
+            if issue.field == "/analysis/solvability"
+        )
+        self.assertIn("非有限位移", issue.message)
+        with self.assertRaises(AlgorithmValidationError):
+            self.service.run(config)
+
+    def test_local_integral_numerical_choices_remain_user_controlled(self):
+        displacements = []
+        for gauss_n, points_per_element in ((2, 11), (3, 37), (4, 83)):
+            config = copy.deepcopy(get_sample_config())
+            config["gauss_n"] = gauss_n
+            config["points_per_element"] = points_per_element
+            config["elements_sensor_data"][0]["measurements"][0]["zone"] = [
+                0.05,
+                0.45,
+            ]
+
+            result = self.service.run(config)
+
+            self.assertEqual(result.inputs["gauss_n"], gauss_n)
+            self.assertEqual(result.inputs["points_per_element"], points_per_element)
+            self.assertEqual(
+                result.inputs["elements_sensor_data"][0]["measurements"][0]["zone"],
+                [0.05, 0.45],
+            )
+            displacements.append(result.native_model.U)
+
+        np.testing.assert_allclose(
+            displacements[0],
+            displacements[1],
+            rtol=1.0e-11,
+            atol=1.0e-13,
+        )
+        np.testing.assert_allclose(
+            displacements[1],
+            displacements[2],
+            rtol=1.0e-11,
+            atol=1.0e-13,
         )
 
     def test_algorithm_matching_uses_space_geometry_and_project_constraints(self):

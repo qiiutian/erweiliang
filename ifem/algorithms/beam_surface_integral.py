@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
+
 from ifem.application.analysis_service import DEFAULT_ALGORITHM_ID
 from ifem.domain.analysis import (
     AlgorithmCapabilities,
@@ -23,9 +25,12 @@ from reconstruction import IBeam3SurfaceIntegralReconstruction2D
 class BeamSurfaceIntegralAlgorithm:
     metadata = AlgorithmMetadata(
         identifier=DEFAULT_ALGORITHM_ID,
-        display_name="积分型表面应变矩阵",
+        display_name="局部积分 ASP-iFEM",
         version="1.0.0",
-        description="二维 Euler-Bernoulli 梁直接表面应变积分重构。",
+        description=(
+            "基于测点局部积分区间的二维 Euler-Bernoulli 梁小变形 "
+            "ASP-iFEM 重构。"
+        ),
         parameter_schema_version="1",
         contract_version="1",
     )
@@ -56,29 +61,112 @@ class BeamSurfaceIntegralAlgorithm:
             "properties": {
                 "gauss_n": {
                     "type": "integer",
-                    "title": "高斯点数",
+                    "title": "局部积分高斯点数",
                     "enum": [2, 3, 4],
                     "default": 3,
+                    "description": (
+                        "每个测点局部积分区间内的数值积分点数；"
+                        "不会改变用户设置的积分区间。"
+                    ),
                 },
                 "points_per_element": {
                     "type": "integer",
-                    "title": "每单元采样点数",
+                    "title": "后处理采样点数",
                     "minimum": 2,
                     "default": 120,
+                    "description": "仅控制结果曲线采样密度，不参与方程组装或可解性判断。",
                 },
             },
         }
 
     def validate(self, context: AnalysisContext) -> ValidationReport:
         # Kept as a local import while the legacy configuration module is migrated.
-        from config_adapter import validate_config
+        from config_adapter import build_model_inputs, validate_config
 
         try:
-            validate_config(self._legacy_config(context))
+            config = self._legacy_config(context)
+            validate_config(config)
+            inputs = build_model_inputs(config)
         except InputValidationError as exc:
             return ValidationReport.invalid(str(exc), field=exc.field)
         except (KeyError, TypeError, ValueError) as exc:
             return ValidationReport.invalid(str(exc))
+        return self._assess_solvability(inputs)
+
+    @staticmethod
+    def _assess_solvability(inputs: Mapping[str, Any]) -> ValidationReport:
+        """Check the selected method's observability before running its solve."""
+
+        try:
+            model = IBeam3SurfaceIntegralReconstruction2D(
+                node_x=inputs["node_x"],
+                thickness=inputs["thickness"],
+                elements_sensor_data=inputs["elements_sensor_data"],
+            )
+            model.assemble(gauss_n=inputs["gauss_n"])
+            fixed = {int(index) for index in inputs["prescribed_dofs"]}
+            fixed_indices = np.asarray(sorted(fixed), dtype=int)
+            free = np.asarray(
+                [index for index in range(model.ndof) if index not in fixed],
+                dtype=int,
+            )
+            if free.size == 0:
+                return ValidationReport.valid()
+            free_matrix = model.K[np.ix_(free, free)]
+            if not np.all(np.isfinite(free_matrix)):
+                return ValidationReport.invalid(
+                    "所选方法形成的自由方程包含非有限数值，当前不可求解。",
+                    field="/analysis/solvability",
+                )
+            constrained_values = np.asarray(
+                [inputs["prescribed_dofs"][int(index)] for index in fixed_indices],
+                dtype=float,
+            )
+            coupling_matrix = model.K[np.ix_(free, fixed_indices)]
+            with np.errstate(over="ignore", invalid="ignore"):
+                free_rhs = model.F[free] - coupling_matrix @ constrained_values
+            if not np.all(np.isfinite(free_rhs)):
+                return ValidationReport.invalid(
+                    "所选方法形成的自由方程右端项包含非有限数值，当前不可求解。",
+                    field="/analysis/solvability",
+                )
+            singular_values = np.linalg.svd(free_matrix, compute_uv=False)
+        except (KeyError, TypeError, ValueError, np.linalg.LinAlgError) as exc:
+            return ValidationReport.invalid(
+                f"无法完成所选方法的可解性分析：{exc}",
+                field="/analysis/solvability",
+            )
+
+        largest = float(singular_values[0]) if singular_values.size else 0.0
+        tolerance = (
+            max(free_matrix.shape) * np.finfo(float).eps * largest
+            if largest > 0.0
+            else 0.0
+        )
+        rank = int(np.count_nonzero(singular_values > tolerance))
+        equation_count = int(free_matrix.shape[0])
+        if rank < equation_count:
+            missing = equation_count - rank
+            return ValidationReport.invalid(
+                "所选方法当前不可求解："
+                f"自由方程秩为 {rank}/{equation_count}，缺少 {missing} 个独立观测或约束。"
+                "请调整测点表面/局部积分区间，或补充边界约束。",
+                field="/analysis/solvability",
+            )
+        try:
+            with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+                trial_solution = np.linalg.solve(free_matrix, free_rhs)
+        except np.linalg.LinAlgError as exc:
+            return ValidationReport.invalid(
+                f"所选方法当前不可求解：自由方程试解失败（{exc}）。",
+                field="/analysis/solvability",
+            )
+        if not np.all(np.isfinite(trial_solution)):
+            return ValidationReport.invalid(
+                "所选方法当前不可求解：自由方程试解产生非有限位移。"
+                "请检查测量量级、梁厚度、局部积分区间和边界约束。",
+                field="/analysis/solvability",
+            )
         return ValidationReport.valid()
 
     @staticmethod

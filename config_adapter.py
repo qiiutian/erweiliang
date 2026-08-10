@@ -635,22 +635,22 @@ def validate_config(config, *, require_measurements=True):
             a = _finite_float(
                 zone[0],
                 field=f"{field_root}/zone_a",
-                message=f"第 {e} 个单元第 {idx} 条 measurement 的量长起点必须是有效有限数值。",
+                message=f"第 {e} 个单元第 {idx} 条 measurement 的局部积分起点必须是有效有限数值。",
             )
             b = _finite_float(
                 zone[1],
                 field=f"{field_root}/zone_b",
-                message=f"第 {e} 个单元第 {idx} 条 measurement 的量长终点必须是有效有限数值。",
+                message=f"第 {e} 个单元第 {idx} 条 measurement 的局部积分终点必须是有效有限数值。",
             )
             if a < 0.0:
                 _validation_error(
                     f"{field_root}/zone_a",
-                    f"第 {e} 个单元第 {idx} 条 measurement 的量长起点不能小于 0。",
+                    f"第 {e} 个单元第 {idx} 条 measurement 的局部积分起点不能小于 0。",
                 )
             if b > Le or b <= a:
                 _validation_error(
                     f"{field_root}/zone_b",
-                    f"第 {e} 个单元第 {idx} 条 measurement 的量长终点不合法。",
+                    f"第 {e} 个单元第 {idx} 条 measurement 的局部积分终点不合法。",
                 )
             has_surface = measurement.get("surface") not in (None, "")
             has_y = measurement.get("y") not in (None, "")
@@ -838,12 +838,12 @@ def build_config_from_form_data(
         )
         zone_a = _parse_form_float(
             row.get("zone_a", ""),
-            f"第 {idx} 条测量数据的量长起点",
+            f"第 {idx} 条测量数据的局部积分起点",
             field=f"{field_root}/zone_a",
         )
         zone_b = _parse_form_float(
             row.get("zone_b", ""),
-            f"第 {idx} 条测量数据的量长终点",
+            f"第 {idx} 条测量数据的局部积分终点",
             field=f"{field_root}/zone_b",
         )
 
@@ -861,12 +861,12 @@ def build_config_from_form_data(
         if zone_a < 0.0:
             _validation_error(
                 f"{field_root}/zone_a",
-                f"第 {idx} 条测量数据的量长起点不能小于 0。",
+                f"第 {idx} 条测量数据的局部积分起点不能小于 0。",
             )
         if zone_b > element_length or zone_b <= zone_a:
             _validation_error(
                 f"{field_root}/zone_b",
-                f"第 {idx} 条测量数据的量长终点不合法。",
+                f"第 {idx} 条测量数据的局部积分终点不合法。",
             )
 
         measurement = {

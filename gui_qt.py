@@ -1543,6 +1543,8 @@ class EditableTable(QWidget):
 
         if field_key not in self.inputs:
             field_terms = (
+                ("局部积分起点", "zone_a"),
+                ("局部积分终点", "zone_b"),
                 ("量长起点", "zone_a"),
                 ("量长终点", "zone_b"),
                 ("单元号", "element"),
@@ -2070,7 +2072,7 @@ class MeasurementPreviewWidget(QWidget):
 
 
 class AnalysisSetupWidget(QWidget):
-    """Adaptive analysis controls that stay compact while only one method exists."""
+    """User-selected reconstruction method with project solvability feedback."""
 
     RECOVERY_UNBOUND = "unbound"
     RECOVERY_READY = "ready"
@@ -2083,7 +2085,7 @@ class AnalysisSetupWidget(QWidget):
     def __init__(self, analysis_service, on_change=None, parent=None):
         super().__init__(parent)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName("分析方案")
+        self.setAccessibleName("重构方法")
         self.analysis_service = analysis_service
         self.on_change = on_change
         self._active_algorithm_id = analysis_service.default_algorithm_id
@@ -2099,6 +2101,7 @@ class AnalysisSetupWidget(QWidget):
         self._parameter_schemas = {}
         self._parameter_cache = {}
         self._compatible_algorithm_ids = ()
+        self._algorithm_matches = {}
         self.is_compatible = False
 
         root = QVBoxLayout(self)
@@ -2107,6 +2110,7 @@ class AnalysisSetupWidget(QWidget):
 
         self.method_card = QFrame()
         self.method_card.setObjectName("analysisMethodCard")
+        self.method_card.setAccessibleName("重构方法")
         method_layout = QHBoxLayout(self.method_card)
         method_layout.setContentsMargins(11, 8, 9, 8)
         method_layout.setSpacing(9)
@@ -2133,14 +2137,15 @@ class AnalysisSetupWidget(QWidget):
         selector_layout = QHBoxLayout(self.algorithm_selector_row)
         selector_layout.setContentsMargins(0, 0, 0, 0)
         selector_layout.setSpacing(8)
-        selector_label = QLabel("分析方法")
-        selector_label.setObjectName("fieldLabel")
+        self.algorithm_selector_label = QLabel("重构方法")
+        self.algorithm_selector_label.setObjectName("fieldLabel")
         self.algorithm_selector = QComboBox()
-        selector_label.setBuddy(self.algorithm_selector)
+        self.algorithm_selector.setAccessibleName("重构方法")
+        self.algorithm_selector_label.setBuddy(self.algorithm_selector)
         self.algorithm_selector.currentIndexChanged.connect(
             self._on_algorithm_selected
         )
-        selector_layout.addWidget(selector_label)
+        selector_layout.addWidget(self.algorithm_selector_label)
         selector_layout.addWidget(self.algorithm_selector, 1)
         root.addWidget(self.algorithm_selector_row)
 
@@ -2162,7 +2167,7 @@ class AnalysisSetupWidget(QWidget):
         recovery_actions.addWidget(self.accept_current_button)
         root.addLayout(recovery_actions)
 
-        parameter_header = QLabel("求解参数")
+        parameter_header = QLabel("方法参数")
         parameter_header.setObjectName("fieldLabel")
         root.addWidget(parameter_header)
 
@@ -2218,7 +2223,7 @@ class AnalysisSetupWidget(QWidget):
         algorithm = self.active_algorithm
         if algorithm is not None:
             return algorithm.metadata.display_name
-        return self._requested_algorithm_id or "未指定算法"
+        return self._requested_algorithm_id or "未指定方法"
 
     @property
     def active_algorithm_version(self):
@@ -2247,6 +2252,7 @@ class AnalysisSetupWidget(QWidget):
             "/analysis/algorithm/id",
             "/analysis/algorithm/version",
             "/analysis/algorithm/parameter-schema-version",
+            "/analysis/solvability",
         }:
             if not self.accept_current_button.isHidden():
                 return self.accept_current_button
@@ -2355,6 +2361,7 @@ class AnalysisSetupWidget(QWidget):
             {} if active_case is None else dict(active_case.parameters)
         )
         self._compatible_algorithm_ids = compatible_ids
+        self._algorithm_matches = match_by_id
 
         if project is None:
             self._requested_algorithm_id = self.analysis_service.default_algorithm_id
@@ -2375,11 +2382,10 @@ class AnalysisSetupWidget(QWidget):
             return
 
         if active_case is None:
-            selected_id = (
-                self.analysis_service.default_algorithm_id
-                if self.analysis_service.default_algorithm_id in compatible_ids
-                else (compatible_ids[0] if compatible_ids else self.analysis_service.default_algorithm_id)
-            )
+            # A project without a bound case keeps the configured default as a
+            # user-visible preselection. Compatibility is advisory and must not
+            # silently replace the user's method choice.
+            selected_id = self.analysis_service.default_algorithm_id
             self._requested_algorithm_id = selected_id
             self._active_algorithm_id = selected_id
             self._binding_accepted = True
@@ -2396,17 +2402,18 @@ class AnalysisSetupWidget(QWidget):
             self._configure_selector(algorithms, blocked=False)
             self.is_compatible = selected_id in compatible_ids
             if self.is_compatible:
-                self._set_state("可运行", "ready")
+                self._set_state("适用", "pending")
                 self.algorithm_feedback_label.setText(
-                    "当前项目尚无分析工况；保存时将创建活动工况。"
+                    "当前重构方法能力范围适用；完成输入校验后确定可解性。"
+                    "项目保存时将创建活动工况。"
                 )
                 self.parameter_panel.setEnabled(True)
             else:
-                self._set_state("不适用", "blocked")
+                self._set_state("不可求解", "blocked")
                 self.algorithm_feedback_label.setText(
-                    "当前模型没有已注册的适用算法。"
+                    self._solvability_feedback(selected_id)
                 )
-                self.parameter_panel.setEnabled(False)
+                self.parameter_panel.setEnabled(True)
             self.accept_current_button.hide()
             return
 
@@ -2437,12 +2444,12 @@ class AnalysisSetupWidget(QWidget):
             self.is_compatible = False
             self._set_installed_identity(algorithm)
             self._show_preserved_parameters()
-            self._set_state("不适用", "blocked")
-            reason = "当前模型不适用于项目保存的算法。"
+            self._set_state("不可求解", "blocked")
+            reason = "当前模型不适用于项目保存的重构方法。"
             if match is not None and match.reasons:
                 reason = "；".join(match.reasons)
             self.algorithm_feedback_label.setText(
-                f"{reason} 原工况保持不变；请选择兼容方法后才会改绑。"
+                f"不可求解：{reason} 原工况保持不变；选择其他重构方法后才会改绑。"
             )
             self.accept_current_button.hide()
             self._configure_selector(algorithms, blocked=True)
@@ -2516,49 +2523,114 @@ class AnalysisSetupWidget(QWidget):
         )
         self._configure_selector(algorithms, blocked=False)
         self.is_compatible = True
-        self._set_state("可运行", "ready")
+        self._set_state("适用", "pending")
         if len(compatible_ids) == 1:
-            feedback = "已恢复项目保存的分析方法和参数。"
+            feedback = "已恢复项目保存的重构方法和参数。"
         else:
             feedback = f"已恢复项目方法；当前模型另有 {len(compatible_ids) - 1} 个适用方法。"
         self.algorithm_feedback_label.setText(feedback)
         self.parameter_panel.setEnabled(True)
         self.accept_current_button.hide()
 
+    def _algorithm_option_details(self, algorithm):
+        identifier = algorithm.metadata.identifier
+        match = self._algorithm_matches.get(identifier)
+        if match is None:
+            status = "待分析"
+            detail = "载入模型后检查是否可求解。"
+        elif match.compatible:
+            status = "适用 · 待校验"
+            detail = "能力范围适用；选中后结合输入、观测和约束检查可解性。"
+        else:
+            status = "不可求解"
+            detail = match.reason_text or "当前模型不满足该重构方法的能力要求。"
+        text = f"{algorithm.metadata.display_name} · {status}"
+        tooltip = f"{algorithm.metadata.display_name}\n{status}：{detail}"
+        return text, tooltip
+
+    def _solvability_feedback(self, identifier):
+        match = self._algorithm_matches.get(identifier)
+        if match is None:
+            return "尚未取得当前重构方法的可求解性分析结果。"
+        if match.compatible:
+            return (
+                "当前重构方法能力范围适用；"
+                "还需结合输入、观测与约束完成可解性检查。"
+            )
+        reason = match.reason_text or "当前模型不满足该重构方法的能力要求"
+        return (
+            f"不可求解：{reason}。所选重构方法仍会保留；"
+            "修正模型或改选其他方法后再运行。"
+        )
+
+    def _add_algorithm_option(self, algorithm):
+        text, tooltip = self._algorithm_option_details(algorithm)
+        self.algorithm_selector.addItem(text, algorithm.metadata.identifier)
+        index = self.algorithm_selector.count() - 1
+        self.algorithm_selector.setItemData(
+            index,
+            tooltip,
+            Qt.ItemDataRole.ToolTipRole,
+        )
+
+    def _sync_algorithm_selector_tooltip(self):
+        index = self.algorithm_selector.currentIndex()
+        tooltip = (
+            ""
+            if index < 0
+            else self.algorithm_selector.itemData(index, Qt.ItemDataRole.ToolTipRole)
+        )
+        self.algorithm_selector.setToolTip(str(tooltip or ""))
+        self.algorithm_selector.setProperty(
+            "validationBaseToolTip",
+            str(tooltip or ""),
+        )
+
+    def _set_active_option_solvability(self, status, detail):
+        index = self.algorithm_selector.findData(self._active_algorithm_id)
+        algorithm = self.active_algorithm
+        if index < 0 or algorithm is None:
+            return
+        self.algorithm_selector.setItemText(
+            index,
+            f"{algorithm.metadata.display_name} · {status}",
+        )
+        self.algorithm_selector.setItemData(
+            index,
+            f"{algorithm.metadata.display_name}\n{status}：{detail}",
+            Qt.ItemDataRole.ToolTipRole,
+        )
+        if index == self.algorithm_selector.currentIndex():
+            self._sync_algorithm_selector_tooltip()
+
     def _configure_selector(self, algorithms, *, blocked):
-        compatible = [
-            algorithm
-            for algorithm in algorithms
-            if algorithm.metadata.identifier in self._compatible_algorithm_ids
-        ]
         self.algorithm_selector.blockSignals(True)
         self.algorithm_selector.clear()
         if blocked:
             candidates = [
                 algorithm
-                for algorithm in compatible
+                for algorithm in algorithms
                 if algorithm.metadata.identifier != self._requested_algorithm_id
             ]
-            if candidates:
-                self.algorithm_selector.addItem("选择替代算法…", None)
-                for algorithm in candidates:
-                    self.algorithm_selector.addItem(
-                        algorithm.metadata.display_name,
-                        algorithm.metadata.identifier,
-                    )
-            self.algorithm_selector_row.setVisible(bool(candidates))
+            self.algorithm_selector.addItem("选择替代重构方法…", None)
+            self.algorithm_selector.setItemData(
+                0,
+                "当前项目绑定保持不变；选择后才会改绑到另一重构方法。",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+            for algorithm in candidates:
+                self._add_algorithm_option(algorithm)
+            self.algorithm_selector_row.setVisible(bool(algorithms))
         else:
-            for algorithm in compatible:
-                self.algorithm_selector.addItem(
-                    algorithm.metadata.display_name,
-                    algorithm.metadata.identifier,
-                )
+            for algorithm in algorithms:
+                self._add_algorithm_option(algorithm)
             selected_index = self.algorithm_selector.findData(
                 self._active_algorithm_id
             )
             if selected_index >= 0:
                 self.algorithm_selector.setCurrentIndex(selected_index)
-            self.algorithm_selector_row.setVisible(len(compatible) > 1)
+            self.algorithm_selector_row.setVisible(bool(algorithms))
+        self._sync_algorithm_selector_tooltip()
         self.algorithm_selector.blockSignals(False)
 
     def _set_missing_identity(self, active_case):
@@ -2568,7 +2640,7 @@ class AnalysisSetupWidget(QWidget):
             getattr(active_case, "parameter_schema_version", None) or "未知模式"
         )
         self.algorithm_meta_label.setText(
-            f"{active_case.algorithm_id} · v{version} · 参数模式 {schema_version}"
+            f"重构方法 · {active_case.algorithm_id} · v{version} · 参数模式 {schema_version}"
         )
         self.algorithm_name_label.setToolTip(active_case.algorithm_id)
 
@@ -2576,7 +2648,7 @@ class AnalysisSetupWidget(QWidget):
         self.algorithm_name_label.setText(algorithm.metadata.display_name)
         if active_case is None:
             meta = (
-                f"已安装方法 · v{algorithm.metadata.version} · "
+                f"重构方法 · 已安装 · v{algorithm.metadata.version} · "
                 f"参数模式 {algorithm.metadata.parameter_schema_version}"
             )
         else:
@@ -2585,7 +2657,7 @@ class AnalysisSetupWidget(QWidget):
                 getattr(active_case, "parameter_schema_version", None) or "未知"
             )
             meta = (
-                f"项目 v{saved_version} / 当前 v{algorithm.metadata.version} · "
+                f"重构方法 · 项目 v{saved_version} / 当前 v{algorithm.metadata.version} · "
                 f"参数模式 {saved_schema} / {algorithm.metadata.parameter_schema_version}"
             )
         self.algorithm_meta_label.setText(meta)
@@ -2660,7 +2732,7 @@ class AnalysisSetupWidget(QWidget):
         self._configuration_modified = True
         self._recovery_status = self.RECOVERY_READY
         self.is_compatible = True
-        self._set_state("可运行", "ready")
+        self._set_state("适用", "pending")
         self.algorithm_feedback_label.setText(
             "已明确采用当前插件版本和参数模式；未知旧参数仍会原样保留。"
         )
@@ -2713,6 +2785,11 @@ class AnalysisSetupWidget(QWidget):
             label.setObjectName("fieldLabel")
             editor = self._create_parameter_editor(field_schema)
             editor.setAccessibleName(label.text())
+            description = str(field_schema.get("description", "")).strip()
+            if description:
+                label.setToolTip(description)
+                editor.setToolTip(description)
+                editor.setAccessibleDescription(description)
             editor.setProperty("fieldPath", parameter_field(name))
             label.setBuddy(editor)
             has_value = name in initial_values or "default" in field_schema
@@ -2944,6 +3021,7 @@ class AnalysisSetupWidget(QWidget):
             self.algorithm_selector.blockSignals(True)
             self.algorithm_selector.setCurrentIndex(previous_selector_index)
             self.algorithm_selector.blockSignals(False)
+            self._sync_algorithm_selector_tooltip()
 
             if restore_error is None and previous_binding_accepted:
                 self._binding_accepted = True
@@ -2954,7 +3032,7 @@ class AnalysisSetupWidget(QWidget):
                 self.accept_current_button.setVisible(previous_accept_visible)
                 self._set_state(previous_state_text, previous_state_style)
                 self.algorithm_feedback_label.setText(
-                    f"未能切换到所选插件：{exc} 已恢复原分析方法和参数。"
+                    f"未能切换到所选插件：{exc} 已恢复原重构方法和参数。"
                 )
                 return
 
@@ -2993,11 +3071,14 @@ class AnalysisSetupWidget(QWidget):
         self._binding_accepted = True
         self._recovery_status = self.RECOVERY_READY
         self.is_compatible = identifier in self._compatible_algorithm_ids
-        self._set_state("可运行" if self.is_compatible else "不适用", "ready" if self.is_compatible else "blocked")
-        self.algorithm_feedback_label.setText(
-            "已明确改用所选算法；原工况中的未知参数仍会保留。"
+        self._set_state(
+            "适用" if self.is_compatible else "不可求解",
+            "pending" if self.is_compatible else "blocked",
         )
-        self.parameter_panel.setEnabled(self.is_compatible)
+        self.algorithm_feedback_label.setText(
+            self._solvability_feedback(identifier)
+        )
+        self.parameter_panel.setEnabled(True)
         self.accept_current_button.hide()
         self._configure_selector(self.analysis_service.registry.list(), blocked=False)
         self._parameters_changed()
@@ -3015,6 +3096,54 @@ class AnalysisSetupWidget(QWidget):
         style.unpolish(self.algorithm_state_label)
         style.polish(self.algorithm_state_label)
         self.algorithm_state_label.update()
+
+    def set_readiness_solvability(self, issues):
+        """Refine the method card after full input and observability checks."""
+        if (
+            not self._binding_accepted
+            or self.active_algorithm is None
+            or not self.is_compatible
+        ):
+            return
+        error_issues = [
+            issue for issue in issues if issue.get("severity", "error") == "error"
+        ]
+        solvability_issue = next(
+            (
+                issue
+                for issue in error_issues
+                if issue.get("field") == "/analysis/solvability"
+            ),
+            None,
+        )
+        if solvability_issue is not None:
+            self._set_state("不可求解", "blocked")
+            message = str(solvability_issue["message"])
+            self.algorithm_feedback_label.setText(
+                message if "不可求解" in message else f"不可求解：{message}"
+            )
+            self._set_active_option_solvability(
+                "不可求解",
+                solvability_issue["message"],
+            )
+        elif error_issues:
+            self._set_state("适用", "pending")
+            self.algorithm_feedback_label.setText(
+                "重构方法能力范围适用；修正当前输入后继续检查可解性。"
+            )
+            self._set_active_option_solvability(
+                "适用 · 待校验",
+                "修正当前输入后继续检查可解性。",
+            )
+        else:
+            self._set_state("可求解", "ready")
+            self.algorithm_feedback_label.setText(
+                "当前重构方法的能力、输入、观测与约束检查均已通过。"
+            )
+            self._set_active_option_solvability(
+                "可求解",
+                "能力、输入、观测与约束检查均已通过。",
+            )
 
 
 class ReconstructionMainWindow(QMainWindow):
@@ -3288,8 +3417,13 @@ class ReconstructionMainWindow(QMainWindow):
         analysis_summary_layout.setContentsMargins(8, 6, 8, 6)
         analysis_summary_layout.setSpacing(0)
         self.analysis_metric_labels = {}
+        self.analysis_metric_title_labels = {}
         metric_specs = [
-            ("solver", "当前求解器", "积分型表面应变矩阵"),
+            (
+                "solver",
+                "重构方法",
+                self.analysis_setup.active_algorithm_display_name,
+            ),
             ("mesh", "离散模型", "--"),
             ("sensors", "传感配置", "--"),
             ("material", "材料参数", "未设置 E"),
@@ -3311,6 +3445,7 @@ class ReconstructionMainWindow(QMainWindow):
             metric_value.setObjectName("metricValue")
             metric_layout.addWidget(metric_name)
             metric_layout.addWidget(metric_value)
+            self.analysis_metric_title_labels[key] = metric_name
             self.analysis_metric_labels[key] = metric_value
             analysis_summary_layout.addWidget(metric_card, 1)
         right_layout.addWidget(analysis_summary)
@@ -3614,8 +3749,8 @@ class ReconstructionMainWindow(QMainWindow):
         self.left_tabs.addTab(optional_page, self.left_tab_names[3])
         self.left_tabs.addTab(json_tab, self.left_tab_names[4])
         self._left_tab_tooltips = (
-            "设置模型、材料和分析方案",
-            "配置应变测点的位置、数据和量长",
+            "设置模型与材料，选择重构方法并检查是否可解",
+            "配置应变测点的位置、数据和局部积分区间",
             "设置节点位移与转角约束",
             "录入实测位移，用于重构结果校核",
             "项目 JSON 数据检查与交换",
@@ -3731,7 +3866,7 @@ class ReconstructionMainWindow(QMainWindow):
         model_hint.setWordWrap(True)
         grid.addWidget(model_hint, 3, 0, 1, 4)
 
-        analysis_group = QGroupBox("分析方案")
+        analysis_group = QGroupBox("重构方法与可解性")
         analysis_group.setObjectName("formSection")
         analysis_layout = QVBoxLayout(analysis_group)
         analysis_layout.setContentsMargins(12, 16, 12, 12)
@@ -3859,8 +3994,18 @@ class ReconstructionMainWindow(QMainWindow):
                 "placeholder": "例如：1.5e-4",
             },
             {"key": "weight", "label": "权重", "placeholder": "留空默认为 1"},
-            {"key": "zone_a", "label": "量长起点 a", "placeholder": "积分起点"},
-            {"key": "zone_b", "label": "量长终点 b", "placeholder": "积分终点"},
+            {
+                "key": "zone_a",
+                "label": "局部积分起点 a",
+                "placeholder": "积分起点",
+                "tooltip": "用户自选的单元局部积分起点，必须位于当前梁段内",
+            },
+            {
+                "key": "zone_b",
+                "label": "局部积分终点 b",
+                "placeholder": "积分终点",
+                "tooltip": "用户自选的单元局部积分终点，必须大于起点且位于当前梁段内",
+            },
         ]
         self.measurement_editor = EditableTable(
             "传感器配置",
@@ -3872,7 +4017,7 @@ class ReconstructionMainWindow(QMainWindow):
             form_sections=(
                 ("位置", ("element", "x", "surface", "y")),
                 ("数据", ("strain", "weight")),
-                ("量长", ("zone_a", "zone_b")),
+                ("局部积分", ("zone_a", "zone_b")),
             ),
             table_min_height=176,
             record_noun="个测点",
@@ -4186,6 +4331,7 @@ class ReconstructionMainWindow(QMainWindow):
             self.y_max_edit,
             self.thickness_scale_combo,
             self.display_settings_button,
+            self.analysis_setup.algorithm_selector,
         ):
             self._set_validation_state(widget)
         for editor in (
@@ -4314,8 +4460,13 @@ class ReconstructionMainWindow(QMainWindow):
                 add_issue(parameter_issue)
 
         self._readiness_issues = issues
+        self.analysis_setup.set_readiness_solvability(issues)
         self._update_readiness_tabs(tab_counts, tab_messages)
         if issues:
+            has_solvability_issue = any(
+                issue.get("field") == "/analysis/solvability"
+                for issue in issues
+            )
             recovery_parameter_gate = self.analysis_setup.recovery_status in {
                 self.analysis_setup.RECOVERY_VERSION,
                 self.analysis_setup.RECOVERY_SCHEMA,
@@ -4331,14 +4482,23 @@ class ReconstructionMainWindow(QMainWindow):
                 )
                 for issue in issues
             )
-            state = "pending" if has_algorithm_only else "error"
+            state = (
+                "error"
+                if has_solvability_issue or not has_algorithm_only
+                else "pending"
+            )
             self.input_status_label.setText(
-                "等待算法  ›"
-                if has_algorithm_only
-                else f"需检查 · {len(issues)}  ›"
+                "不可求解  ›"
+                if has_solvability_issue
+                else (
+                    "等待算法  ›"
+                    if has_algorithm_only
+                    else f"需检查 · {len(issues)}  ›"
+                )
             )
         else:
             has_algorithm_only = False
+            has_solvability_issue = False
             state = "ready"
             self.input_status_label.setText("可运行  ›")
         self.input_status_label.setProperty("state", state)
@@ -4358,7 +4518,11 @@ class ReconstructionMainWindow(QMainWindow):
         style.unpolish(self.input_status_label)
         style.polish(self.input_status_label)
         self.input_status_label.update()
-        self._sync_empty_state(waiting_for_algorithm=has_algorithm_only)
+        self._sync_empty_state(
+            waiting_for_algorithm=(
+                has_algorithm_only and not has_solvability_issue
+            )
+        )
         can_run = (
             not issues
             and capability is not None
@@ -4372,6 +4536,16 @@ class ReconstructionMainWindow(QMainWindow):
             self.analysis_empty_state.action_button.setEnabled(
                 not self._analysis_busy
             )
+        if not self._analysis_busy and not self.analysis_setup.is_compatible:
+            if self.analysis_setup.recovery_status in {
+                self.analysis_setup.RECOVERY_READY,
+                self.analysis_setup.RECOVERY_INCOMPATIBLE,
+            }:
+                self._set_run_status("当前重构方法不可求解", "error")
+            else:
+                self._set_run_status("重构方法待恢复", "stale")
+        elif not self._analysis_busy and has_solvability_issue:
+            self._set_run_status("当前重构方法不可求解", "error")
         return bool(can_run)
 
     def _set_run_status(self, text, state):
@@ -4540,17 +4714,10 @@ class ReconstructionMainWindow(QMainWindow):
         if not hasattr(self, "analysis_metric_labels"):
             return
         self.analysis_setup.set_project(project)
-        matches = match_project_algorithms(
-            project,
-            self.analysis_service.registry.list(),
-        )
-        compatible_matches = [match for match in matches if match.compatible]
         material = project.materials[0] if project.materials else None
         elastic_modulus = None if material is None else material.elastic_modulus
         self.analysis_metric_labels["solver"].setText(
-            compatible_matches[0].display_name
-            if compatible_matches
-            else "等待匹配算法"
+            self.analysis_setup.active_algorithm_display_name
         )
         self.analysis_metric_labels["mesh"].setText(
             f"{project.modeling_space.upper()} · "
@@ -5629,7 +5796,7 @@ class ReconstructionMainWindow(QMainWindow):
             self._set_run_status(f"重构完成 · {model.n_nodes} 节点 / {model.n_elems} 单元", "success")
             message_lines = [
                 "重构完成。",
-                f"分析方法: {self.analysis_setup.active_algorithm_display_name} "
+                f"重构方法: {self.analysis_setup.active_algorithm_display_name} "
                 f"v{result.algorithm_version}",
                 f"节点数: {model.n_nodes}",
                 f"单元数: {model.n_elems}",

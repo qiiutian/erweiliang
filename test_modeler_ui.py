@@ -119,15 +119,36 @@ class ModelerUiTests(unittest.TestCase):
         self.assertTrue(window.measurement_editor.header_action_button.toolTip())
         window.close()
 
-    def test_single_algorithm_is_auto_selected_without_redundant_selector(self):
+    def test_single_algorithm_remains_visible_as_user_selected_method(self):
         window = gui_qt.ReconstructionMainWindow()
         setup = window.analysis_setup
 
-        self.assertTrue(setup.algorithm_selector_row.isHidden())
-        self.assertEqual(setup.algorithm_state_label.text(), "可运行")
+        self.assertFalse(setup.algorithm_selector_row.isHidden())
+        self.assertEqual(setup.algorithm_selector.count(), 1)
+        self.assertEqual(
+            setup.algorithm_selector.currentData(),
+            BeamSurfaceIntegralAlgorithm.metadata.identifier,
+        )
+        self.assertIn("可求解", setup.algorithm_selector.currentText())
+        self.assertEqual(setup.algorithm_state_label.text(), "可求解")
         self.assertEqual(
             setup.algorithm_name_label.text(),
-            "积分型表面应变矩阵",
+            BeamSurfaceIntegralAlgorithm.metadata.display_name,
+        )
+        self.assertEqual(setup.method_card.accessibleName(), "重构方法")
+        self.assertEqual(setup.algorithm_selector_label.text(), "重构方法")
+        self.assertEqual(
+            window.analysis_metric_title_labels["solver"].text(),
+            "重构方法",
+        )
+        self.assertIn("可求解", setup.algorithm_selector.toolTip())
+        self.assertIn(
+            "不会改变用户设置的积分区间",
+            setup.parameter_editor("gauss_n").toolTip(),
+        )
+        self.assertIn(
+            "不参与方程组装",
+            setup.parameter_editor("points_per_element").toolTip(),
         )
         self.assertEqual(
             setup.parameter_values(),
@@ -234,6 +255,49 @@ class ModelerUiTests(unittest.TestCase):
 
         self.assertEqual(window.left_tabs.currentIndex(), 0)
         self.assertTrue(editor.hasFocus())
+        window.close()
+
+    def test_rank_deficiency_marks_method_unsolvable_and_focuses_selector(self):
+        window = gui_qt.ReconstructionMainWindow()
+        window.show()
+        self.app.processEvents()
+        rows = window.measurement_editor.get_rows()
+        for row in rows:
+            row["surface"] = "top"
+        window.measurement_editor.set_rows(rows)
+        self.app.processEvents()
+        window._refresh_input_readiness()
+
+        issue = next(
+            item
+            for item in window._readiness_issues
+            if item["field"] == "/analysis/solvability"
+        )
+        self.assertIn("秩", issue["message"])
+        self.assertEqual(
+            window.analysis_setup.algorithm_state_label.text(),
+            "不可求解",
+        )
+        self.assertIn(
+            "秩",
+            window.analysis_setup.algorithm_feedback_label.text(),
+        )
+        self.assertIn(
+            "不可求解",
+            window.analysis_setup.algorithm_selector.currentText(),
+        )
+        self.assertIn("不可求解", window.input_status_label.text())
+        self.assertEqual(
+            window.run_status_label.text(),
+            "当前重构方法不可求解",
+        )
+        self.assertFalse(window.run_button.isEnabled())
+
+        window.input_status_label.click()
+        self.app.processEvents()
+
+        self.assertEqual(window.left_tabs.currentIndex(), 0)
+        self.assertTrue(window.analysis_setup.algorithm_selector.hasFocus())
         window.close()
 
     def test_stale_result_is_preserved_and_visibly_marked_until_rerun(self):
@@ -785,6 +849,18 @@ class ModelerUiTests(unittest.TestCase):
 
         self.assertFalse(setup.algorithm_selector_row.isHidden())
         self.assertEqual(setup.algorithm_selector.count(), 2)
+        self.assertIn(
+            "可求解",
+            setup.algorithm_selector.itemText(
+                setup.algorithm_selector.findData(primary.metadata.identifier)
+            ),
+        )
+        self.assertIn(
+            "适用",
+            setup.algorithm_selector.itemText(
+                setup.algorithm_selector.findData(alternate.metadata.identifier)
+            ),
+        )
         alternate_index = setup.algorithm_selector.findData(
             alternate.metadata.identifier
         )
@@ -807,6 +883,153 @@ class ModelerUiTests(unittest.TestCase):
             window._project_for_interactive_modeler().analysis_cases[0].algorithm_id,
             alternate.metadata.identifier,
         )
+        window.close()
+
+    def test_incompatible_method_remains_selectable_with_reason_and_blocks_run(self):
+        class SpatialOnlyAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier="ifem.beam3d.spatial-only.test",
+                display_name="仅三维测试方法",
+                version="0.1.0",
+                description="用于验证用户可选择当前模型不可解的方法。",
+            )
+            capabilities = replace(
+                BeamSurfaceIntegralAlgorithm.capabilities,
+                modeling_spaces=("3d",),
+            )
+
+        primary = BeamSurfaceIntegralAlgorithm()
+        spatial_only = SpatialOnlyAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((primary, spatial_only)),
+            default_algorithm_id=primary.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        setup = window.analysis_setup
+
+        spatial_index = setup.algorithm_selector.findData(
+            spatial_only.metadata.identifier
+        )
+        self.assertGreaterEqual(spatial_index, 0)
+        self.assertIn("不可求解", setup.algorithm_selector.itemText(spatial_index))
+        self.assertIn(
+            "不支持2D建模空间",
+            setup.algorithm_selector.itemData(
+                spatial_index,
+                Qt.ItemDataRole.ToolTipRole,
+            ),
+        )
+
+        setup.algorithm_selector.setCurrentIndex(spatial_index)
+        self.app.processEvents()
+
+        self.assertEqual(setup.active_algorithm_id, spatial_only.metadata.identifier)
+        self.assertFalse(setup.is_compatible)
+        self.assertEqual(setup.algorithm_state_label.text(), "不可求解")
+        self.assertIn("不支持2D建模空间", setup.algorithm_feedback_label.text())
+        self.assertTrue(setup.parameter_panel.isEnabled())
+        self.assertFalse(window.run_button.isEnabled())
+        self.assertEqual(
+            window.run_status_label.text(),
+            "当前重构方法不可求解",
+        )
+        self.assertEqual(
+            window.analysis_metric_labels["solver"].text(),
+            spatial_only.metadata.display_name,
+        )
+
+        primary_index = setup.algorithm_selector.findData(primary.metadata.identifier)
+        setup.algorithm_selector.setCurrentIndex(primary_index)
+        self.app.processEvents()
+        self.assertTrue(setup.is_compatible)
+        self.assertEqual(setup.algorithm_state_label.text(), "可求解")
+        self.assertTrue(window.run_button.isEnabled())
+        window.close()
+
+    def test_project_without_case_keeps_incompatible_default_preselected(self):
+        class SpatialDefaultAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier="ifem.beam3d.default-selection.test",
+                display_name="默认三维测试方法",
+                version="0.1.0",
+            )
+            capabilities = replace(
+                BeamSurfaceIntegralAlgorithm.capabilities,
+                modeling_spaces=("3d",),
+            )
+
+        primary = BeamSurfaceIntegralAlgorithm()
+        spatial_default = SpatialDefaultAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((primary, spatial_default)),
+            default_algorithm_id=spatial_default.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        project = window.current_project_document.revised(
+            analysis_cases=(),
+            active_analysis_id=None,
+        )
+
+        window.analysis_setup.set_project(project)
+
+        self.assertEqual(
+            window.analysis_setup.active_algorithm_id,
+            spatial_default.metadata.identifier,
+        )
+        self.assertFalse(window.analysis_setup.is_compatible)
+        self.assertEqual(
+            window.analysis_setup.algorithm_state_label.text(),
+            "不可求解",
+        )
+        window.close()
+
+    def test_recovery_selector_lists_all_alternatives_with_solvability_status(self):
+        class SpatialOnlyAlgorithm(BeamSurfaceIntegralAlgorithm):
+            metadata = AlgorithmMetadata(
+                identifier="ifem.beam3d.recovery-alternative.test",
+                display_name="三维替代测试方法",
+                version="0.1.0",
+            )
+            capabilities = replace(
+                BeamSurfaceIntegralAlgorithm.capabilities,
+                modeling_spaces=("3d",),
+            )
+
+        primary = BeamSurfaceIntegralAlgorithm()
+        spatial_only = SpatialOnlyAlgorithm()
+        service = AnalysisService(
+            AlgorithmRegistry((primary, spatial_only)),
+            default_algorithm_id=primary.metadata.identifier,
+        )
+        window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        original_case = replace(
+            window.current_project_document.analysis_cases[0],
+            algorithm_id="vendor.missing.recovery-choice",
+            algorithm_version="4.0.0",
+            parameter_schema_version="9",
+        )
+        project = window.current_project_document.revised(
+            analysis_cases=(original_case,)
+        )
+
+        window._apply_project_document(
+            project,
+            dirty=False,
+            status_text="恢复候选测试项目已载入",
+        )
+        selector = window.analysis_setup.algorithm_selector
+
+        self.assertFalse(window.analysis_setup.algorithm_selector_row.isHidden())
+        self.assertEqual(selector.count(), 3)
+        primary_index = selector.findData(primary.metadata.identifier)
+        spatial_index = selector.findData(spatial_only.metadata.identifier)
+        self.assertIn("适用", selector.itemText(primary_index))
+        self.assertIn("不可求解", selector.itemText(spatial_index))
+        self.assertIn(
+            "不支持2D建模空间",
+            selector.itemData(spatial_index, Qt.ItemDataRole.ToolTipRole),
+        )
+        self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
         window.close()
 
     def test_missing_algorithm_save_preserves_case_until_explicit_rebind(self):
@@ -933,7 +1156,7 @@ class ModelerUiTests(unittest.TestCase):
         class UpdatedBeamAlgorithm(BeamSurfaceIntegralAlgorithm):
             metadata = AlgorithmMetadata(
                 identifier=BeamSurfaceIntegralAlgorithm.metadata.identifier,
-                display_name="积分型表面应变矩阵",
+                display_name="局部积分 ASP-iFEM",
                 version="2.0.0",
                 description="用于验证插件升级恢复流程。",
                 parameter_schema_version="2",
@@ -967,6 +1190,9 @@ class ModelerUiTests(unittest.TestCase):
 
         self.assertEqual(setup.recovery_status, setup.RECOVERY_SCHEMA)
         self.assertFalse(setup.accept_current_button.isHidden())
+        self.assertFalse(setup.algorithm_selector_row.isHidden())
+        self.assertEqual(setup.algorithm_selector.count(), 1)
+        self.assertIsNone(setup.algorithm_selector.itemData(0))
         self.assertFalse(setup.is_compatible)
         self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
 
@@ -1137,6 +1363,19 @@ class ModelerUiTests(unittest.TestCase):
         self.assertGreaterEqual(
             setup.algorithm_selector.findData(alternative.metadata.identifier),
             0,
+        )
+        restored_index = setup.algorithm_selector.currentIndex()
+        self.assertEqual(
+            setup.algorithm_selector.toolTip(),
+            setup.algorithm_selector.itemData(
+                restored_index,
+                Qt.ItemDataRole.ToolTipRole,
+            ),
+        )
+        self.assertIn(primary.metadata.display_name, setup.algorithm_selector.toolTip())
+        self.assertNotIn(
+            alternative.metadata.display_name,
+            setup.algorithm_selector.toolTip(),
         )
         self.assertTrue(window.run_button.isEnabled())
         window.close()
@@ -1594,8 +1833,14 @@ class ModelerUiTests(unittest.TestCase):
 
         self.assertIs(window.current_project_document, spatial_project)
         self.assertFalse(window.run_button.isEnabled())
-        self.assertEqual(window.analysis_metric_labels["solver"].text(), "等待匹配算法")
-        self.assertEqual(window.run_status_label.text(), "模型已保存 · 算法待接入")
+        self.assertEqual(
+            window.analysis_metric_labels["solver"].text(),
+            window.analysis_setup.active_algorithm_display_name,
+        )
+        self.assertEqual(
+            window.run_status_label.text(),
+            "当前重构方法不可求解",
+        )
         window.close()
 
     def test_uniform_section_form_switches_shape_and_updates_project(self):

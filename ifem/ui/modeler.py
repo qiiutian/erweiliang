@@ -1895,8 +1895,14 @@ class BeamModelerDialog(QDialog):
         )
         data_form.addRow("应变 ε", self.sensor_strain_edit)
         data_form.addRow("权重", self.sensor_weight_edit)
-        data_form.addRow("量长起点 a", self.sensor_zone_a_edit)
-        data_form.addRow("量长终点 b", self.sensor_zone_b_edit)
+        self.sensor_zone_a_edit.setToolTip(
+            "用户自选的归一化局部积分起点，范围为 0 到 1"
+        )
+        self.sensor_zone_b_edit.setToolTip(
+            "用户自选的归一化局部积分终点，需大于起点且不超过 1"
+        )
+        data_form.addRow("局部积分起点 a (ξ)", self.sensor_zone_a_edit)
+        data_form.addRow("局部积分终点 b (ξ)", self.sensor_zone_b_edit)
         self.sensor_config_tabs.addTab(data_page, "数据")
 
         sensor_apply = QPushButton("更新测点")
