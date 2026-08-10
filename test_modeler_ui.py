@@ -22,7 +22,12 @@ from ifem.domain.project import AnalysisCase, empty_beam_project
 from ifem.infrastructure import load_project, project_from_legacy_config, save_project
 from ifem.modeling import BeamProjectEditor, PathBeamEditor
 from ifem.modeling.section_geometry import section_boundary_point
-from ifem.ui.modeler import BeamModelCanvas, BeamModelerDialog, SensorArrayDialog
+from ifem.ui.modeler import (
+    BeamModelCanvas,
+    BeamModelerDialog,
+    SensorArrayDialog,
+    SpatialCurveDialog,
+)
 from ifem.ui.modeler_3d import BeamGeometry3DView
 from visualization_3d import Structure3DView
 
@@ -1630,6 +1635,113 @@ class ModelerUiTests(unittest.TestCase):
         self.assertIn("不会自动写入", dialog.apply_to_workspace_button.toolTip())
         self.assertEqual(dialog.generate_button.text(), "替换当前路径")
         self.assertIn("清空", dialog.generate_button.toolTip())
+        dialog.close()
+
+    def test_spatial_curve_dialog_parses_arc_and_nurbs_definitions(self):
+        dialog = SpatialCurveDialog()
+        dialog.points_edit.setPlainText(
+            "0, 0, 0\n1, 0.5, 0.75\n2, 1.5, 0.25"
+        )
+        arc = dialog.definition()
+
+        self.assertEqual(arc["kind"], SpatialCurveDialog.ARC)
+        self.assertEqual(len(arc["points"]), 3)
+
+        dialog.kind_combo.setCurrentIndex(
+            dialog.kind_combo.findData(SpatialCurveDialog.NURBS)
+        )
+        self.assertEqual(dialog.degree_spin.value(), 2)
+        self.assertTrue(
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+        )
+        dialog.points_edit.setPlainText(
+            "0, 0, 0\n1, 0, 1\n2, 1, 1\n3, 1, 0"
+        )
+        dialog.degree_spin.setValue(3)
+        dialog.weights_edit.setText("1, 0.8, 1.2, 1")
+        nurbs = dialog.definition()
+
+        self.assertEqual(nurbs["kind"], SpatialCurveDialog.NURBS)
+        self.assertEqual(nurbs["degree"], 3)
+        self.assertEqual(nurbs["weights"], (1.0, 0.8, 1.2, 1.0))
+
+        dialog.weights_edit.setText("1, 0, 1, 1")
+        with self.assertRaisesRegex(ValueError, "大于 0"):
+            dialog.definition()
+        dialog.close()
+
+    def test_modeler_creates_single_nurbs_entity_and_supports_undo(self):
+        project = PathBeamEditor.create_straight_beam(
+            empty_beam_project(modeling_space="3d"),
+            length=2.0,
+            element_count=1,
+        )
+        dialog = BeamModelerDialog(project)
+
+        class AcceptedSpatialCurveDialog:
+            ARC = SpatialCurveDialog.ARC
+            NURBS = SpatialCurveDialog.NURBS
+
+            def __init__(self, _parent=None):
+                self.curve_definition = {
+                    "kind": self.NURBS,
+                    "points": (
+                        (0.0, 0.0, 0.0),
+                        (0.8, 0.0, 1.0),
+                        (2.0, 1.0, 0.8),
+                        (3.0, 1.2, 0.0),
+                    ),
+                    "degree": 3,
+                    "weights": None,
+                }
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        with patch(
+            "ifem.ui.modeler.SpatialCurveDialog",
+            AcceptedSpatialCurveDialog,
+        ):
+            dialog._create_spatial_curve()
+
+        self.assertEqual(len(dialog.project.elements), 1)
+        self.assertEqual(dialog.project.elements[0].geometry.kind, "nurbs_curve")
+        self.assertEqual(dialog.project.modeling_space, "3d")
+        dialog.undo_stack.undo()
+        self.assertEqual(dialog.project.elements[0].geometry.kind, "line")
+        dialog.close()
+
+    def test_modeler_creates_tilted_three_point_arc(self):
+        project = empty_beam_project(modeling_space="3d")
+        dialog = BeamModelerDialog(project)
+
+        class AcceptedSpatialArcDialog:
+            ARC = SpatialCurveDialog.ARC
+            NURBS = SpatialCurveDialog.NURBS
+
+            def __init__(self, _parent=None):
+                self.curve_definition = {
+                    "kind": self.ARC,
+                    "points": (
+                        (1.0, -1.0, 0.0),
+                        (1.0, 0.0, 1.0),
+                        (0.0, 1.0, 1.0),
+                    ),
+                }
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        with patch(
+            "ifem.ui.modeler.SpatialCurveDialog",
+            AcceptedSpatialArcDialog,
+        ):
+            dialog._create_spatial_curve()
+
+        element = dialog.project.elements[0]
+        self.assertEqual(element.geometry.kind, "circular_arc")
+        self.assertEqual(element.geometry.parameters["plane"], "custom")
+        self.assertEqual(dialog.project.modeling_space, "3d")
         dialog.close()
 
     def test_replacing_path_confirms_when_only_boundaries_would_be_cleared(self):

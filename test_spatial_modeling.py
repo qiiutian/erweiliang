@@ -68,6 +68,205 @@ class PathBeamEditorTests(unittest.TestCase):
         self.assertEqual(len(restored.elements), 1)
         self.assertEqual(restored.elements[0].geometry, arc.elements[0].geometry)
 
+    def test_tilted_three_point_arc_keeps_exact_spatial_plane(self):
+        normal = np.asarray((1.0, 1.0, 1.0), dtype=float)
+        normal /= np.linalg.norm(normal)
+        radial = np.asarray((1.0, -1.0, 0.0), dtype=float)
+        radial /= np.linalg.norm(radial)
+        tangent_radius = np.cross(normal, radial)
+        center = np.asarray((0.4, -0.2, 0.7), dtype=float)
+        radius = 2.0
+
+        def circle_point(angle):
+            return center + radius * (
+                np.cos(angle) * radial + np.sin(angle) * tangent_radius
+            )
+
+        start = circle_point(0.0)
+        through = circle_point(pi / 4.0)
+        end = circle_point(pi / 2.0)
+        project = PathBeamEditor.create_circular_arc_through_points(
+            empty_beam_project(modeling_space="3d"),
+            start=start,
+            through=through,
+            end=end,
+        )
+
+        element = project.elements[0]
+        parameters = element.geometry.parameters
+        self.assertEqual(parameters["plane"], "custom")
+        self.assertEqual(project.modeling_space, "3d")
+        self.assertAlmostEqual(PathBeamEditor.element_length(project, element), pi, places=10)
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(project, element, 0.5),
+            through,
+            atol=1.0e-10,
+        )
+        np.testing.assert_allclose(
+            abs(np.dot(parameters["normal"], normal)),
+            1.0,
+            atol=1.0e-12,
+        )
+        restored = ProjectDocument.from_dict(project.to_dict())
+        self.assertEqual(restored.elements[0].geometry, element.geometry)
+
+        updated = PathBeamEditor.update_circular_arc(
+            project,
+            element.identifier,
+            radius=2.5,
+            sweep_degrees=60.0,
+            plane="custom",
+        )
+        updated_element = updated.elements[0]
+        np.testing.assert_allclose(
+            updated_element.geometry.parameters["normal"],
+            parameters["normal"],
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(updated, updated_element, 1.0),
+            next(
+                node.coordinates
+                for node in updated.nodes
+                if node.identifier == updated_element.node_ids[1]
+            ),
+            atol=1.0e-10,
+        )
+
+    def test_nurbs_curve_is_single_entity_with_arc_length_mapping(self):
+        control_points = (
+            (0.0, 0.0, 0.0),
+            (0.8, -0.2, 1.2),
+            (2.1, 1.4, 1.0),
+            (3.0, 1.0, -0.3),
+        )
+        project = PathBeamEditor.create_nurbs_curve(
+            empty_beam_project(modeling_space="3d"),
+            control_points=control_points,
+            degree=3,
+        )
+        element = project.elements[0]
+
+        self.assertEqual(len(project.nodes), 2)
+        self.assertEqual(len(project.elements), 1)
+        self.assertEqual(element.geometry.kind, "nurbs_curve")
+        self.assertEqual(PathBeamEditor.capability(project).kind, "三维样条曲梁")
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(project, element, 0.0),
+            control_points[0],
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(project, element, 1.0),
+            control_points[-1],
+            atol=1.0e-12,
+        )
+        expected_start_tangent = np.asarray(control_points[1]) - np.asarray(
+            control_points[0]
+        )
+        expected_start_tangent /= np.linalg.norm(expected_start_tangent)
+        np.testing.assert_allclose(
+            PathBeamEditor.tangent_on_element(project, element, 0.0),
+            expected_start_tangent,
+            atol=1.0e-11,
+        )
+        self.assertGreater(
+            PathBeamEditor.element_length(project, element),
+            np.linalg.norm(np.asarray(control_points[-1]) - np.asarray(control_points[0])),
+        )
+        previous_normal = None
+        for xi in np.linspace(0.0, 1.0, 11):
+            tangent, normal, binormal = (
+                np.asarray(vector)
+                for vector in PathBeamEditor.section_frame(project, element, float(xi))
+            )
+            self.assertAlmostEqual(np.linalg.norm(tangent), 1.0, places=10)
+            self.assertAlmostEqual(np.linalg.norm(normal), 1.0, places=10)
+            self.assertAlmostEqual(np.linalg.norm(binormal), 1.0, places=10)
+            self.assertAlmostEqual(float(np.dot(tangent, normal)), 0.0, places=10)
+            self.assertAlmostEqual(float(np.dot(tangent, binormal)), 0.0, places=10)
+            self.assertAlmostEqual(float(np.dot(normal, binormal)), 0.0, places=10)
+            if previous_normal is not None:
+                self.assertGreater(float(np.dot(previous_normal, normal)), 0.9)
+            previous_normal = normal
+
+        expected_xi = 0.37
+        distance = PathBeamEditor.element_arc_length(
+            project,
+            element,
+            0.0,
+            expected_xi,
+        )
+        _index, resolved_element, resolved_xi = PathBeamEditor.element_at_path_distance(
+            project,
+            distance,
+        )
+        self.assertEqual(resolved_element.identifier, element.identifier)
+        self.assertAlmostEqual(resolved_xi, expected_xi, places=8)
+
+        project = PathBeamEditor.add_sensor(project, element.identifier, expected_xi, "top")
+        location = PathBeamEditor.sensor_location(project, project.sensors[0].identifier)
+        self.assertAlmostEqual(location.path_distance, distance, places=8)
+        restored = ProjectDocument.from_dict(project.to_dict())
+        self.assertEqual(restored.elements[0].geometry, project.elements[0].geometry)
+        self.assertEqual(restored.sensors[0].attachment, project.sensors[0].attachment)
+
+    def test_nurbs_surface_pick_recovers_curve_and_section_coordinates(self):
+        project = PathBeamEditor.create_nurbs_curve(
+            empty_beam_project(modeling_space="3d"),
+            control_points=(
+                (0.0, 0.0, 0.0),
+                (0.7, -0.3, 1.0),
+                (1.9, 1.2, 0.9),
+                (3.0, 0.8, -0.2),
+            ),
+            degree=3,
+        )
+        element = project.elements[0]
+        expected_xi = 0.43
+        rendered, physical = self._rendered_surface_point(
+            project,
+            element,
+            expected_xi,
+            68.0,
+            12.0,
+        )
+
+        location = PathBeamEditor.surface_location_from_point(
+            project,
+            rendered,
+            display_scale=12.0,
+        )
+
+        self.assertEqual(location.element_id, element.identifier)
+        self.assertAlmostEqual(location.local_coordinate, expected_xi, places=5)
+        np.testing.assert_allclose(location.global_position, physical, atol=1.0e-7)
+        self.assertAlmostEqual(location.surface_angle_degrees, 68.0, places=4)
+
+    def test_nurbs_curve_rejects_fractional_degree_and_disconnected_append(self):
+        control_points = (
+            (0.0, 0.0, 0.0),
+            (0.5, 0.2, 0.6),
+            (1.0, 0.8, 0.2),
+        )
+        with self.assertRaisesRegex(ValueError, "次数必须是整数"):
+            PathBeamEditor.create_nurbs_curve(
+                empty_beam_project(modeling_space="3d"),
+                control_points=control_points,
+                degree=1.5,
+            )
+
+        line = PathBeamEditor.create_straight_beam(
+            empty_beam_project(modeling_space="3d"),
+            length=1.0,
+            element_count=1,
+        )
+        with self.assertRaisesRegex(ValueError, "第一个控制点"):
+            PathBeamEditor.append_nurbs_curve(
+                line,
+                control_points=((2.0, 0.0, 0.0), (3.0, 0.5, 0.2)),
+            )
+
     def test_2d_path_can_combine_straight_and_analytic_arc_segments(self):
         project = PathBeamEditor.create_straight_beam(
             empty_beam_project(modeling_space="2d"),

@@ -131,8 +131,8 @@ class BeamGeometryDefinition:
                 or abs(sweep_degrees) >= 360.0
             ):
                 raise ValueError("圆弧圆心角必须满足 0 < |角度| < 360°。")
-            if plane not in {"xy", "xz", "yz"}:
-                raise ValueError("圆弧平面必须是 XY、XZ 或 YZ。")
+            if plane not in {"xy", "xz", "yz", "custom"}:
+                raise ValueError("圆弧平面必须是 XY、XZ、YZ 或 custom。")
             normal_length = sqrt(sum(value * value for value in normal))
             start_length = sqrt(sum(value * value for value in start_vector))
             if normal_length <= 0.0 or start_length <= 0.0:
@@ -150,6 +150,99 @@ class BeamGeometryDefinition:
                     "normal": normal,
                     "start_vector": start_vector,
                     "plane": plane,
+                }
+            )
+        elif kind == "nurbs_curve":
+            raw_points = parameters.get("control_points", ())
+            if not isinstance(raw_points, (list, tuple)):
+                raise ValueError("NURBS 控制点必须是坐标列表。")
+            control_points = tuple(
+                _finite_tuple(point, size=3, field_name=f"NURBS 控制点 {index + 1}")
+                for index, point in enumerate(raw_points)
+            )
+            if len(control_points) < 2:
+                raise ValueError("NURBS 曲线至少需要两个控制点。")
+            raw_degree = parameters.get("degree", min(3, len(control_points) - 1))
+            if isinstance(raw_degree, bool):
+                raise ValueError("NURBS 次数必须是整数。")
+            try:
+                degree = int(raw_degree)
+                numeric_degree = float(raw_degree)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("NURBS 次数必须是整数。") from exc
+            if (
+                not isfinite(numeric_degree)
+                or numeric_degree != degree
+                or not 1 <= degree < len(control_points)
+            ):
+                raise ValueError("NURBS 次数必须是小于控制点数量的正整数。")
+
+            raw_weights = parameters.get("weights", (1.0,) * len(control_points))
+            if not isinstance(raw_weights, (list, tuple)):
+                raise ValueError("NURBS 权重必须是数值列表。")
+            try:
+                weights = tuple(float(value) for value in raw_weights)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("NURBS 权重必须是数值列表。") from exc
+            if (
+                len(weights) != len(control_points)
+                or not all(isfinite(value) and value > 0.0 for value in weights)
+            ):
+                raise ValueError("NURBS 权重必须与控制点一一对应且全部大于 0。")
+
+            expected_knot_count = len(control_points) + degree + 1
+            raw_knots = parameters.get("knots")
+            if raw_knots is None:
+                internal_count = len(control_points) - degree - 1
+                knots = (
+                    (0.0,) * (degree + 1)
+                    + tuple(
+                        index / (internal_count + 1)
+                        for index in range(1, internal_count + 1)
+                    )
+                    + (1.0,) * (degree + 1)
+                )
+            else:
+                if not isinstance(raw_knots, (list, tuple)):
+                    raise ValueError("NURBS 节点向量必须是数值列表。")
+                try:
+                    knots = tuple(float(value) for value in raw_knots)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("NURBS 节点向量必须是数值列表。") from exc
+            if len(knots) != expected_knot_count or not all(
+                isfinite(value) for value in knots
+            ):
+                raise ValueError(
+                    f"NURBS 节点向量必须包含 {expected_knot_count} 个有限数值。"
+                )
+            if any(right < left for left, right in zip(knots, knots[1:])):
+                raise ValueError("NURBS 节点向量必须单调不减。")
+            domain_start = knots[degree]
+            domain_end = knots[-degree - 1]
+            if domain_end - domain_start <= 1.0e-12:
+                raise ValueError("NURBS 有效参数区间不能为空。")
+            if any(abs(value - domain_start) > 1.0e-10 for value in knots[: degree + 1]):
+                raise ValueError("NURBS 起点必须使用夹持节点向量。")
+            if any(abs(value - domain_end) > 1.0e-10 for value in knots[-degree - 1 :]):
+                raise ValueError("NURBS 终点必须使用夹持节点向量。")
+            if sqrt(
+                sum(
+                    (right - left) ** 2
+                    for left, right in zip(control_points[0], control_points[1])
+                )
+            ) <= 1.0e-12 or sqrt(
+                sum(
+                    (right - left) ** 2
+                    for left, right in zip(control_points[-2], control_points[-1])
+                )
+            ) <= 1.0e-12:
+                raise ValueError("NURBS 首尾控制边不能退化为零长度。")
+            parameters.update(
+                {
+                    "degree": degree,
+                    "control_points": control_points,
+                    "weights": weights,
+                    "knots": knots,
                 }
             )
         object.__setattr__(self, "kind", kind)
@@ -421,6 +514,15 @@ def _infer_modeling_space(
         for element in elements
     ):
         return "3d"
+    if any(
+        element.geometry.kind == "nurbs_curve"
+        and any(
+            abs(point[2]) > 1.0e-10
+            for point in element.geometry.parameters.get("control_points", ())
+        )
+        for element in elements
+    ):
+        return "3d"
     return "2d"
 
 
@@ -469,14 +571,46 @@ class ProjectDocument:
                 for element in elements
             ):
                 raise ValueError("二维模型中的圆弧必须位于 XY 平面。")
+            if any(
+                element.geometry.kind == "nurbs_curve"
+                and any(
+                    abs(point[2]) > 1.0e-10
+                    for point in element.geometry.parameters.get("control_points", ())
+                )
+                for element in elements
+            ):
+                raise ValueError("二维模型中的 NURBS 控制点必须位于 XY 平面。")
 
         node_ids = {node.identifier for node in nodes}
+        nodes_by_id = {node.identifier: node for node in nodes}
         element_ids = {element.identifier for element in elements}
         material_ids = {material.identifier for material in materials}
         section_ids = {section.identifier for section in sections}
         for element in elements:
             if any(node_id not in node_ids for node_id in element.node_ids):
                 raise ValueError(f"梁单元 {element.identifier} 引用了不存在的节点。")
+            if element.geometry.kind == "nurbs_curve":
+                control_points = element.geometry.parameters["control_points"]
+                endpoint_pairs = zip(
+                    element.node_ids,
+                    (control_points[0], control_points[-1]),
+                )
+                if any(
+                    sqrt(
+                        sum(
+                            (actual - expected) ** 2
+                            for actual, expected in zip(
+                                nodes_by_id[node_id].coordinates,
+                                control_point,
+                            )
+                        )
+                    )
+                    > 1.0e-8
+                    for node_id, control_point in endpoint_pairs
+                ):
+                    raise ValueError(
+                        f"NURBS 梁单元 {element.identifier} 的控制曲线端点必须与结构节点一致。"
+                    )
             if element.material_id is not None and element.material_id not in material_ids:
                 raise ValueError(f"梁单元 {element.identifier} 引用了不存在的材料。")
             if element.section_id is not None and element.section_id not in section_ids:

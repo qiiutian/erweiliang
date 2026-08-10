@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import ceil, hypot
+from math import ceil, hypot, isfinite
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -1053,6 +1054,182 @@ class SensorArrayDialog(QDialog):
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
 
 
+class SpatialCurveDialog(QDialog):
+    """Collect an arbitrary three-point arc or a NURBS control polygon."""
+
+    ARC = "arc_three_points"
+    NURBS = "nurbs_curve"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("spatialCurveDialog")
+        self.setWindowTitle("创建空间曲线")
+        self.setMinimumSize(560, 470)
+        self._definition = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+
+        title = QLabel("空间曲线")
+        title.setObjectName("inspectorTitle")
+        root.addWidget(title)
+        intro = QLabel(
+            "输入绝对坐标；圆弧通过三个点精确定义，NURBS 使用控制点和可选权重。"
+        )
+        intro.setObjectName("sectionHint")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(9)
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItem("任意平面圆弧（三点）", self.ARC)
+        self.kind_combo.addItem("三维 B 样条 / NURBS", self.NURBS)
+        form.addRow("曲线类型", self.kind_combo)
+        self.degree_spin = QSpinBox()
+        self.degree_spin.setRange(1, 5)
+        self.degree_spin.setValue(3)
+        self.degree_label = QLabel("样条次数")
+        form.addRow(self.degree_label, self.degree_spin)
+        self.weights_edit = QLineEdit()
+        self.weights_edit.setPlaceholderText("可选，例如：1, 1, 0.8, 1")
+        self.weights_label = QLabel("控制点权重")
+        form.addRow(self.weights_label, self.weights_edit)
+        root.addLayout(form)
+
+        points_label = QLabel("空间点（每行 x, y, z）")
+        points_label.setObjectName("fieldLabel")
+        root.addWidget(points_label)
+        self.points_edit = QPlainTextEdit()
+        self.points_edit.setAccessibleName("空间曲线控制点")
+        self.points_edit.setPlaceholderText(
+            "0, 0, 0\n1, 0.5, 0.8\n2, 1.0, 0.2"
+        )
+        self.points_edit.setPlainText("0, 0, 0\n1, 0.5, 0.8\n2, 1.0, 0.2")
+        root.addWidget(self.points_edit, 1)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setObjectName("sectionHint")
+        self.feedback_label.setWordWrap(True)
+        root.addWidget(self.feedback_label)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("创建曲线")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName(
+            "smallPrimaryButton"
+        )
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+
+        self.kind_combo.currentIndexChanged.connect(self._curve_kind_changed)
+        self.degree_spin.valueChanged.connect(self._refresh_state)
+        self.weights_edit.textChanged.connect(self._refresh_state)
+        self.points_edit.textChanged.connect(self._refresh_state)
+        self._refresh_state()
+
+    def _parse_points(self):
+        points = []
+        for line_number, line in enumerate(self.points_edit.toPlainText().splitlines(), 1):
+            text = line.strip()
+            if not text:
+                continue
+            parts = text.replace("，", ",").replace(",", " ").split()
+            if len(parts) != 3:
+                raise ValueError(f"第 {line_number} 行必须包含 x、y、z 三个坐标。")
+            point = tuple(float(value) for value in parts)
+            if not all(isfinite(value) for value in point):
+                raise ValueError(f"第 {line_number} 行坐标必须是有限数值。")
+            points.append(point)
+        return tuple(points)
+
+    def definition(self):
+        points = self._parse_points()
+        kind = self.kind_combo.currentData()
+        if kind == self.ARC:
+            if len(points) != 3:
+                raise ValueError("任意平面圆弧必须恰好输入三个点。")
+            first = tuple(right - left for left, right in zip(points[0], points[1]))
+            second = tuple(right - left for left, right in zip(points[0], points[2]))
+            cross = (
+                first[1] * second[2] - first[2] * second[1],
+                first[2] * second[0] - first[0] * second[2],
+                first[0] * second[1] - first[1] * second[0],
+            )
+            if sum(value * value for value in cross) <= 1.0e-20:
+                raise ValueError("任意平面圆弧的三个点不能共线或重合。")
+            return {"kind": kind, "points": points}
+        if len(points) < 2:
+            raise ValueError("NURBS 曲线至少需要两个控制点。")
+        degree = self.degree_spin.value()
+        if degree >= len(points):
+            raise ValueError("样条次数必须小于控制点数量。")
+        weights_text = self.weights_edit.text().strip()
+        weights = None
+        if weights_text:
+            weights = tuple(
+                float(value)
+                for value in weights_text.replace("，", ",").replace(",", " ").split()
+            )
+            if len(weights) != len(points):
+                raise ValueError("权重数量必须与控制点数量一致。")
+            if not all(isfinite(value) and value > 0.0 for value in weights):
+                raise ValueError("每个 NURBS 权重都必须是大于 0 的有限数值。")
+        return {
+            "kind": kind,
+            "points": points,
+            "degree": degree,
+            "weights": weights,
+        }
+
+    def _curve_kind_changed(self, *_args):
+        if self.kind_combo.currentData() == self.NURBS:
+            try:
+                point_count = len(self._parse_points())
+            except (TypeError, ValueError):
+                point_count = 0
+            if point_count >= 2 and self.degree_spin.value() >= point_count:
+                self.degree_spin.setValue(point_count - 1)
+        self._refresh_state()
+
+    def _refresh_state(self, *_args):
+        is_nurbs = self.kind_combo.currentData() == self.NURBS
+        self.degree_label.setVisible(is_nurbs)
+        self.degree_spin.setVisible(is_nurbs)
+        self.weights_label.setVisible(is_nurbs)
+        self.weights_edit.setVisible(is_nurbs)
+        try:
+            definition = self.definition()
+            point_count = len(definition["points"])
+            self.feedback_label.setText(
+                f"可创建 · {point_count} 个定义点"
+                + (f" · {definition['degree']} 次" if is_nurbs else "")
+            )
+            valid = True
+        except (TypeError, ValueError) as exc:
+            self.feedback_label.setText(str(exc))
+            valid = False
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
+
+    def accept(self):
+        try:
+            self._definition = self.definition()
+        except (TypeError, ValueError) as exc:
+            self.feedback_label.setText(str(exc))
+            return
+        super().accept()
+
+    @property
+    def curve_definition(self):
+        return self._definition
+
+
 class BeamModelerDialog(QDialog):
     def __init__(self, project: ProjectDocument, parent=None, *, theme_id=None):
         super().__init__(parent)
@@ -1405,6 +1582,13 @@ class BeamModelerDialog(QDialog):
         action_row = QHBoxLayout()
         action_row.setSpacing(7)
         action_row.addStretch(1)
+        self.spatial_curve_button = QPushButton("空间曲线…")
+        self.spatial_curve_button.setObjectName("modelerPathButton")
+        self.spatial_curve_button.setToolTip(
+            "通过三个空间点创建任意平面圆弧，或通过控制点创建 B 样条/NURBS"
+        )
+        self.spatial_curve_button.clicked.connect(self._create_spatial_curve)
+        action_row.addWidget(self.spatial_curve_button)
         self.generate_button = QPushButton("新建路径")
         self.generate_button.setObjectName("modelerPathButton")
         self.generate_button.setToolTip("使用当前参数新建整条路径，并替换现有几何")
@@ -1502,6 +1686,7 @@ class BeamModelerDialog(QDialog):
         self.arc_plane_combo.addItem("XY 平面", "xy")
         self.arc_plane_combo.addItem("XZ 平面", "xz")
         self.arc_plane_combo.addItem("YZ 平面", "yz")
+        self.arc_plane_combo.addItem("任意空间平面（保留法向）", "custom")
         self.element_family_combo = QComboBox()
         self.element_family_combo.addItem("二维 Euler-Bernoulli 梁", "beam2d_euler_bernoulli")
         self.element_family_combo.addItem("二维解析曲梁", "beam2d_curved")
@@ -2221,7 +2406,18 @@ class BeamModelerDialog(QDialog):
                     f"{PathBeamEditor.element_length(self._project, element):.8g} m"
                 )
                 is_arc = element.geometry.kind == "circular_arc"
-                self.element_geometry_label.setText("参数化圆弧" if is_arc else "直线")
+                is_nurbs = element.geometry.kind == "nurbs_curve"
+                if is_arc:
+                    geometry_text = "参数化圆弧"
+                elif is_nurbs:
+                    parameters = element.geometry.parameters
+                    geometry_text = (
+                        f"{parameters['degree']} 次 NURBS · "
+                        f"{len(parameters['control_points'])} 控制点"
+                    )
+                else:
+                    geometry_text = "直线"
+                self.element_geometry_label.setText(geometry_text)
                 for widget in (
                     self.arc_radius_label,
                     self.arc_radius_edit,
@@ -2245,7 +2441,7 @@ class BeamModelerDialog(QDialog):
                     self.element_family_combo.addItem(element.family, element.family)
                     family_index = self.element_family_combo.count() - 1
                 self.element_family_combo.setCurrentIndex(family_index)
-                self.element_family_combo.setEnabled(not is_arc)
+                self.element_family_combo.setEnabled(not (is_arc or is_nurbs))
                 self.element_section_combo.setCurrentIndex(
                     max(self.element_section_combo.findData(element.section_id), 0)
                 )
@@ -2419,7 +2615,7 @@ class BeamModelerDialog(QDialog):
         except (KeyError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "删除对象", str(exc))
 
-    def _generate_geometry(self):
+    def _confirm_geometry_replacement(self):
         if self._project.sensors or self._project.boundary_conditions:
             cleared_items = []
             if self._project.sensors:
@@ -2438,7 +2634,12 @@ class BeamModelerDialog(QDialog):
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return
+                return False
+        return True
+
+    def _generate_geometry(self):
+        if not self._confirm_geometry_replacement():
+            return
         try:
             before = self._project
             if self.geometry_combo.currentData() == "arc":
@@ -2461,6 +2662,37 @@ class BeamModelerDialog(QDialog):
             self._selection_changed("", "")
         except (TypeError, ValueError) as exc:
             QMessageBox.warning(self, "参数化生成", str(exc))
+
+    def _create_spatial_curve(self):
+        dialog = SpatialCurveDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not self._confirm_geometry_replacement():
+            return
+        try:
+            definition = dialog.curve_definition
+            before = self._project
+            if definition["kind"] == SpatialCurveDialog.ARC:
+                start, through, end = definition["points"]
+                after = PathBeamEditor.create_circular_arc_through_points(
+                    before,
+                    start=start,
+                    through=through,
+                    end=end,
+                )
+                description = "新建任意平面圆弧"
+            else:
+                after = PathBeamEditor.create_nurbs_curve(
+                    before,
+                    control_points=definition["points"],
+                    degree=definition["degree"],
+                    weights=definition["weights"],
+                )
+                description = "新建空间 NURBS 曲线"
+            self._commit_project(before, after, description)
+            self._selection_changed("", "")
+        except (KeyError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "空间曲线", str(exc))
 
     def _append_geometry(self):
         try:

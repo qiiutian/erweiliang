@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from math import atan2, ceil, cos, degrees, isfinite, radians, sin, sqrt
+from math import atan2, ceil, cos, degrees, isfinite, pi, radians, sin, sqrt
 from typing import Mapping
 
 from ifem.domain.project import (
@@ -14,6 +14,12 @@ from ifem.domain.project import (
     SensorDefinition,
     StructuralNode,
     new_entity_id,
+)
+from ifem.modeling.parametric_curves import (
+    clamped_uniform_knots,
+    nurbs_arc_length,
+    nurbs_parameter_at_arc_length,
+    nurbs_point_and_derivative,
 )
 from ifem.modeling.section_geometry import section_boundary_point
 
@@ -49,6 +55,23 @@ def _normalize(vector) -> tuple[float, float, float]:
     if length <= _GEOMETRY_TOLERANCE:
         raise ValueError("方向向量不能为零。")
     return tuple(float(value) / length for value in vector)
+
+
+def _nurbs_degree(value, control_count: int) -> int:
+    if value is None:
+        return min(3, control_count - 1)
+    if isinstance(value, bool):
+        raise ValueError("NURBS 次数必须是整数。")
+    try:
+        degree = int(value)
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("NURBS 次数必须是整数。") from exc
+    if not isfinite(numeric) or numeric != degree:
+        raise ValueError("NURBS 次数必须是整数。")
+    if not 1 <= degree < control_count:
+        raise ValueError("NURBS 次数必须是小于控制点数量的正整数。")
+    return degree
 
 
 def _rotate_about_axis(vector, axis, angle: float) -> tuple[float, float, float]:
@@ -216,10 +239,44 @@ class PathBeamEditor:
         if element.geometry.kind == "circular_arc":
             parameters = element.geometry.parameters
             return float(parameters["radius"]) * abs(radians(parameters["sweep_degrees"]))
+        if element.geometry.kind == "nurbs_curve":
+            return nurbs_arc_length(element.geometry.parameters)
         if element.geometry.kind != "line":
             raise ValueError(f"暂不支持的梁几何类型：{element.geometry.kind}")
         node_a, node_b = PathBeamEditor.element_nodes(project, element)
         return _distance(node_a.coordinates, node_b.coordinates)
+
+    @staticmethod
+    def element_arc_length(
+        project: ProjectDocument,
+        element: BeamElement | str,
+        start: float = 0.0,
+        end: float = 1.0,
+    ) -> float:
+        element = PathBeamEditor._resolve_element(project, element)
+        left = float(start)
+        right = float(end)
+        if not all(isfinite(value) and 0.0 <= value <= 1.0 for value in (left, right)):
+            raise ValueError("梁实体弧长区间必须位于 [0, 1]。")
+        if element.geometry.kind == "nurbs_curve":
+            return nurbs_arc_length(element.geometry.parameters, left, right)
+        return abs(right - left) * PathBeamEditor.element_length(project, element)
+
+    @staticmethod
+    def element_parameter_at_length(
+        project: ProjectDocument,
+        element: BeamElement | str,
+        distance: float,
+    ) -> float:
+        element = PathBeamEditor._resolve_element(project, element)
+        if element.geometry.kind == "nurbs_curve":
+            return nurbs_parameter_at_arc_length(element.geometry.parameters, distance)
+        length = PathBeamEditor.element_length(project, element)
+        target = float(distance)
+        tolerance = max(length, 1.0) * 1.0e-11
+        if not isfinite(target) or target < -tolerance or target > length + tolerance:
+            raise ValueError(f"梁实体局部弧长必须位于 [0, {length:.8g}]。")
+        return min(1.0, max(0.0, target / length))
 
     @staticmethod
     def total_length(project: ProjectDocument) -> float:
@@ -250,6 +307,12 @@ class PathBeamEditor:
                 float(center) + float(offset)
                 for center, offset in zip(parameters["center"], radius_vector)
             )
+        if element.geometry.kind == "nurbs_curve":
+            point, _derivative = nurbs_point_and_derivative(
+                element.geometry.parameters,
+                parameter,
+            )
+            return point
         if element.geometry.kind != "line":
             raise ValueError(f"暂不支持的梁几何类型：{element.geometry.kind}")
         node_a, node_b = PathBeamEditor.element_nodes(project, element)
@@ -275,6 +338,12 @@ class PathBeamEditor:
             if float(parameters["sweep_degrees"]) < 0.0:
                 tangent = tuple(-value for value in tangent)
             return _normalize(tangent)
+        if element.geometry.kind == "nurbs_curve":
+            _point, derivative = nurbs_point_and_derivative(
+                element.geometry.parameters,
+                parameter,
+            )
+            return _normalize(derivative)
         node_a, node_b = PathBeamEditor.element_nodes(project, element)
         return _normalize(
             tuple(
@@ -295,6 +364,12 @@ class PathBeamEditor:
     ]:
         element = PathBeamEditor._resolve_element(project, element)
         tangent = PathBeamEditor.tangent_on_element(project, element, local_coordinate)
+        if element.geometry.kind == "nurbs_curve":
+            return PathBeamEditor._nurbs_section_frame(
+                project,
+                element,
+                local_coordinate,
+            )
         reference = (
             tuple(float(value) for value in element.geometry.parameters["normal"])
             if element.geometry.kind == "circular_arc"
@@ -307,6 +382,47 @@ class PathBeamEditor:
                 if _dot(normal, normal) > _GEOMETRY_TOLERANCE**2:
                     break
         normal = _normalize(normal)
+        binormal = _normalize(_cross(tangent, normal))
+        return tangent, normal, binormal
+
+    @staticmethod
+    def _nurbs_section_frame(
+        project: ProjectDocument,
+        element: BeamElement,
+        local_coordinate: float,
+    ):
+        target_xi = min(1.0, max(0.0, float(local_coordinate)))
+        previous_tangent = PathBeamEditor.tangent_on_element(project, element, 0.0)
+        reference = (0.0, 0.0, 1.0)
+        normal = _cross(reference, previous_tangent)
+        if _dot(normal, normal) <= _GEOMETRY_TOLERANCE**2:
+            normal = _cross((0.0, 1.0, 0.0), previous_tangent)
+        normal = _normalize(normal)
+        control_count = len(element.geometry.parameters["control_points"])
+        steps = max(1, ceil(target_xi * max(32, 12 * (control_count - 1))))
+        for index in range(1, steps + 1):
+            xi = target_xi * index / steps
+            tangent = PathBeamEditor.tangent_on_element(project, element, xi)
+            axis = _cross(previous_tangent, tangent)
+            axis_length = sqrt(_dot(axis, axis))
+            alignment = max(-1.0, min(1.0, _dot(previous_tangent, tangent)))
+            if axis_length > _GEOMETRY_TOLERANCE:
+                normal = _rotate_about_axis(
+                    normal,
+                    axis,
+                    atan2(axis_length, alignment),
+                )
+            normal = tuple(
+                value - _dot(normal, tangent) * tangent_value
+                for value, tangent_value in zip(normal, tangent)
+            )
+            if _dot(normal, normal) <= _GEOMETRY_TOLERANCE**2:
+                normal = _cross((0.0, 0.0, 1.0), tangent)
+                if _dot(normal, normal) <= _GEOMETRY_TOLERANCE**2:
+                    normal = _cross((0.0, 1.0, 0.0), tangent)
+            normal = _normalize(normal)
+            previous_tangent = tangent
+        tangent = previous_tangent
         binormal = _normalize(_cross(tangent, normal))
         return tangent, normal, binormal
 
@@ -472,6 +588,9 @@ class PathBeamEditor:
         elif element.geometry.kind == "circular_arc":
             sweep = abs(float(element.geometry.parameters["sweep_degrees"]))
             count = sample_count or min(181, max(17, ceil(sweep / 3.0) + 1))
+        elif element.geometry.kind == "nurbs_curve":
+            control_count = len(element.geometry.parameters["control_points"])
+            count = sample_count or min(241, max(41, 16 * (control_count - 1) + 1))
         else:
             raise ValueError(f"暂不支持的梁几何类型：{element.geometry.kind}")
         count = max(2, int(count))
@@ -512,21 +631,53 @@ class PathBeamEditor:
             bounds = sensor.attachment.integration_bounds
             point = PathBeamEditor.point_on_element(project, element, xi)
             if element.node_ids[0] == path_start.identifier:
-                path_xi = xi
-                path_bounds = bounds
+                local_distance = PathBeamEditor.element_arc_length(
+                    project,
+                    element,
+                    0.0,
+                    xi,
+                )
+                zone_a = PathBeamEditor.element_arc_length(
+                    project,
+                    element,
+                    0.0,
+                    bounds[0],
+                )
+                zone_b = PathBeamEditor.element_arc_length(
+                    project,
+                    element,
+                    0.0,
+                    bounds[1],
+                )
             else:
-                path_xi = 1.0 - xi
-                path_bounds = (1.0 - bounds[1], 1.0 - bounds[0])
+                local_distance = PathBeamEditor.element_arc_length(
+                    project,
+                    element,
+                    xi,
+                    1.0,
+                )
+                zone_a = PathBeamEditor.element_arc_length(
+                    project,
+                    element,
+                    bounds[1],
+                    1.0,
+                )
+                zone_b = PathBeamEditor.element_arc_length(
+                    project,
+                    element,
+                    bounds[0],
+                    1.0,
+                )
             return PathSensorLocation(
                 global_position=point,
-                path_distance=cumulative + path_xi * length,
+                path_distance=cumulative + local_distance,
                 element_index=index,
                 element_id=element.identifier,
                 local_coordinate=xi,
-                local_distance=path_xi * length,
+                local_distance=local_distance,
                 element_length=length,
-                zone_a=path_bounds[0] * length,
-                zone_b=path_bounds[1] * length,
+                zone_a=zone_a,
+                zone_b=zone_b,
             )
         raise ValueError("测点引用的梁单元不在当前路径中。")
 
@@ -552,12 +703,19 @@ class PathBeamEditor:
             length = PathBeamEditor.element_length(project, element)
             end = cumulative + length
             if distance <= end + tolerance or index == len(elements) - 1:
-                path_xi = min(1.0, max(0.0, (distance - cumulative) / length))
-                local_xi = (
-                    path_xi
-                    if element.node_ids[0] == path_start.identifier
-                    else 1.0 - path_xi
-                )
+                local_distance = min(length, max(0.0, distance - cumulative))
+                if element.node_ids[0] == path_start.identifier:
+                    local_xi = PathBeamEditor.element_parameter_at_length(
+                        project,
+                        element,
+                        local_distance,
+                    )
+                else:
+                    local_xi = PathBeamEditor.element_parameter_at_length(
+                        project,
+                        element,
+                        length - local_distance,
+                    )
                 return index, element, local_xi
             cumulative = end
         raise ValueError("无法将路径弧长映射到梁实体。")
@@ -707,11 +865,20 @@ class PathBeamEditor:
             for previous in elements[:element_index]
         )
         element_length = PathBeamEditor.element_length(project, element)
-        path_xi = (
-            xi
-            if element.node_ids[0] == nodes[element_index].identifier
-            else 1.0 - xi
-        )
+        if element.node_ids[0] == nodes[element_index].identifier:
+            local_distance = PathBeamEditor.element_arc_length(
+                project,
+                element,
+                0.0,
+                xi,
+            )
+        else:
+            local_distance = PathBeamEditor.element_arc_length(
+                project,
+                element,
+                xi,
+                1.0,
+            )
         surface_side = (
             "top" if surface_angle < 90.0 or surface_angle >= 270.0 else "bottom"
         )
@@ -719,7 +886,7 @@ class PathBeamEditor:
             element_index=element_index,
             element_id=element.identifier,
             local_coordinate=float(xi),
-            path_distance=cumulative + path_xi * element_length,
+            path_distance=cumulative + local_distance,
             centerline_position=tuple(float(value) for value in centerline),
             global_position=tuple(float(value) for value in global_position),
             picked_position=target,
@@ -740,10 +907,10 @@ class PathBeamEditor:
         if modeling_space == "2d":
             return (
                 "beam2d_curved"
-                if geometry_kind == "circular_arc"
+                if geometry_kind != "line"
                 else "beam2d_euler_bernoulli"
             )
-        return "beam3d_curved" if geometry_kind == "circular_arc" else "beam3d_line"
+        return "beam3d_curved" if geometry_kind != "line" else "beam3d_line"
 
     @staticmethod
     def set_modeling_space(
@@ -762,6 +929,15 @@ class PathBeamEditor:
                 for element in project.elements
             ):
                 raise ValueError("当前模型包含非 XY 圆弧，不能直接切换为二维建模。")
+            if any(
+                element.geometry.kind == "nurbs_curve"
+                and any(
+                    abs(point[2]) > _GEOMETRY_TOLERANCE
+                    for point in element.geometry.parameters["control_points"]
+                )
+                for element in project.elements
+            ):
+                raise ValueError("当前模型包含空间 NURBS 曲线，不能直接切换为二维建模。")
         elements = tuple(
             replace(
                 element,
@@ -832,11 +1008,17 @@ class PathBeamEditor:
         target = next((node for node in nodes if node.identifier == node_id), None)
         if target is None:
             raise KeyError(f"未知节点：{node_id}")
-        if any(
-            node_id in element.node_ids and element.geometry.kind != "line"
+        attached_curve_kinds = {
+            element.geometry.kind
             for element in elements
-        ):
-            raise ValueError("参数化圆弧端点由圆弧参数控制，请编辑圆弧半径、角度或平面。")
+            if node_id in element.node_ids and element.geometry.kind != "line"
+        }
+        if attached_curve_kinds:
+            if attached_curve_kinds == {"circular_arc"}:
+                raise ValueError(
+                    "参数化圆弧端点由圆弧参数控制，请编辑圆弧半径、角度或平面。"
+                )
+            raise ValueError("参数化曲线端点由曲线参数控制，请编辑曲线定义。")
         for node in nodes:
             if node.identifier != node_id and _distance(node.coordinates, coordinates) <= _GEOMETRY_TOLERANCE:
                 raise ValueError("两个结构节点不能位于同一位置。")
@@ -1007,11 +1189,12 @@ class PathBeamEditor:
         tangent,
         radius: float,
         sweep_degrees: float,
-        plane: str,
+        plane: str | None = None,
+        normal=None,
     ) -> tuple[BeamGeometryDefinition, tuple[float, float, float]]:
         radius = float(radius)
         sweep_degrees = float(sweep_degrees)
-        plane = str(plane).strip().lower()
+        plane = str(plane or "").strip().lower()
         if not isfinite(radius) or radius <= 0.0:
             raise ValueError("圆弧半径必须大于 0。")
         if (
@@ -1025,11 +1208,16 @@ class PathBeamEditor:
             "xz": (0.0, -1.0, 0.0),
             "yz": (1.0, 0.0, 0.0),
         }
-        if plane not in normals:
-            raise ValueError("圆弧平面必须是 XY、XZ 或 YZ。")
         start = tuple(float(value) for value in start)
         tangent = _normalize(tangent)
-        normal = normals[plane]
+        if normal is None:
+            if plane not in normals:
+                raise ValueError("圆弧平面必须是 XY、XZ、YZ 或提供空间法向。")
+            normal = normals[plane]
+        else:
+            normal = _normalize(normal)
+            if plane not in normals:
+                plane = PathBeamEditor._plane_label_from_normal(normal)
         if abs(_dot(tangent, normal)) > 1.0e-8:
             raise ValueError("所选圆弧平面必须包含当前路径末端切线。")
         turn_sign = 1.0 if sweep_degrees > 0.0 else -1.0
@@ -1064,17 +1252,100 @@ class PathBeamEditor:
         return geometry, end
 
     @staticmethod
+    def _plane_label_from_normal(normal) -> str:
+        normal = _normalize(normal)
+        if abs(abs(normal[2]) - 1.0) <= 1.0e-8:
+            return "xy"
+        if abs(abs(normal[1]) - 1.0) <= 1.0e-8:
+            return "xz"
+        if abs(abs(normal[0]) - 1.0) <= 1.0e-8:
+            return "yz"
+        return "custom"
+
+    @staticmethod
+    def _circular_arc_geometry_through_points(start, through, end):
+        start = tuple(float(value) for value in start)
+        through = tuple(float(value) for value in through)
+        end = tuple(float(value) for value in end)
+        if any(len(point) != 3 or not all(isfinite(value) for value in point) for point in (start, through, end)):
+            raise ValueError("三点圆弧的每个点必须包含三个有限坐标。")
+        first_chord = tuple(value - origin for value, origin in zip(through, start))
+        second_chord = tuple(value - origin for value, origin in zip(end, start))
+        plane_cross = _cross(first_chord, second_chord)
+        cross_squared = _dot(plane_cross, plane_cross)
+        scale = max(
+            _dot(first_chord, first_chord),
+            _dot(second_chord, second_chord),
+            1.0,
+        )
+        if cross_squared <= (_GEOMETRY_TOLERANCE * scale) ** 2:
+            raise ValueError("三点圆弧的三个点不能共线或重合。")
+        first_squared = _dot(first_chord, first_chord)
+        second_squared = _dot(second_chord, second_chord)
+        center_offset = tuple(
+            (
+                first_squared * left
+                + second_squared * right
+            )
+            / (2.0 * cross_squared)
+            for left, right in zip(
+                _cross(second_chord, plane_cross),
+                _cross(plane_cross, first_chord),
+            )
+        )
+        center = tuple(origin + offset for origin, offset in zip(start, center_offset))
+        start_vector = tuple(value - origin for value, origin in zip(start, center))
+        through_vector = tuple(value - origin for value, origin in zip(through, center))
+        end_vector = tuple(value - origin for value, origin in zip(end, center))
+        radius = sqrt(_dot(start_vector, start_vector))
+        normal = _normalize(plane_cross)
+
+        def positive_angle(vector):
+            angle = atan2(
+                _dot(normal, _cross(start_vector, vector)),
+                _dot(start_vector, vector),
+            )
+            return angle if angle >= 0.0 else angle + 2.0 * pi
+
+        through_angle = positive_angle(through_vector)
+        end_angle = positive_angle(end_vector)
+        if through_angle >= end_angle - 1.0e-10:
+            normal = tuple(-value for value in normal)
+            through_angle = positive_angle(through_vector)
+            end_angle = positive_angle(end_vector)
+        sweep_degrees = degrees(end_angle)
+        if not 1.0e-9 < sweep_degrees < 360.0 - 1.0e-9:
+            raise ValueError("三点圆弧无法形成有效的开放圆弧。")
+        geometry = BeamGeometryDefinition(
+            kind="circular_arc",
+            parameters={
+                "radius": radius,
+                "sweep_degrees": sweep_degrees,
+                "plane": PathBeamEditor._plane_label_from_normal(normal),
+                "center": center,
+                "normal": normal,
+                "start_vector": start_vector,
+            },
+        )
+        return geometry, start, end
+
+    @staticmethod
     def append_circular_arc(
         project: ProjectDocument,
         *,
         radius: float,
         sweep_degrees: float,
         plane: str | None = None,
+        normal=None,
         endpoint_id: str | None = None,
     ) -> ProjectDocument:
         plane = "xy" if project.modeling_space == "2d" else str(plane or "xy").lower()
         if project.modeling_space == "2d" and plane != "xy":
             raise ValueError("二维建模只能追加 XY 平面圆弧。")
+        if project.modeling_space == "2d" and normal is not None:
+            normalized = _normalize(normal)
+            if abs(abs(normalized[2]) - 1.0) > 1.0e-8:
+                raise ValueError("二维建模只能追加 XY 平面圆弧。")
         nodes, _elements, endpoint, adjacent, tangent, prepend = (
             PathBeamEditor._path_endpoint_context(project, endpoint_id)
         )
@@ -1084,6 +1355,7 @@ class PathBeamEditor:
             radius=radius,
             sweep_degrees=sweep_degrees,
             plane=plane,
+            normal=normal,
         )
         if any(
             _distance(node.coordinates, end) <= _GEOMETRY_TOLERANCE
@@ -1098,6 +1370,70 @@ class PathBeamEditor:
             family=PathBeamEditor._family_for_geometry(
                 project.modeling_space,
                 "circular_arc",
+            ),
+            geometry=geometry,
+        )
+        if prepend:
+            return project.revised(
+                nodes=(new_node,) + project.nodes,
+                elements=(new_element,) + project.elements,
+            )
+        return project.revised(
+            nodes=project.nodes + (new_node,),
+            elements=project.elements + (new_element,),
+        )
+
+    @staticmethod
+    def append_nurbs_curve(
+        project: ProjectDocument,
+        *,
+        control_points,
+        degree: int | None = None,
+        weights=None,
+        knots=None,
+        endpoint_id: str | None = None,
+    ) -> ProjectDocument:
+        points = tuple(tuple(float(value) for value in point) for point in control_points)
+        if len(points) < 2:
+            raise ValueError("追加空间曲线至少需要起点和终点两个控制点。")
+        if any(len(point) != 3 or not all(isfinite(value) for value in point) for point in points):
+            raise ValueError("空间曲线控制点必须包含三个有限坐标。")
+        if project.modeling_space == "2d" and any(
+            abs(point[2]) > _GEOMETRY_TOLERANCE for point in points
+        ):
+            project = PathBeamEditor.set_modeling_space(project, "3d")
+        nodes, _elements, endpoint, adjacent, _tangent, prepend = (
+            PathBeamEditor._path_endpoint_context(project, endpoint_id)
+        )
+        if _distance(points[0], endpoint.coordinates) > _GEOMETRY_TOLERANCE:
+            raise ValueError("追加空间曲线的第一个控制点必须是所选路径端点。")
+        if any(
+            _distance(node.coordinates, points[-1]) <= _GEOMETRY_TOLERANCE
+            for node in nodes
+        ):
+            raise ValueError("追加空间曲线的终点与已有节点重合。")
+        curve_degree = _nurbs_degree(degree, len(points))
+        geometry = BeamGeometryDefinition(
+            kind="nurbs_curve",
+            parameters={
+                "degree": curve_degree,
+                "control_points": points,
+                "weights": (1.0,) * len(points) if weights is None else tuple(weights),
+                "knots": (
+                    clamped_uniform_knots(len(points), curve_degree)
+                    if knots is None
+                    else tuple(knots)
+                ),
+            },
+        )
+        new_node = StructuralNode(new_entity_id("node"), points[-1])
+        new_element = PathBeamEditor._new_element(
+            project,
+            (endpoint.identifier, new_node.identifier),
+            template=adjacent,
+            family=PathBeamEditor._family_for_geometry(
+                project.modeling_space,
+                "nurbs_curve",
             ),
             geometry=geometry,
         )
@@ -1167,7 +1503,7 @@ class PathBeamEditor:
         if original is None:
             raise KeyError(f"未知梁单元：{element_id}")
         if original.geometry.kind != "line":
-            raise ValueError("参数化圆弧保持为单个几何实体，不在建模阶段拆分为梁段。")
+            raise ValueError("参数化曲线保持为单个几何实体，不在建模阶段拆分为梁段。")
         point = PathBeamEditor.point_on_element(project, original, split)
         new_node = StructuralNode(new_entity_id("node"), point)
         first = replace(
@@ -1238,7 +1574,7 @@ class PathBeamEditor:
                 element.geometry.kind != "line"
                 for element in (left_element, right_element)
             ):
-                raise ValueError("不能通过删除节点合并参数化圆弧，请直接编辑圆弧参数。")
+                raise ValueError("不能通过删除节点合并参数化曲线，请直接编辑曲线定义。")
             removed_element_ids.update((left_element.identifier, right_element.identifier))
             left_node = nodes[node_index - 1]
             right_node = nodes[node_index + 1]
@@ -1330,13 +1666,17 @@ class PathBeamEditor:
         ) if surface_angle_degrees is None else float(surface_angle_degrees)
         bound_a = max(0.0, xi - 0.15)
         bound_b = min(1.0, xi + 0.15)
-        length = PathBeamEditor.element_length(project, element)
         label = PathBeamEditor._next_sensor_label(project)
         attachment = SensorAttachment(
             entity_id=element.identifier,
             local_coordinates=(xi,),
             surface_side=side,
-            gauge_length=(bound_b - bound_a) * length,
+            gauge_length=PathBeamEditor.element_arc_length(
+                project,
+                element,
+                bound_a,
+                bound_b,
+            ),
             integration_bounds=(bound_a, bound_b),
             surface_angle_degrees=surface_angle,
             orientation_angle_degrees=orientation_angle_degrees,
@@ -1383,22 +1723,46 @@ class PathBeamEditor:
         if not 0.0 <= xi <= 1.0:
             raise ValueError("测点局部坐标必须位于 [0, 1]。")
         angle = float(surface_angle_degrees) % 360.0
-        source_length = PathBeamEditor.element_length(
-            project,
-            sensor.attachment.entity_id,
-        )
         target_length = PathBeamEditor.element_length(project, element)
         source_a, source_b = sensor.attachment.integration_bounds
         source_xi = sensor.attachment.local_coordinates[0]
-        source_span = max((source_b - source_a) * source_length, 0.0)
+        source_span = PathBeamEditor.element_arc_length(
+            project,
+            sensor.attachment.entity_id,
+            source_a,
+            source_b,
+        )
         if source_a <= source_xi <= source_b and source_span > _GEOMETRY_TOLERANCE:
-            left_fraction = (source_xi - source_a) / (source_b - source_a)
+            left_length = PathBeamEditor.element_arc_length(
+                project,
+                sensor.attachment.entity_id,
+                source_a,
+                source_xi,
+            )
+            right_length = PathBeamEditor.element_arc_length(
+                project,
+                sensor.attachment.entity_id,
+                source_xi,
+                source_b,
+            )
         else:
-            left_fraction = 0.5
-        left_length = source_span * left_fraction
-        right_length = source_span - left_length
-        bound_a = max(0.0, xi - left_length / target_length)
-        bound_b = min(1.0, xi + right_length / target_length)
+            left_length = right_length = 0.5 * source_span
+        target_center = PathBeamEditor.element_arc_length(
+            project,
+            element,
+            0.0,
+            xi,
+        )
+        bound_a = PathBeamEditor.element_parameter_at_length(
+            project,
+            element,
+            max(0.0, target_center - left_length),
+        )
+        bound_b = PathBeamEditor.element_parameter_at_length(
+            project,
+            element,
+            min(target_length, target_center + right_length),
+        )
         if bound_b - bound_a <= 1.0e-9:
             half_span = min(0.15, max(1.0e-6, source_span / target_length * 0.5))
             bound_a = max(0.0, xi - half_span)
@@ -1409,7 +1773,12 @@ class PathBeamEditor:
             entity_id=element.identifier,
             local_coordinates=(xi,),
             surface_side=side,
-            gauge_length=(bound_b - bound_a) * target_length,
+            gauge_length=PathBeamEditor.element_arc_length(
+                project,
+                element,
+                bound_a,
+                bound_b,
+            ),
             integration_bounds=(bound_a, bound_b),
             surface_angle_degrees=angle,
         )
@@ -1612,13 +1981,17 @@ class PathBeamEditor:
             if orientation_angle_degrees is None
             else float(orientation_angle_degrees)
         )
-        length = PathBeamEditor.element_length(project, element)
         attachment = SensorAttachment(
             entity_id=element.identifier,
             local_coordinates=(xi,),
             surface_side=side,
             direction=tuple(float(value) for value in direction),
-            gauge_length=(bound_b - bound_a) * length,
+            gauge_length=PathBeamEditor.element_arc_length(
+                project,
+                element,
+                bound_a,
+                bound_b,
+            ),
             integration_bounds=(bound_a, bound_b),
             surface_angle_degrees=surface_angle,
             orientation_angle_degrees=orientation_angle,
@@ -1886,6 +2259,103 @@ class PathBeamEditor:
         return replace(blank, elements=(element,))
 
     @staticmethod
+    def create_circular_arc_through_points(
+        project: ProjectDocument,
+        *,
+        start,
+        through,
+        end,
+    ) -> ProjectDocument:
+        geometry, start, end = PathBeamEditor._circular_arc_geometry_through_points(
+            start,
+            through,
+            end,
+        )
+        modeling_space = (
+            "2d"
+            if geometry.parameters["plane"] == "xy"
+            and all(abs(point[2]) <= _GEOMETRY_TOLERANCE for point in (start, through, end))
+            else "3d"
+        )
+        nodes = (
+            StructuralNode(new_entity_id("node"), start),
+            StructuralNode(new_entity_id("node"), end),
+        )
+        blank = project.revised(
+            modeling_space=modeling_space,
+            nodes=nodes,
+            elements=(),
+            sensors=(),
+            boundary_conditions=(),
+        )
+        element = PathBeamEditor._new_element(
+            blank,
+            (nodes[0].identifier, nodes[1].identifier),
+            family=PathBeamEditor._family_for_geometry(
+                modeling_space,
+                "circular_arc",
+            ),
+            geometry=geometry,
+        )
+        return replace(blank, elements=(element,))
+
+    @staticmethod
+    def create_nurbs_curve(
+        project: ProjectDocument,
+        *,
+        control_points,
+        degree: int | None = None,
+        weights=None,
+        knots=None,
+    ) -> ProjectDocument:
+        points = tuple(tuple(float(value) for value in point) for point in control_points)
+        if len(points) < 2:
+            raise ValueError("空间曲线至少需要两个控制点。")
+        if any(len(point) != 3 or not all(isfinite(value) for value in point) for point in points):
+            raise ValueError("空间曲线控制点必须包含三个有限坐标。")
+        curve_degree = _nurbs_degree(degree, len(points))
+        geometry = BeamGeometryDefinition(
+            kind="nurbs_curve",
+            parameters={
+                "degree": curve_degree,
+                "control_points": points,
+                "weights": (1.0,) * len(points) if weights is None else tuple(weights),
+                "knots": (
+                    clamped_uniform_knots(len(points), curve_degree)
+                    if knots is None
+                    else tuple(knots)
+                ),
+            },
+        )
+        modeling_space = (
+            "3d"
+            if project.modeling_space == "3d"
+            or any(abs(point[2]) > _GEOMETRY_TOLERANCE for point in points)
+            else "2d"
+        )
+        nodes = (
+            StructuralNode(new_entity_id("node"), points[0]),
+            StructuralNode(new_entity_id("node"), points[-1]),
+        )
+        blank = project.revised(
+            modeling_space=modeling_space,
+            nodes=nodes,
+            elements=(),
+            sensors=(),
+            boundary_conditions=(),
+        )
+        element = PathBeamEditor._new_element(
+            blank,
+            (nodes[0].identifier, nodes[1].identifier),
+            family=PathBeamEditor._family_for_geometry(
+                modeling_space,
+                "nurbs_curve",
+            ),
+            geometry=geometry,
+        )
+        return replace(blank, elements=(element,))
+
+    @staticmethod
     def _circular_arc_geometry(
         *,
         radius: float,
@@ -1938,6 +2408,7 @@ class PathBeamEditor:
         radius: float,
         sweep_degrees: float,
         plane: str,
+        normal=None,
     ) -> ProjectDocument:
         if project.modeling_space == "2d" and str(plane).lower() != "xy":
             project = PathBeamEditor.set_modeling_space(project, "3d")
@@ -1950,7 +2421,9 @@ class PathBeamEditor:
             and node_a.identifier in candidate.node_ids
             for candidate in project.elements
         )
-        if has_connected_entry:
+        if str(plane).lower() == "custom" and normal is None:
+            normal = element.geometry.parameters["normal"]
+        if has_connected_entry or str(plane).lower() == "custom":
             start_tangent = PathBeamEditor.tangent_on_element(project, element, 0.0)
             geometry, end = PathBeamEditor._oriented_circular_arc_geometry(
                 start=node_a.coordinates,
@@ -1958,6 +2431,7 @@ class PathBeamEditor:
                 radius=radius,
                 sweep_degrees=sweep_degrees,
                 plane=plane,
+                normal=normal,
             )
         else:
             geometry, _start, end = PathBeamEditor._circular_arc_geometry(
@@ -2030,6 +2504,22 @@ class PathBeamEditor:
                     candidate,
                     geometry=BeamGeometryDefinition(
                         kind="circular_arc",
+                        parameters=parameters,
+                    ),
+                )
+            elif (
+                candidate.geometry.kind == "nurbs_curve"
+                and set(candidate.node_ids).issubset(moved_node_ids)
+            ):
+                parameters = dict(candidate.geometry.parameters)
+                parameters["control_points"] = tuple(
+                    tuple(value + offset for value, offset in zip(point, translation))
+                    for point in parameters["control_points"]
+                )
+                candidate = replace(
+                    candidate,
+                    geometry=BeamGeometryDefinition(
+                        kind="nurbs_curve",
                         parameters=parameters,
                     ),
                 )
@@ -2131,9 +2621,18 @@ class PathBeamEditor:
         else:
             if modeling_space == "2d":
                 if mixed_geometry:
-                    kind = "二维直线/圆弧组合梁"
+                    kind = (
+                        "二维直线/圆弧组合梁"
+                        if set(geometry_kinds) == {"line", "circular_arc"}
+                        else "二维直线/曲线组合梁"
+                    )
                 elif has_curves:
-                    kind = "二维圆弧梁" if len(elements) == 1 else "二维曲梁"
+                    if len(elements) == 1 and geometry_kinds == ("circular_arc",):
+                        kind = "二维圆弧梁"
+                    elif len(elements) == 1 and geometry_kinds == ("nurbs_curve",):
+                        kind = "二维样条曲梁"
+                    else:
+                        kind = "二维曲梁"
                 elif collinear:
                     kind = "二维直梁"
                 else:
@@ -2145,9 +2644,17 @@ class PathBeamEditor:
                 )
             else:
                 if mixed_geometry:
-                    kind = "三维直线/圆弧组合梁"
+                    kind = (
+                        "三维直线/圆弧组合梁"
+                        if set(geometry_kinds) == {"line", "circular_arc"}
+                        else "三维直线/曲线组合梁"
+                    )
                 elif has_curves:
-                    kind = "三维曲梁"
+                    kind = (
+                        "三维样条曲梁"
+                        if len(elements) == 1 and geometry_kinds == ("nurbs_curve",)
+                        else "三维曲梁"
+                    )
                 elif collinear:
                     kind = "三维直梁"
                 else:
