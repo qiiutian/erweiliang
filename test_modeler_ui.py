@@ -119,29 +119,33 @@ class ModelerUiTests(unittest.TestCase):
         self.assertTrue(window.measurement_editor.header_action_button.toolTip())
         window.close()
 
-    def test_single_algorithm_remains_visible_as_user_selected_method(self):
+    def test_single_algorithm_uses_card_without_redundant_selector(self):
         window = gui_qt.ReconstructionMainWindow()
         setup = window.analysis_setup
 
-        self.assertFalse(setup.algorithm_selector_row.isHidden())
-        self.assertEqual(setup.algorithm_selector.count(), 1)
+        self.assertTrue(setup.algorithm_selector_row.isHidden())
+        self.assertEqual(setup.algorithm_selector.count(), 0)
         self.assertEqual(
-            setup.algorithm_selector.currentData(),
+            setup.active_algorithm_id,
             BeamSurfaceIntegralAlgorithm.metadata.identifier,
         )
-        self.assertIn("可求解", setup.algorithm_selector.currentText())
+        self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
         self.assertEqual(setup.algorithm_state_label.text(), "可求解")
         self.assertEqual(
             setup.algorithm_name_label.text(),
             BeamSurfaceIntegralAlgorithm.metadata.display_name,
         )
-        self.assertEqual(setup.method_card.accessibleName(), "重构方法")
-        self.assertEqual(setup.algorithm_selector_label.text(), "重构方法")
+        self.assertEqual(setup.method_card.accessibleName(), "当前重构方法")
+        self.assertEqual(setup.algorithm_selector_label.text(), "切换方法")
         self.assertEqual(
             window.analysis_metric_title_labels["solver"].text(),
             "重构方法",
         )
-        self.assertIn("可求解", setup.algorithm_selector.toolTip())
+        self.assertIn("仅安装此方法", setup.algorithm_feedback_label.text())
+        self.assertIn(
+            BeamSurfaceIntegralAlgorithm.metadata.display_name,
+            setup.method_card.accessibleDescription(),
+        )
         self.assertIn(
             "不会改变用户设置的积分区间",
             setup.parameter_editor("gauss_n").toolTip(),
@@ -257,11 +261,12 @@ class ModelerUiTests(unittest.TestCase):
         self.assertTrue(editor.hasFocus())
         window.close()
 
-    def test_rank_deficiency_marks_method_unsolvable_and_focuses_selector(self):
+    def test_rank_deficiency_marks_method_unsolvable_and_focuses_method_card(self):
         window = gui_qt.ReconstructionMainWindow()
         window.show()
         self.app.processEvents()
-        rows = window.measurement_editor.get_rows()
+        original_rows = window.measurement_editor.get_rows()
+        rows = [dict(row) for row in original_rows]
         for row in rows:
             row["surface"] = "top"
         window.measurement_editor.set_rows(rows)
@@ -282,10 +287,7 @@ class ModelerUiTests(unittest.TestCase):
             "秩",
             window.analysis_setup.algorithm_feedback_label.text(),
         )
-        self.assertIn(
-            "不可求解",
-            window.analysis_setup.algorithm_selector.currentText(),
-        )
+        self.assertTrue(window.analysis_setup.algorithm_selector_row.isHidden())
         self.assertIn("不可求解", window.input_status_label.text())
         self.assertEqual(
             window.run_status_label.text(),
@@ -297,7 +299,19 @@ class ModelerUiTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertEqual(window.left_tabs.currentIndex(), 0)
-        self.assertTrue(window.analysis_setup.algorithm_selector.hasFocus())
+        self.assertTrue(window.analysis_setup.method_card.hasFocus())
+
+        window.measurement_editor.set_rows(original_rows)
+        window._refresh_input_readiness()
+
+        self.assertFalse(
+            window.analysis_setup.method_card.property("validationState")
+        )
+        self.assertNotIn("秩", window.analysis_setup.method_card.toolTip())
+        self.assertEqual(
+            window.analysis_setup.algorithm_state_label.text(),
+            "可求解",
+        )
         window.close()
 
     def test_stale_result_is_preserved_and_visibly_marked_until_rerun(self):
@@ -845,15 +859,33 @@ class ModelerUiTests(unittest.TestCase):
             default_algorithm_id=primary.metadata.identifier,
         )
         window = gui_qt.ReconstructionMainWindow(analysis_service=service)
+        window.show()
+        self.app.processEvents()
         setup = window.analysis_setup
 
         self.assertFalse(setup.algorithm_selector_row.isHidden())
-        self.assertEqual(setup.algorithm_selector.count(), 2)
+        self.assertEqual(setup.algorithm_selector_label.text(), "切换方法")
+        self.assertEqual(
+            setup.algorithm_selector.placeholderText(),
+            "选择其他重构方法…",
+        )
+        self.assertEqual(
+            setup.algorithm_selector.accessibleName(),
+            "切换重构方法",
+        )
         self.assertIn(
-            "可求解",
-            setup.algorithm_selector.itemText(
-                setup.algorithm_selector.findData(primary.metadata.identifier)
-            ),
+            primary.metadata.display_name,
+            setup.algorithm_selector.accessibleDescription(),
+        )
+        self.assertIs(
+            setup.algorithm_selector_label.buddy(),
+            setup.algorithm_selector,
+        )
+        self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
+        self.assertEqual(setup.algorithm_selector.count(), 1)
+        self.assertEqual(
+            setup.algorithm_selector.findData(primary.metadata.identifier),
+            -1,
         )
         self.assertIn(
             "适用",
@@ -864,10 +896,36 @@ class ModelerUiTests(unittest.TestCase):
         alternate_index = setup.algorithm_selector.findData(
             alternate.metadata.identifier
         )
-        setup.algorithm_selector.setCurrentIndex(alternate_index)
+        self.assertEqual(alternate_index, 0)
+        project_before_wheel = window.current_project_document
+        parameters_before_wheel = setup.parameter_values()
+        window.run_button.setFocus()
+        selector_position = setup.algorithm_selector.mapTo(
+            window,
+            setup.algorithm_selector.rect().center(),
+        )
+        QTest.wheelEvent(
+            window.windowHandle(),
+            selector_position,
+            QPoint(0, -120),
+        )
+        self.app.processEvents()
+        self.assertEqual(setup.active_algorithm_id, primary.metadata.identifier)
+        self.assertEqual(window.current_project_document, project_before_wheel)
+        self.assertEqual(setup.parameter_values(), parameters_before_wheel)
+        self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
+
+        setup.algorithm_selector.setFocus()
+        QTest.keyClick(setup.algorithm_selector, Qt.Key.Key_Down)
+        self.app.processEvents()
         self.assertEqual(
             setup.active_algorithm_id,
             alternate.metadata.identifier,
+        )
+        self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
+        self.assertGreaterEqual(
+            setup.algorithm_selector.findData(primary.metadata.identifier),
+            0,
         )
         self.assertEqual(
             window.analysis_metric_labels["solver"].text(),
@@ -1020,7 +1078,14 @@ class ModelerUiTests(unittest.TestCase):
         selector = window.analysis_setup.algorithm_selector
 
         self.assertFalse(window.analysis_setup.algorithm_selector_row.isHidden())
-        self.assertEqual(selector.count(), 3)
+        self.assertEqual(
+            window.analysis_setup.algorithm_selector_label.text(),
+            "替代方法",
+        )
+        self.assertEqual(selector.placeholderText(), "选择替代重构方法…")
+        self.assertEqual(selector.accessibleName(), "选择替代重构方法")
+        self.assertEqual(selector.currentIndex(), -1)
+        self.assertEqual(selector.count(), 2)
         primary_index = selector.findData(primary.metadata.identifier)
         spatial_index = selector.findData(spatial_only.metadata.identifier)
         self.assertIn("适用", selector.itemText(primary_index))
@@ -1190,9 +1255,9 @@ class ModelerUiTests(unittest.TestCase):
 
         self.assertEqual(setup.recovery_status, setup.RECOVERY_SCHEMA)
         self.assertFalse(setup.accept_current_button.isHidden())
-        self.assertFalse(setup.algorithm_selector_row.isHidden())
-        self.assertEqual(setup.algorithm_selector.count(), 1)
-        self.assertIsNone(setup.algorithm_selector.itemData(0))
+        self.assertTrue(setup.algorithm_selector_row.isHidden())
+        self.assertEqual(setup.algorithm_selector.count(), 0)
+        self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
         self.assertFalse(setup.is_compatible)
         self.assertEqual(window._project_for_save().analysis_cases[0], original_case)
 
@@ -1356,22 +1421,15 @@ class ModelerUiTests(unittest.TestCase):
             setup.parameter_values(),
             {"gauss_n": 4, "points_per_element": 160},
         )
-        self.assertGreaterEqual(
+        self.assertEqual(
             setup.algorithm_selector.findData(primary.metadata.identifier),
-            0,
+            -1,
         )
         self.assertGreaterEqual(
             setup.algorithm_selector.findData(alternative.metadata.identifier),
             0,
         )
-        restored_index = setup.algorithm_selector.currentIndex()
-        self.assertEqual(
-            setup.algorithm_selector.toolTip(),
-            setup.algorithm_selector.itemData(
-                restored_index,
-                Qt.ItemDataRole.ToolTipRole,
-            ),
-        )
+        self.assertEqual(setup.algorithm_selector.currentIndex(), -1)
         self.assertIn(primary.metadata.display_name, setup.algorithm_selector.toolTip())
         self.assertNotIn(
             alternative.metadata.display_name,

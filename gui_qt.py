@@ -831,6 +831,10 @@ QFrame#analysisMethodCard {
     border-left: 4px solid #4f705c;
     border-radius: 8px;
 }
+QFrame#analysisMethodCard:focus {
+    border-color: #6e94ae;
+    border-left-color: #2d6f91;
+}
 QLabel#algorithmName {
     color: #26372d;
     font-size: 14px;
@@ -1158,6 +1162,13 @@ QPlainTextEdit#jsonEditor {
     font-size: 12px;
 }
 """
+
+
+class NoWheelComboBox(QComboBox):
+    """Keep form scrolling from changing an action-style selection."""
+
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 class EditableTable(QWidget):
@@ -2110,7 +2121,8 @@ class AnalysisSetupWidget(QWidget):
 
         self.method_card = QFrame()
         self.method_card.setObjectName("analysisMethodCard")
-        self.method_card.setAccessibleName("重构方法")
+        self.method_card.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.method_card.setAccessibleName("当前重构方法")
         method_layout = QHBoxLayout(self.method_card)
         method_layout.setContentsMargins(11, 8, 9, 8)
         method_layout.setSpacing(9)
@@ -2137,10 +2149,10 @@ class AnalysisSetupWidget(QWidget):
         selector_layout = QHBoxLayout(self.algorithm_selector_row)
         selector_layout.setContentsMargins(0, 0, 0, 0)
         selector_layout.setSpacing(8)
-        self.algorithm_selector_label = QLabel("重构方法")
+        self.algorithm_selector_label = QLabel("切换方法")
         self.algorithm_selector_label.setObjectName("fieldLabel")
-        self.algorithm_selector = QComboBox()
-        self.algorithm_selector.setAccessibleName("重构方法")
+        self.algorithm_selector = NoWheelComboBox()
+        self.algorithm_selector.setAccessibleName("切换重构方法")
         self.algorithm_selector_label.setBuddy(self.algorithm_selector)
         self.algorithm_selector.currentIndexChanged.connect(
             self._on_algorithm_selected
@@ -2258,7 +2270,7 @@ class AnalysisSetupWidget(QWidget):
                 return self.accept_current_button
             if not self.algorithm_selector_row.isHidden():
                 return self.algorithm_selector
-            return self
+            return self.method_card
         prefix = "/analysis/parameters/"
         if not field_path.startswith(prefix):
             return None
@@ -2576,7 +2588,7 @@ class AnalysisSetupWidget(QWidget):
     def _sync_algorithm_selector_tooltip(self):
         index = self.algorithm_selector.currentIndex()
         tooltip = (
-            ""
+            self.algorithm_selector.property("selectionPromptToolTip") or ""
             if index < 0
             else self.algorithm_selector.itemData(index, Qt.ItemDataRole.ToolTipRole)
         )
@@ -2604,6 +2616,7 @@ class AnalysisSetupWidget(QWidget):
             self._sync_algorithm_selector_tooltip()
 
     def _configure_selector(self, algorithms, *, blocked):
+        algorithms = tuple(algorithms)
         self.algorithm_selector.blockSignals(True)
         self.algorithm_selector.clear()
         if blocked:
@@ -2612,24 +2625,38 @@ class AnalysisSetupWidget(QWidget):
                 for algorithm in algorithms
                 if algorithm.metadata.identifier != self._requested_algorithm_id
             ]
-            self.algorithm_selector.addItem("选择替代重构方法…", None)
-            self.algorithm_selector.setItemData(
-                0,
-                "当前项目绑定保持不变；选择后才会改绑到另一重构方法。",
-                Qt.ItemDataRole.ToolTipRole,
+            label = "替代方法"
+            placeholder = "选择替代重构方法…"
+            prompt_tooltip = (
+                "原项目工况保持不变；明确选择后才会改绑到另一重构方法。"
             )
-            for algorithm in candidates:
-                self._add_algorithm_option(algorithm)
-            self.algorithm_selector_row.setVisible(bool(algorithms))
         else:
-            for algorithm in algorithms:
-                self._add_algorithm_option(algorithm)
-            selected_index = self.algorithm_selector.findData(
-                self._active_algorithm_id
+            candidates = [
+                algorithm
+                for algorithm in algorithms
+                if algorithm.metadata.identifier != self._active_algorithm_id
+            ]
+            label = "切换方法"
+            placeholder = "选择其他重构方法…"
+            prompt_tooltip = (
+                f"当前使用 {self.active_algorithm_display_name}；"
+                "请选择要切换到的其他已安装方法。"
             )
-            if selected_index >= 0:
-                self.algorithm_selector.setCurrentIndex(selected_index)
-            self.algorithm_selector_row.setVisible(bool(algorithms))
+        self.algorithm_selector_label.setText(label)
+        self.algorithm_selector.setAccessibleName(
+            "选择替代重构方法" if blocked else "切换重构方法"
+        )
+        self.algorithm_selector.setAccessibleDescription(prompt_tooltip)
+        self.algorithm_selector.setPlaceholderText(placeholder)
+        self.algorithm_selector.setProperty(
+            "selectionPromptToolTip",
+            prompt_tooltip,
+        )
+        for algorithm in candidates:
+            self._add_algorithm_option(algorithm)
+        self.algorithm_selector.setCurrentIndex(-1)
+        self.algorithm_selector_row.setVisible(bool(candidates))
+        self.algorithm_selector.setEnabled(bool(candidates))
         self._sync_algorithm_selector_tooltip()
         self.algorithm_selector.blockSignals(False)
 
@@ -2989,9 +3016,6 @@ class AnalysisSetupWidget(QWidget):
         previous_state_style = self.algorithm_state_label.property("state")
         previous_accept_visible = not self.accept_current_button.isHidden()
         previous_panel_enabled = self.parameter_panel.isEnabled()
-        previous_selector_index = self.algorithm_selector.findData(previous_id)
-        if previous_selector_index < 0:
-            previous_selector_index = 0
         try:
             self._activate_algorithm(
                 identifier,
@@ -3019,7 +3043,7 @@ class AnalysisSetupWidget(QWidget):
             self._requested_algorithm_id = previous_requested_id
             self._parameter_issues = previous_parameter_issues
             self.algorithm_selector.blockSignals(True)
-            self.algorithm_selector.setCurrentIndex(previous_selector_index)
+            self.algorithm_selector.setCurrentIndex(-1)
             self.algorithm_selector.blockSignals(False)
             self._sync_algorithm_selector_tooltip()
 
@@ -3137,13 +3161,26 @@ class AnalysisSetupWidget(QWidget):
             )
         else:
             self._set_state("可求解", "ready")
-            self.algorithm_feedback_label.setText(
-                "当前重构方法的能力、输入、观测与约束检查均已通过。"
-            )
+            if len(self.analysis_service.registry.list()) == 1:
+                message = "当前仅安装此方法；能力与可解性检查均已通过。"
+            else:
+                message = "当前方法的能力与可解性检查均已通过。"
+            self.algorithm_feedback_label.setText(message)
             self._set_active_option_solvability(
                 "可求解",
                 "能力、输入、观测与约束检查均已通过。",
             )
+
+    def sync_accessibility(self):
+        details = [
+            self.algorithm_name_label.text().strip(),
+            self.algorithm_state_label.text().strip(),
+            self.algorithm_meta_label.text().strip(),
+            self.algorithm_feedback_label.text().strip(),
+        ]
+        self.method_card.setAccessibleDescription(
+            "；".join(item for item in details if item)
+        )
 
 
 class ReconstructionMainWindow(QMainWindow):
@@ -4331,6 +4368,7 @@ class ReconstructionMainWindow(QMainWindow):
             self.y_max_edit,
             self.thickness_scale_combo,
             self.display_settings_button,
+            self.analysis_setup.method_card,
             self.analysis_setup.algorithm_selector,
         ):
             self._set_validation_state(widget)
@@ -4461,6 +4499,7 @@ class ReconstructionMainWindow(QMainWindow):
 
         self._readiness_issues = issues
         self.analysis_setup.set_readiness_solvability(issues)
+        self.analysis_setup.sync_accessibility()
         self._update_readiness_tabs(tab_counts, tab_messages)
         if issues:
             has_solvability_issue = any(

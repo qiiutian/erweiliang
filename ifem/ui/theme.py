@@ -460,6 +460,10 @@ QFrame#analysisMethodCard, QFrame#metricCardPrimary {{
     border-color: {c['border']};
 }}
 QFrame#analysisMethodCard {{ border-left-color: {c['primary']}; }}
+QFrame#analysisMethodCard:focus {{
+    border-color: {c['focus']};
+    border-left-color: {c['focus']};
+}}
 QFrame#metricCard, QFrame#metricCardPrimary {{ border-right-color: {c['divider']}; }}
 QFrame#plotMetaBar, QFrame#modelerHeader, QFrame#modelerViewBar {{
     border-bottom-color: {c['divider']};
