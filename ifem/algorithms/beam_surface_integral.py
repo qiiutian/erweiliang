@@ -10,8 +10,11 @@ from ifem.domain.analysis import (
     AnalysisContext,
     AnalysisResult,
     CancellationToken,
+    DeformationRegime,
     InputValidationError,
     ProgressReporter,
+    ReconstructionState,
+    RotationRepresentation,
     ValidationReport,
 )
 from reconstruction import IBeam3SurfaceIntegralReconstruction2D
@@ -24,6 +27,7 @@ class BeamSurfaceIntegralAlgorithm:
         version="1.0.0",
         description="二维 Euler-Bernoulli 梁直接表面应变积分重构。",
         parameter_schema_version="1",
+        contract_version="1",
     )
     capabilities = AlgorithmCapabilities(
         model_dimensions=(1,),
@@ -34,6 +38,8 @@ class BeamSurfaceIntegralAlgorithm:
         modeling_spaces=("2d",),
         geometry_kinds=("line",),
         supports_mixed_geometry=False,
+        deformation_regimes=(DeformationRegime.SMALL.value,),
+        rotation_representations=(RotationRepresentation.ROTATION_VECTOR.value,),
     )
 
     def assess_project(self, project) -> ValidationReport:
@@ -68,12 +74,83 @@ class BeamSurfaceIntegralAlgorithm:
         from config_adapter import validate_config
 
         try:
-            validate_config(context.project_config)
+            validate_config(self._legacy_config(context))
         except InputValidationError as exc:
             return ValidationReport.invalid(str(exc), field=exc.field)
         except (KeyError, TypeError, ValueError) as exc:
             return ValidationReport.invalid(str(exc))
         return ValidationReport.valid()
+
+    @staticmethod
+    def _legacy_config(context: AnalysisContext) -> dict[str, Any]:
+        if context.project is not None:
+            from ifem.infrastructure.legacy_project import legacy_config_from_project
+
+            config = legacy_config_from_project(
+                context.project,
+                include_analysis_parameters=False,
+            )
+        elif context.project_config:
+            config = dict(context.project_config)
+        else:
+            raise InputValidationError("当前二维算法缺少工程输入。", field="/model")
+        for name in ("gauss_n", "points_per_element", "query_xs", "true_points"):
+            if name in context.parameters:
+                config[name] = context.parameters[name]
+        return config
+
+    @staticmethod
+    def _result_state(context: AnalysisContext, model) -> ReconstructionState:
+        project = context.project
+        if project is None:
+            node_ids = tuple(f"node-{index}" for index in range(model.n_nodes))
+            element_ids = tuple(f"element-{index}" for index in range(model.n_elems))
+            connectivity = tuple(
+                (node_ids[index], node_ids[index + 1])
+                for index in range(model.n_elems)
+            )
+        else:
+            from ifem.modeling.path_editor import PathBeamEditor
+
+            ordered_nodes = tuple(PathBeamEditor.ordered_nodes(project))
+            node_ids = tuple(node.identifier for node in ordered_nodes)
+            element_by_pair = {
+                frozenset(element.node_ids): element for element in project.elements
+            }
+            ordered_elements = tuple(
+                element_by_pair[frozenset((left.identifier, right.identifier))]
+                for left, right in zip(ordered_nodes, ordered_nodes[1:])
+            )
+            element_ids = tuple(element.identifier for element in ordered_elements)
+            connectivity = tuple(element.node_ids for element in ordered_elements)
+        reference_coordinates = tuple(
+            (float(value), 0.0, 0.0) for value in model.node_x
+        )
+        displacements = tuple(
+            (float(model.U[3 * index]), float(model.U[3 * index + 1]), 0.0)
+            for index in range(model.n_nodes)
+        )
+        rotations = tuple(
+            (0.0, 0.0, float(model.U[3 * index + 2]))
+            for index in range(model.n_nodes)
+        )
+        return ReconstructionState(
+            modeling_space="2d",
+            deformation_regime=DeformationRegime.SMALL.value,
+            node_ids=node_ids,
+            reference_coordinates=reference_coordinates,
+            displacements=displacements,
+            reference_frames=(
+                (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+            )
+            * model.n_nodes,
+            element_ids=element_ids,
+            connectivity=connectivity,
+            rotations=rotations,
+            rotation_representation=RotationRepresentation.ROTATION_VECTOR.value,
+            project_id=None if project is None else project.identifier,
+            project_revision=None if project is None else project.revision,
+        )
 
     def solve(
         self,
@@ -85,10 +162,7 @@ class BeamSurfaceIntegralAlgorithm:
         # The adapter delegates to the existing solver without changing its formulas.
         from config_adapter import build_model_inputs
 
-        config = dict(context.project_config)
-        for name in self.parameter_schema().get("properties", {}):
-            if name in context.parameters:
-                config[name] = context.parameters[name]
+        config = self._legacy_config(context)
         inputs = build_model_inputs(config)
         progress(0.15, "正在创建二维梁模型")
         cancellation.raise_if_cancelled()
@@ -113,5 +187,6 @@ class BeamSurfaceIntegralAlgorithm:
             algorithm_version=self.metadata.version,
             native_model=model,
             inputs=inputs,
+            state=self._result_state(context, model),
             diagnostics=("legacy_config_adapter",),
         )

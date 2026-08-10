@@ -55,6 +55,7 @@ class AlgorithmPluginTests(unittest.TestCase):
         self.assertEqual(len(algorithms), 1)
         algorithm = algorithms[0]
         self.assertEqual(algorithm.metadata.identifier, DEFAULT_ALGORITHM_ID)
+        self.assertEqual(algorithm.metadata.contract_version, "1")
         self.assertEqual(algorithm.capabilities.model_dimensions, (1,))
         self.assertIn("surface_axial_strain", algorithm.capabilities.measurement_types)
         self.assertIn("axial_stress", algorithm.capabilities.result_fields)
@@ -62,6 +63,10 @@ class AlgorithmPluginTests(unittest.TestCase):
         self.assertEqual(algorithm.capabilities.modeling_spaces, ("2d",))
         self.assertEqual(algorithm.capabilities.geometry_kinds, ("line",))
         self.assertFalse(algorithm.capabilities.supports_mixed_geometry)
+        self.assertEqual(
+            algorithm.capabilities.deformation_regimes,
+            ("small_deformation",),
+        )
 
     def test_algorithm_matching_uses_space_geometry_and_project_constraints(self):
         algorithm = self.service.registry.list()[0]

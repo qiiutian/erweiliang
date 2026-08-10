@@ -1,14 +1,21 @@
 """UI-independent domain contracts."""
 
 from ifem.domain.analysis import (
+    LEGACY_RECONSTRUCTION_CONTRACT_VERSION,
+    RECONSTRUCTION_CONTRACT_VERSION,
     AlgorithmCapabilities,
     AlgorithmMetadata,
     AnalysisCancelled,
     AnalysisContext,
     AnalysisResult,
     CancellationToken,
+    DeformationRegime,
     InputValidationError,
+    ProjectAnalysisRequest,
+    ReconstructionState,
     ReconstructionAlgorithm,
+    ResultField,
+    RotationRepresentation,
     ValidationIssue,
     ValidationReport,
 )
@@ -29,14 +36,21 @@ from ifem.domain.project import (
 )
 
 __all__ = [
+    "LEGACY_RECONSTRUCTION_CONTRACT_VERSION",
+    "RECONSTRUCTION_CONTRACT_VERSION",
     "AlgorithmCapabilities",
     "AlgorithmMetadata",
     "AnalysisCancelled",
     "AnalysisContext",
     "AnalysisResult",
     "CancellationToken",
+    "DeformationRegime",
     "InputValidationError",
+    "ProjectAnalysisRequest",
+    "ReconstructionState",
     "ReconstructionAlgorithm",
+    "ResultField",
+    "RotationRepresentation",
     "ValidationIssue",
     "ValidationReport",
     "CURRENT_PROJECT_SCHEMA_VERSION",

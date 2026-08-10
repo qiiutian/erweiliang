@@ -173,6 +173,7 @@ def legacy_config_from_project(
     project: ProjectDocument,
     *,
     include_analysis_parameters: bool = True,
+    analysis_case_id: str | None = None,
 ) -> dict[str, Any]:
     if project.modeling_space != "2d":
         raise ValueError("当前二维梁算法不支持三维建模空间。")
@@ -233,15 +234,22 @@ def legacy_config_from_project(
         )
 
     analysis = None
-    if project.active_analysis_id is not None:
-        analysis = next(
-            item for item in project.analysis_cases if item.identifier == project.active_analysis_id
-        )
-    elif project.analysis_cases:
-        analysis = project.analysis_cases[0]
+    if include_analysis_parameters:
+        requested_analysis_id = analysis_case_id or project.active_analysis_id
+        if requested_analysis_id is not None:
+            analysis = next(
+                (
+                    item
+                    for item in project.analysis_cases
+                    if item.identifier == requested_analysis_id
+                ),
+                None,
+            )
+            if analysis is None:
+                raise KeyError(f"项目中不存在分析工况：{requested_analysis_id}")
+        elif project.analysis_cases:
+            analysis = project.analysis_cases[0]
     parameters = {} if analysis is None else dict(analysis.parameters)
-    if not include_analysis_parameters:
-        parameters = {}
 
     config = {
         "node_x": node_x,

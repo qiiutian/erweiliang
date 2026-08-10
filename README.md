@@ -102,3 +102,4 @@ PYTHONDONTWRITEBYTECODE=1 \
 - `ifem/ui/modeler_3d.py`：PyVistaQt/VTK 三维几何预览与拾取。
 - `visualization_data.py`：结构模型与结果帧的可视化中间层。
 - `visualization_3d.py`：PyVistaQt/VTK 三维结果视图，仅显示结构与结果场。
+- `docs/RECONSTRUCTION_ALGORITHM_API.md`：二维/三维、小/大变形重构插件的统一接入契约。

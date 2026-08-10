@@ -3,6 +3,7 @@
 from ifem.application.algorithm_matching import (
     AlgorithmMatch,
     ModelFeatureProfile,
+    assess_project_algorithm,
     match_project_algorithms,
     profile_project,
 )
@@ -21,6 +22,7 @@ from ifem.application.analysis_service import (
 __all__ = [
     "AlgorithmMatch",
     "ModelFeatureProfile",
+    "assess_project_algorithm",
     "match_project_algorithms",
     "profile_project",
     "DEFAULT_ALGORITHM_ID",
