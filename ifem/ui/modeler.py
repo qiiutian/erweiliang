@@ -105,6 +105,32 @@ QPushButton#modelerModeButton:checked {
     background: #365b49;
     border-color: #365b49;
 }
+QFrame#pathKindSelector {
+    background: transparent;
+    border: none;
+}
+QPushButton#pathKindStart, QPushButton#pathKindEnd {
+    min-width: 58px;
+    min-height: 28px;
+    padding: 0 11px;
+    border: 1px solid #cfd9d2;
+    border-radius: 0;
+}
+QPushButton#pathKindStart {
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
+    border-right: none;
+}
+QPushButton#pathKindEnd {
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+QPushButton#pathKindStart:checked, QPushButton#pathKindEnd:checked {
+    font-weight: 700;
+}
+QLabel#pathParameterLabel {
+    font-weight: 600;
+}
 QPushButton#modelerToolButton, QPushButton#modelerFileButton,
 QPushButton#modelerPathButton {
     min-height: 30px;
@@ -119,6 +145,9 @@ QPushButton#modelerPathButton:hover {
     color: #2f5945;
     background: #eef4f0;
     border-color: #9eafa3;
+}
+QPushButton#modelerPathButton[primaryAction="true"] {
+    font-weight: 700;
 }
 QPushButton#modelerDangerButton {
     min-height: 30px;
@@ -270,6 +299,13 @@ class ElidedLabel(QLabel):
         )
         if displayed != QLabel.text(self):
             QLabel.setText(self, displayed)
+
+
+class CompactDoubleSpinBox(QDoubleSpinBox):
+    """Keep engineering values precise without displaying padded zeroes."""
+
+    def textFromValue(self, value):
+        return f"{float(value):.10g}"
 
 
 class SectionProfilePreview(QWidget):
@@ -1249,7 +1285,7 @@ class BeamModelerDialog(QDialog):
         self._loading_section = False
         self.undo_stack = QUndoStack(self)
         self._build_ui()
-        self._apply_project(project)
+        self._apply_project(project, seed_generator=True)
 
     @property
     def project(self) -> ProjectDocument:
@@ -1543,45 +1579,98 @@ class BeamModelerDialog(QDialog):
         space_divider.setFrameShape(QFrame.Shape.VLine)
         space_divider.setFixedHeight(24)
         parameter_row.addWidget(space_divider)
-        path_label = QLabel("路径")
-        path_label.setObjectName("toolbarLabel")
-        parameter_row.addWidget(path_label)
-        self.geometry_combo = QComboBox()
+        self.path_generator_label = QLabel("快速生成")
+        self.path_generator_label.setObjectName("toolbarLabel")
+        parameter_row.addWidget(self.path_generator_label)
+        self.geometry_combo = QComboBox(generator)
         self.geometry_combo.addItem("直线段", "straight")
         self.geometry_combo.addItem("解析圆弧段", "arc")
         self.geometry_combo.currentIndexChanged.connect(self._generator_kind_changed)
-        parameter_row.addWidget(self.geometry_combo)
+        self.geometry_combo.hide()
+
+        path_kind_selector = QFrame()
+        path_kind_selector.setObjectName("pathKindSelector")
+        path_kind_layout = QHBoxLayout(path_kind_selector)
+        path_kind_layout.setContentsMargins(0, 0, 0, 0)
+        path_kind_layout.setSpacing(0)
+        self.path_kind_group = QButtonGroup(self)
+        self.path_kind_group.setExclusive(True)
+        self.path_kind_buttons = {}
+        for index, (kind, text) in enumerate((("straight", "直线"), ("arc", "圆弧"))):
+            button = QPushButton(text)
+            button.setObjectName("pathKindStart" if index == 0 else "pathKindEnd")
+            button.setCheckable(True)
+            button.setAccessibleName(f"路径几何类型：{text}")
+            button.setToolTip(
+                "创建或追加直线梁段"
+                if kind == "straight"
+                else "创建或追加保持解析定义的圆弧梁段"
+            )
+            button.clicked.connect(
+                lambda _checked=False, value=kind: self._select_generator_kind(value)
+            )
+            self.path_kind_group.addButton(button)
+            self.path_kind_buttons[kind] = button
+            path_kind_layout.addWidget(button)
+        self.path_kind_buttons["straight"].setChecked(True)
+        parameter_row.addWidget(path_kind_selector)
+
         self.primary_label = QLabel("梁长")
+        self.primary_label.setObjectName("pathParameterLabel")
         parameter_row.addWidget(self.primary_label)
-        self.primary_spin = QDoubleSpinBox()
+        self.primary_spin = CompactDoubleSpinBox()
         self.primary_spin.setRange(0.001, 1.0e9)
-        self.primary_spin.setDecimals(6)
+        self.primary_spin.setDecimals(10)
+        self.primary_spin.setSingleStep(0.1)
         self.primary_spin.setSuffix(" m")
-        self.primary_spin.setMinimumWidth(125)
+        self.primary_spin.setMinimumWidth(112)
+        self.primary_spin.setMaximumWidth(148)
+        self.primary_label.setBuddy(self.primary_spin)
         parameter_row.addWidget(self.primary_spin)
         self.secondary_label = QLabel("圆心角")
+        self.secondary_label.setObjectName("pathParameterLabel")
         parameter_row.addWidget(self.secondary_label)
-        self.sweep_spin = QDoubleSpinBox()
+        self.sweep_spin = CompactDoubleSpinBox()
         self.sweep_spin.setRange(-359.0, 359.0)
-        self.sweep_spin.setDecimals(2)
+        self.sweep_spin.setDecimals(8)
+        self.sweep_spin.setSingleStep(5.0)
         self.sweep_spin.setValue(90.0)
         self.sweep_spin.setSuffix("°")
+        self.sweep_spin.setMinimumWidth(92)
+        self.sweep_spin.setMaximumWidth(112)
+        self.secondary_label.setBuddy(self.sweep_spin)
         parameter_row.addWidget(self.sweep_spin)
         self.orientation_label = QLabel("方向")
+        self.orientation_label.setObjectName("pathParameterLabel")
         parameter_row.addWidget(self.orientation_label)
         self.orientation_combo = QComboBox()
+        self.orientation_combo.setMinimumWidth(86)
+        self.orientation_combo.setMaximumWidth(116)
+        self.orientation_label.setBuddy(self.orientation_combo)
         parameter_row.addWidget(self.orientation_combo)
         self.element_count_label = QLabel("单元数")
+        self.element_count_label.setObjectName("pathParameterLabel")
         parameter_row.addWidget(self.element_count_label)
         self.element_count_spin = QSpinBox()
         self.element_count_spin.setRange(1, 1000)
+        self.element_count_spin.setMinimumWidth(76)
+        self.element_count_spin.setMaximumWidth(92)
+        self.element_count_label.setBuddy(self.element_count_spin)
         parameter_row.addWidget(self.element_count_spin)
         parameter_row.addStretch(1)
         generator_layout.addLayout(parameter_row)
 
         action_row = QHBoxLayout()
         action_row.setSpacing(7)
-        action_row.addStretch(1)
+        self.current_path_label = ElidedLabel()
+        self.current_path_label.setObjectName("sectionHint")
+        self.current_path_label.setAccessibleName("当前路径摘要")
+        self.current_path_label.setMinimumWidth(0)
+        self.current_path_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        action_row.addWidget(self.current_path_label, 1)
         self.spatial_curve_button = QPushButton("空间曲线…")
         self.spatial_curve_button.setObjectName("modelerPathButton")
         self.spatial_curve_button.setToolTip(
@@ -1596,6 +1685,7 @@ class BeamModelerDialog(QDialog):
         action_row.addWidget(self.generate_button)
         self.append_button = QPushButton("追加到末端")
         self.append_button.setObjectName("modelerPathButton")
+        self.append_button.setProperty("primaryAction", True)
         self.append_button.setToolTip("保留现有模型，在路径末端追加当前直线或圆弧段")
         self.append_button.clicked.connect(self._append_geometry)
         action_row.addWidget(self.append_button)
@@ -1605,6 +1695,13 @@ class BeamModelerDialog(QDialog):
             self._generator_orientation_changed
         )
         self._generator_kind_changed()
+
+    def _select_generator_kind(self, kind: str):
+        index = self.geometry_combo.findData(kind)
+        if index >= 0 and index != self.geometry_combo.currentIndex():
+            self.geometry_combo.setCurrentIndex(index)
+        else:
+            self._generator_kind_changed()
 
     def _build_property_panel(self):
         panel = QFrame()
@@ -1960,6 +2057,8 @@ class BeamModelerDialog(QDialog):
 
     def _generator_kind_changed(self, *_args):
         kind = self.geometry_combo.currentData()
+        if hasattr(self, "path_kind_buttons") and kind in self.path_kind_buttons:
+            self.path_kind_buttons[kind].setChecked(True)
         modeling_space = self._project.modeling_space
         current_orientation = self.orientation_combo.currentData()
         self.orientation_combo.clear()
@@ -1974,7 +2073,7 @@ class BeamModelerDialog(QDialog):
                 self.orientation_combo.addItem("YZ", "yz")
             self.element_count_label.hide()
             self.element_count_spin.hide()
-            self.append_button.setText("追加圆弧段")
+            self.append_button.setText("追加圆弧")
         else:
             self.primary_label.setText("段长")
             self.secondary_label.hide()
@@ -1992,7 +2091,7 @@ class BeamModelerDialog(QDialog):
             self.element_count_label.setText("新建单元数")
             self.element_count_label.show()
             self.element_count_spin.show()
-            self.append_button.setText("追加直线段")
+            self.append_button.setText("追加直线")
         orientation_index = self.orientation_combo.findData(current_orientation)
         if orientation_index >= 0:
             self.orientation_combo.setCurrentIndex(orientation_index)
@@ -2001,15 +2100,28 @@ class BeamModelerDialog(QDialog):
     def _generator_orientation_changed(self, *_args):
         if not hasattr(self, "generate_button"):
             return
+        self._refresh_generator_actions()
+
+    def _refresh_generator_actions(self):
         tangent_only = (
             self.geometry_combo.currentData() == "straight"
             and self.orientation_combo.currentData() == "tangent"
         )
         self.generate_button.setEnabled(not tangent_only)
-        self.generate_button.setToolTip(
-            "沿末端切线仅适用于追加；新建路径请选择全局方向"
-            if tangent_only
-            else "使用当前参数新建整条路径，并替换现有几何"
+        if tangent_only:
+            self.generate_button.setToolTip(
+                "沿末端切线仅适用于追加；替换整条路径时请选择全局方向"
+            )
+        elif self._project.elements:
+            self.generate_button.setToolTip(
+                "使用当前参数替换全部现有几何；现有测点和边界约束将被清空，可撤销"
+            )
+        else:
+            self.generate_button.setToolTip("使用当前参数创建第一条结构路径")
+        self.append_button.setToolTip(
+            "保留当前路径，在末端追加解析圆弧"
+            if self.geometry_combo.currentData() == "arc"
+            else "保留当前路径，在末端追加直线段"
         )
 
     def _sensor_surface_preset_changed(self, *_args):
@@ -2087,7 +2199,12 @@ class BeamModelerDialog(QDialog):
         self.footer_hint.style().unpolish(self.footer_hint)
         self.footer_hint.style().polish(self.footer_hint)
 
-    def _apply_project(self, project: ProjectDocument):
+    def _apply_project(
+        self,
+        project: ProjectDocument,
+        *,
+        seed_generator: bool = False,
+    ):
         PathBeamEditor.ordered_path(project)
         self._project = project
         valid_ids = {
@@ -2129,14 +2246,26 @@ class BeamModelerDialog(QDialog):
             self.geometry_3d_view.set_mode(BeamGeometry3DView.MODE_SELECT)
         capability = PathBeamEditor.capability(project)
         has_geometry = bool(project.elements)
+        path_kind = capability.kind
+        if len(project.elements) == 1:
+            geometry = project.elements[0].geometry
+            if (
+                geometry.kind == "circular_arc"
+                and geometry.parameters.get("plane") == "custom"
+            ):
+                path_kind = "任意平面圆弧"
+            elif geometry.kind == "nurbs_curve":
+                path_kind = (
+                    f"{geometry.parameters['degree']} 次 NURBS · "
+                    f"{len(geometry.parameters['control_points'])} 控制点"
+                )
+        self.current_path_label.setText(
+            f"当前路径 · {path_kind} · {len(project.elements)} 段"
+        )
         self.generate_button.setText(
             "替换当前路径" if has_geometry else "新建路径"
         )
-        self.generate_button.setToolTip(
-            "使用当前参数替换全部现有几何；现有测点和边界约束将被清空"
-            if has_geometry
-            else "使用当前参数创建第一条结构路径"
-        )
+        self._refresh_generator_actions()
         dimension_label = "二维" if capability.dimension == 2 else "三维"
         self.summary_label.setText(
             f"{dimension_label} · {capability.total_length:.6g} m · "
@@ -2158,24 +2287,30 @@ class BeamModelerDialog(QDialog):
             "模型就绪" if compatible_matches else "等待算法插件",
             "ready" if compatible_matches else "waiting",
         )
-        arc_elements = [
-            element
-            for element in project.elements
-            if element.geometry.kind == "circular_arc"
-        ]
-        if len(project.elements) == 1 and len(arc_elements) == 1:
-            arc = arc_elements[0]
-            parameters = arc.geometry.parameters
-            self.geometry_combo.setCurrentIndex(self.geometry_combo.findData("arc"))
-            self.primary_spin.setValue(float(parameters["radius"]))
-            self.sweep_spin.setValue(float(parameters["sweep_degrees"]))
-            self.orientation_combo.setCurrentIndex(
-                max(self.orientation_combo.findData(parameters["plane"]), 0)
-            )
-        else:
-            self.geometry_combo.setCurrentIndex(self.geometry_combo.findData("straight"))
-            self.primary_spin.setValue(max(capability.total_length, 0.001))
-            self.element_count_spin.setValue(len(project.elements))
+        if seed_generator:
+            arc_elements = [
+                element
+                for element in project.elements
+                if element.geometry.kind == "circular_arc"
+                and element.geometry.parameters.get("plane") in {"xy", "xz", "yz"}
+            ]
+            if len(project.elements) == 1 and len(arc_elements) == 1:
+                arc = arc_elements[0]
+                parameters = arc.geometry.parameters
+                self.geometry_combo.setCurrentIndex(
+                    self.geometry_combo.findData("arc")
+                )
+                self.primary_spin.setValue(float(parameters["radius"]))
+                self.sweep_spin.setValue(float(parameters["sweep_degrees"]))
+                self.orientation_combo.setCurrentIndex(
+                    max(self.orientation_combo.findData(parameters["plane"]), 0)
+                )
+            else:
+                self.geometry_combo.setCurrentIndex(
+                    self.geometry_combo.findData("straight")
+                )
+                self.primary_spin.setValue(max(capability.total_length, 0.001))
+                self.element_count_spin.setValue(max(1, len(project.elements)))
         section = project.sections[0] if project.sections else None
         material = project.materials[0] if project.materials else None
         self._loading_section = True
@@ -2732,7 +2867,7 @@ class BeamModelerDialog(QDialog):
             self._saved_revision = project.revision
             self.undo_stack.clear()
             self._selection_changed("", "")
-            self._apply_project(project)
+            self._apply_project(project, seed_generator=True)
         except (OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "打开项目失败", str(exc))
 

@@ -1485,6 +1485,65 @@ class ModelerUiTests(unittest.TestCase):
         self.assertEqual(updated.geometry.parameters["plane"], "xz")
         dialog.close()
 
+    def test_path_generator_uses_compact_segmented_controls(self):
+        dialog = BeamModelerDialog(empty_beam_project())
+        dialog.resize(1040, 680)
+        dialog.show()
+        self.app.processEvents()
+
+        self.assertEqual(dialog.path_generator_label.text(), "快速生成")
+        self.assertFalse(dialog.geometry_combo.isVisible())
+        self.assertTrue(dialog.path_kind_buttons["straight"].isChecked())
+        self.assertEqual(
+            dialog.path_kind_buttons["arc"].accessibleName(),
+            "路径几何类型：圆弧",
+        )
+
+        dialog.path_kind_buttons["arc"].click()
+        dialog.primary_spin.setValue(5.001)
+        dialog.sweep_spin.setValue(90.0)
+        self.app.processEvents()
+
+        self.assertEqual(dialog.geometry_combo.currentData(), "arc")
+        self.assertTrue(dialog.path_kind_buttons["arc"].isChecked())
+        self.assertIn("5.001 m", dialog.primary_spin.text())
+        self.assertNotIn("5.001000", dialog.primary_spin.text())
+        self.assertEqual(dialog.sweep_spin.text(), "90°")
+        self.assertEqual(dialog.append_button.text(), "追加圆弧")
+        self.assertTrue(dialog.append_button.property("primaryAction"))
+        self.assertFalse(bool(dialog.generate_button.property("primaryAction")))
+        self.assertIn("清空", dialog.generate_button.toolTip())
+        dialog.path_kind_buttons["straight"].click()
+        dialog.path_kind_buttons["arc"].click()
+        self.assertIn("清空", dialog.generate_button.toolTip())
+        self.assertIn("当前路径", dialog.current_path_label.toolTip())
+        self.assertIs(dialog.primary_label.buddy(), dialog.primary_spin)
+        self.assertIs(dialog.secondary_label.buddy(), dialog.sweep_spin)
+        for button in (
+            dialog.spatial_curve_button,
+            dialog.generate_button,
+            dialog.append_button,
+        ):
+            self.assertGreaterEqual(button.width(), button.minimumSizeHint().width())
+        dialog.close()
+
+    def test_path_generator_keeps_segment_draft_after_append_and_undo(self):
+        dialog = BeamModelerDialog(empty_beam_project())
+        dialog.path_kind_buttons["straight"].click()
+        dialog.primary_spin.setValue(0.75)
+        dialog.orientation_combo.setCurrentIndex(
+            dialog.orientation_combo.findData("x")
+        )
+
+        dialog._append_geometry()
+        self.assertAlmostEqual(PathBeamEditor.total_length(dialog.project), 1.75)
+        self.assertAlmostEqual(dialog.primary_spin.value(), 0.75)
+
+        dialog.undo_stack.undo()
+        self.assertAlmostEqual(PathBeamEditor.total_length(dialog.project), 1.0)
+        self.assertAlmostEqual(dialog.primary_spin.value(), 0.75)
+        dialog.close()
+
     def test_modeler_builds_a_mixed_2d_path_without_discretizing_the_arc(self):
         dialog = BeamModelerDialog(empty_beam_project(modeling_space="2d"))
         dialog.resize(1100, 700)
@@ -1707,6 +1766,8 @@ class ModelerUiTests(unittest.TestCase):
         self.assertEqual(len(dialog.project.elements), 1)
         self.assertEqual(dialog.project.elements[0].geometry.kind, "nurbs_curve")
         self.assertEqual(dialog.project.modeling_space, "3d")
+        self.assertIn("3 次 NURBS", dialog.current_path_label.toolTip())
+        self.assertIn("4 控制点", dialog.current_path_label.toolTip())
         dialog.undo_stack.undo()
         self.assertEqual(dialog.project.elements[0].geometry.kind, "line")
         dialog.close()
@@ -1742,6 +1803,7 @@ class ModelerUiTests(unittest.TestCase):
         self.assertEqual(element.geometry.kind, "circular_arc")
         self.assertEqual(element.geometry.parameters["plane"], "custom")
         self.assertEqual(dialog.project.modeling_space, "3d")
+        self.assertIn("任意平面圆弧", dialog.current_path_label.toolTip())
         dialog.close()
 
     def test_replacing_path_confirms_when_only_boundaries_would_be_cleared(self):

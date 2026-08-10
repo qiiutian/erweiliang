@@ -398,6 +398,24 @@ QPushButton#viewModeButton:checked, QPushButton#modelerModeButton:checked {{
     background: {c['primary']};
     border-color: {c['primary']};
 }}
+QPushButton#pathKindStart, QPushButton#pathKindEnd {{
+    color: {c['text_secondary']};
+    background: {c['surface']};
+    border-color: {c['border_strong']};
+}}
+QPushButton#pathKindStart:hover, QPushButton#pathKindEnd:hover {{
+    color: {c['primary']};
+    background: {c['primary_soft']};
+    border-color: {c['focus']};
+}}
+QPushButton#pathKindStart:checked, QPushButton#pathKindEnd:checked {{
+    color: {c['on_primary']};
+    background: {c['primary']};
+    border-color: {c['primary']};
+}}
+QPushButton#pathKindStart:focus, QPushButton#pathKindEnd:focus {{
+    border-color: {c['focus']};
+}}
 QPushButton#displayModeButton:checked {{
     color: {c['primary']};
     background: {c['primary_soft']};
@@ -413,6 +431,24 @@ QPushButton#modelerToolButton:hover, QPushButton#modelerFileButton:hover,
 QPushButton#modelerPathButton:hover, QPushButton#viewportButton:hover {{
     color: {c['primary']};
     background: {c['primary_soft']};
+    border-color: {c['focus']};
+}}
+QPushButton#modelerPathButton[primaryAction="true"] {{
+    color: {c['on_primary']};
+    background: {c['primary']};
+    border-color: {c['primary_pressed']};
+}}
+QPushButton#modelerPathButton[primaryAction="true"]:hover {{
+    color: {c['on_primary']};
+    background: {c['primary_hover']};
+    border-color: {c['primary_pressed']};
+}}
+QPushButton#modelerPathButton[primaryAction="true"]:pressed {{
+    color: {c['on_primary']};
+    background: {c['primary_pressed']};
+    border-color: {c['primary_pressed']};
+}}
+QPushButton#modelerPathButton[primaryAction="true"]:focus {{
     border-color: {c['focus']};
 }}
 QFrame#viewToolbar, QFrame#viewportToolbar {{
