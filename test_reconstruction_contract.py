@@ -54,7 +54,12 @@ class ProbeAlgorithm(ProjectReconstructionAlgorithm):
                 else ("beam2d_euler_bernoulli", "beam2d_curved")
             ),
             measurement_types=("surface_axial_strain",),
-            geometry_kinds=("line", "circular_arc", "nurbs_curve"),
+            geometry_kinds=(
+                "line",
+                "circular_arc",
+                "nurbs_curve",
+                "parametric_curve",
+            ),
             supports_mixed_geometry=True,
             rotation_representations=(
                 RotationRepresentation.QUATERNION.value
@@ -252,6 +257,42 @@ class ReconstructionContractTests(unittest.TestCase):
         self.assertEqual(
             result.state.rotation_representation,
             RotationRepresentation.QUATERNION.value,
+        )
+
+    def test_parametric_curve_project_reaches_capable_plugin_without_projection(self):
+        project = PathBeamEditor.create_parametric_curve(
+            empty_beam_project(modeling_space="3d"),
+            expressions={
+                "x": "R*cos(2*pi*N*t)",
+                "y": "R*sin(2*pi*N*t)",
+                "z": "H*t",
+            },
+            constants={"R": 0.5, "N": 1.0, "H": 2.0},
+            template="helix",
+        )
+        probe = ProbeAlgorithm("3d", DeformationRegime.SMALL.value)
+        service = AnalysisService(
+            AlgorithmRegistry((probe,)),
+            default_algorithm_id=probe.metadata.identifier,
+        )
+
+        result = service.run_project(project, parameters={"max_iterations": 12})
+
+        self.assertEqual(
+            probe.seen_project.elements[0].geometry.parameters["expressions"],
+            project.elements[0].geometry.parameters["expressions"],
+        )
+        self.assertEqual(result.state.project_id, project.identifier)
+        default_match = match_project_algorithms(
+            project,
+            create_default_analysis_service().registry.list(),
+        )[0]
+        self.assertFalse(default_match.compatible)
+        self.assertTrue(
+            any(
+                issue.field in {"/model/modeling-space", "/model/geometry"}
+                for issue in default_match.issues
+            )
         )
 
     def test_project_algorithm_base_rejects_legacy_only_context(self):

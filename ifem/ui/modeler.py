@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import ceil, hypot, isfinite
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QKeySequence,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -35,13 +36,23 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 from ifem.application import get_default_analysis_service, match_project_algorithms
-from ifem.domain.project import ProjectDocument, SectionDefinition
+from ifem.domain import (
+    parametric_point_and_derivative,
+    parametric_recommended_sample_count,
+)
+from ifem.domain.project import (
+    BeamGeometryDefinition,
+    ProjectDocument,
+    SectionDefinition,
+)
 from ifem.infrastructure.project_io import load_project, save_project
 from ifem.infrastructure.project_library import ProjectLibrary
 from ifem.modeling.path_editor import BeamSurfaceLocation, PathBeamEditor
@@ -270,6 +281,23 @@ QLabel#modelerStatus[state="waiting"] {
     background: #f6efdf;
     border-color: #e5d6b7;
 }
+QLabel#modelerStatus[state="error"] {
+    color: #934b3d;
+    background: #fff5f2;
+    border-color: #e7cbc5;
+}
+QDialog#spatialCurveDialog QLineEdit[validationState="error"],
+QDialog#spatialCurveDialog QDoubleSpinBox[validationState="error"],
+QDialog#spatialCurveDialog QPlainTextEdit[validationState="error"],
+QDialog#spatialCurveDialog QSpinBox[validationState="error"],
+QDialog#spatialCurveDialog QTableWidget[validationState="error"] {
+    border: 1px solid #b45f50;
+}
+QFrame#curvePreviewFrame {
+    background: #f8faf8;
+    border: 1px solid #dce4de;
+    border-radius: 7px;
+}
 """
 
 
@@ -306,6 +334,20 @@ class CompactDoubleSpinBox(QDoubleSpinBox):
 
     def textFromValue(self, value):
         return f"{float(value):.10g}"
+
+
+class ScientificDoubleEdit(QLineEdit):
+    """Round-trip a finite double without imposing a GUI-specific numeric range."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+    def setValue(self, value):
+        self.setText(format(float(value), ".17g"))
+
+    def value(self):
+        return float(self.text().strip())
 
 
 class SectionProfilePreview(QWidget):
@@ -971,6 +1013,90 @@ class BeamModelCanvas(QWidget):
             self.update()
 
 
+class ParametricCurvePreview(QWidget):
+    """Lightweight isometric preview that does not create a second VTK view."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.samples = ()
+        self.setAccessibleName("参数曲线预览")
+        self.setMinimumSize(250, 210)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_samples(self, samples):
+        self.samples = tuple(tuple(float(value) for value in point) for point in samples)
+        if self.samples:
+            start = self.samples[0]
+            end = self.samples[-1]
+            self.setAccessibleDescription(
+                "等轴预览，"
+                f"起点 {start[0]:.4g}, {start[1]:.4g}, {start[2]:.4g}；"
+                f"终点 {end[0]:.4g}, {end[1]:.4g}, {end[2]:.4g}。"
+            )
+        else:
+            self.setAccessibleDescription("填写合法参数后显示曲线预览。")
+        self.update()
+
+    @staticmethod
+    def _project(point):
+        x, y, z = point
+        return x - 0.58 * y, z + 0.34 * (x + y)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), self.palette().base())
+        bounds = self.rect().adjusted(20, 20, -20, -34)
+        if len(self.samples) < 2 or bounds.width() <= 0 or bounds.height() <= 0:
+            painter.setPen(self.palette().color(self.foregroundRole()))
+            painter.drawText(
+                self.rect(),
+                Qt.AlignmentFlag.AlignCenter,
+                "填写合法参数后显示预览",
+            )
+            painter.end()
+            return
+
+        projected = tuple(self._project(point) for point in self.samples)
+        minimum_x = min(point[0] for point in projected)
+        maximum_x = max(point[0] for point in projected)
+        minimum_y = min(point[1] for point in projected)
+        maximum_y = max(point[1] for point in projected)
+        width = max(maximum_x - minimum_x, 1.0e-12)
+        height = max(maximum_y - minimum_y, 1.0e-12)
+        scale = min(bounds.width() / width, bounds.height() / height)
+        offset_x = bounds.center().x() - scale * 0.5 * (minimum_x + maximum_x)
+        offset_y = bounds.center().y() + scale * 0.5 * (minimum_y + maximum_y)
+        polygon = QPolygonF(
+            [
+                QPointF(offset_x + scale * x, offset_y - scale * y)
+                for x, y in projected
+            ]
+        )
+        curve_pen = QPen(self.palette().highlight().color(), 2.4)
+        curve_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        curve_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(curve_pen)
+        painter.drawPolyline(polygon)
+        painter.setBrush(self.palette().highlight())
+        painter.drawEllipse(polygon[0], 4.0, 4.0)
+        painter.setBrush(self.palette().base())
+        painter.drawEllipse(polygon[-1], 4.0, 4.0)
+
+        origin = QPointF(34.0, self.height() - 22.0)
+        axes = (
+            (QPointF(21.0, -7.0), "X"),
+            (QPointF(-13.0, -7.0), "Y"),
+            (QPointF(0.0, -23.0), "Z"),
+        )
+        painter.setPen(QPen(self.palette().color(self.foregroundRole()), 1.0))
+        for vector, label in axes:
+            endpoint = origin + vector
+            painter.drawLine(origin, endpoint)
+            painter.drawText(endpoint + QPointF(2.0, 2.0), label)
+        painter.end()
+
+
 class ProjectSnapshotCommand(QUndoCommand):
     def __init__(self, dialog, before: ProjectDocument, after: ProjectDocument, text: str):
         super().__init__(text)
@@ -1090,64 +1216,237 @@ class SensorArrayDialog(QDialog):
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
 
 
+def _parametric_template_label(template_id: str) -> str:
+    return {
+        "helix": "空间螺旋线",
+        "sine": "正弦曲线",
+        "parabola": "抛物线拱",
+        "custom": "自定义",
+    }.get(str(template_id), "自定义")
+
+
 class SpatialCurveDialog(QDialog):
-    """Collect an arbitrary three-point arc or a NURBS control polygon."""
+    """Collect an analytic arc, parameter equation, or NURBS definition."""
 
     ARC = "arc_three_points"
+    PARAMETRIC = "parametric_curve"
     NURBS = "nurbs_curve"
+    PARAMETRIC_TEMPLATES = {
+        "helix": {
+            "label": "空间螺旋线",
+            "domain": (0.0, 1.0),
+            "expressions": {
+                "x": "R*cos(2*pi*N*t)",
+                "y": "R*sin(2*pi*N*t)",
+                "z": "H*t",
+            },
+            "constants": {"R": 1.0, "N": 2.0, "H": 2.0},
+        },
+        "sine": {
+            "label": "正弦曲线",
+            "domain": (0.0, 1.0),
+            "expressions": {
+                "x": "L*t",
+                "y": "A*sin(2*pi*N*t)",
+                "z": "0",
+            },
+            "constants": {"L": 4.0, "A": 0.5, "N": 2.0},
+        },
+        "parabola": {
+            "label": "抛物线拱",
+            "domain": (0.0, 1.0),
+            "expressions": {
+                "x": "L*t",
+                "y": "4*H*t*(1-t)",
+                "z": "0",
+            },
+            "constants": {"L": 4.0, "H": 1.0},
+        },
+        "custom": {
+            "label": "自定义",
+            "domain": (0.0, 1.0),
+            "expressions": {"x": "t", "y": "0", "z": "0"},
+            "constants": {},
+        },
+    }
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, initial_definition=None):
         super().__init__(parent)
         self.setObjectName("spatialCurveDialog")
         self.setWindowTitle("创建空间曲线")
-        self.setMinimumSize(560, 470)
+        self.setMinimumSize(820, 590)
         self._definition = None
+        self._loading_template = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(10)
 
-        title = QLabel("空间曲线")
-        title.setObjectName("inspectorTitle")
-        root.addWidget(title)
+        self.title_label = QLabel("空间曲线")
+        self.title_label.setObjectName("inspectorTitle")
+        root.addWidget(self.title_label)
         intro = QLabel(
-            "输入绝对坐标；圆弧通过三个点精确定义，NURBS 使用控制点和可选权重。"
+            "可用三点圆弧、参数方程或 NURBS 定义空间路径；所有坐标均使用米。"
         )
         intro.setObjectName("sectionHint")
         intro.setWordWrap(True)
         root.addWidget(intro)
 
-        form = QFormLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(9)
+        kind_form = QFormLayout()
+        kind_form.setHorizontalSpacing(12)
+        kind_form.setVerticalSpacing(9)
         self.kind_combo = QComboBox()
         self.kind_combo.addItem("任意平面圆弧（三点）", self.ARC)
-        self.kind_combo.addItem("三维 B 样条 / NURBS", self.NURBS)
-        form.addRow("曲线类型", self.kind_combo)
+        self.kind_combo.addItem("参数方程曲线 x(t), y(t), z(t)", self.PARAMETRIC)
+        self.kind_combo.addItem("B 样条 / NURBS（高级）", self.NURBS)
+        self.kind_combo.setAccessibleName("空间曲线类型")
+        kind_label = QLabel("曲线类型")
+        kind_label.setBuddy(self.kind_combo)
+        kind_form.addRow(kind_label, self.kind_combo)
+        root.addLayout(kind_form)
+
+        self.definition_stack = QStackedWidget()
+
+        point_page = QWidget()
+        point_layout = QVBoxLayout(point_page)
+        point_layout.setContentsMargins(0, 0, 0, 0)
+        point_layout.setSpacing(9)
+        nurbs_form = QFormLayout()
+        nurbs_form.setHorizontalSpacing(12)
+        nurbs_form.setVerticalSpacing(9)
         self.degree_spin = QSpinBox()
         self.degree_spin.setRange(1, 5)
         self.degree_spin.setValue(3)
+        self.degree_spin.setAccessibleName("NURBS 样条次数")
         self.degree_label = QLabel("样条次数")
-        form.addRow(self.degree_label, self.degree_spin)
+        self.degree_label.setBuddy(self.degree_spin)
+        nurbs_form.addRow(self.degree_label, self.degree_spin)
         self.weights_edit = QLineEdit()
         self.weights_edit.setPlaceholderText("可选，例如：1, 1, 0.8, 1")
+        self.weights_edit.setAccessibleName("NURBS 控制点权重")
         self.weights_label = QLabel("控制点权重")
-        form.addRow(self.weights_label, self.weights_edit)
-        root.addLayout(form)
+        self.weights_label.setBuddy(self.weights_edit)
+        nurbs_form.addRow(self.weights_label, self.weights_edit)
+        point_layout.addLayout(nurbs_form)
 
         points_label = QLabel("空间点（每行 x, y, z）")
         points_label.setObjectName("fieldLabel")
-        root.addWidget(points_label)
+        point_layout.addWidget(points_label)
         self.points_edit = QPlainTextEdit()
         self.points_edit.setAccessibleName("空间曲线控制点")
+        points_label.setBuddy(self.points_edit)
         self.points_edit.setPlaceholderText(
             "0, 0, 0\n1, 0.5, 0.8\n2, 1.0, 0.2"
         )
         self.points_edit.setPlainText("0, 0, 0\n1, 0.5, 0.8\n2, 1.0, 0.2")
-        root.addWidget(self.points_edit, 1)
+        point_layout.addWidget(self.points_edit, 1)
+        self.definition_stack.addWidget(point_page)
+
+        parameter_page = QWidget()
+        parameter_columns = QHBoxLayout(parameter_page)
+        parameter_columns.setContentsMargins(0, 0, 0, 0)
+        parameter_columns.setSpacing(14)
+
+        parameter_editor = QWidget()
+        parameter_layout = QVBoxLayout(parameter_editor)
+        parameter_layout.setContentsMargins(0, 0, 0, 0)
+        parameter_layout.setSpacing(8)
+        parameter_form = QFormLayout()
+        parameter_form.setHorizontalSpacing(12)
+        parameter_form.setVerticalSpacing(8)
+        self.parametric_template_combo = QComboBox()
+        for template_id, template in self.PARAMETRIC_TEMPLATES.items():
+            self.parametric_template_combo.addItem(template["label"], template_id)
+        self.parametric_template_combo.setAccessibleName("参数曲线起始模板")
+        template_label = QLabel("起始模板")
+        template_label.setBuddy(self.parametric_template_combo)
+        parameter_form.addRow(template_label, self.parametric_template_combo)
+
+        domain_widget = QWidget()
+        domain_layout = QHBoxLayout(domain_widget)
+        domain_layout.setContentsMargins(0, 0, 0, 0)
+        domain_layout.setSpacing(7)
+        domain_start_label = QLabel("t₀")
+        self.domain_start_spin = ScientificDoubleEdit()
+        self.domain_start_spin.setValue(0.0)
+        self.domain_start_spin.setAccessibleName("参数定义域下限 t0")
+        domain_start_label.setBuddy(self.domain_start_spin)
+        domain_layout.addWidget(domain_start_label)
+        domain_layout.addWidget(self.domain_start_spin, 1)
+        domain_layout.addWidget(QLabel("至"))
+        domain_end_label = QLabel("t₁")
+        self.domain_end_spin = ScientificDoubleEdit()
+        self.domain_end_spin.setValue(1.0)
+        self.domain_end_spin.setAccessibleName("参数定义域上限 t1")
+        domain_end_label.setBuddy(self.domain_end_spin)
+        domain_layout.addWidget(domain_end_label)
+        domain_layout.addWidget(self.domain_end_spin, 1)
+        parameter_form.addRow("定义域", domain_widget)
+
+        self.expression_edits = {}
+        for coordinate in ("x", "y", "z"):
+            editor = QLineEdit()
+            editor.setAccessibleName(f"参数表达式 {coordinate}(t)")
+            editor.setPlaceholderText(f"输入 {coordinate}(t)")
+            label = QLabel(f"{coordinate}(t)")
+            label.setBuddy(editor)
+            parameter_form.addRow(label, editor)
+            self.expression_edits[coordinate] = editor
+        parameter_layout.addLayout(parameter_form)
+
+        constants_header = QHBoxLayout()
+        constants_label = QLabel("用户常量")
+        constants_label.setObjectName("fieldLabel")
+        constants_header.addWidget(constants_label)
+        constants_header.addStretch(1)
+        self.add_constant_button = QPushButton("添加常量")
+        self.add_constant_button.setObjectName("modelerPathButton")
+        self.add_constant_button.setAccessibleDescription("在常量表末尾添加一行")
+        constants_header.addWidget(self.add_constant_button)
+        self.remove_constant_button = QPushButton("移除选中")
+        self.remove_constant_button.setObjectName("modelerPathButton")
+        self.remove_constant_button.setAccessibleDescription("移除常量表中的选中行")
+        constants_header.addWidget(self.remove_constant_button)
+        parameter_layout.addLayout(constants_header)
+
+        self.constants_table = QTableWidget(0, 2)
+        self.constants_table.setHorizontalHeaderLabels(("名称", "数值"))
+        self.constants_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.constants_table.verticalHeader().setVisible(False)
+        self.constants_table.setAccessibleName("参数曲线用户常量表")
+        self.constants_table.setAccessibleDescription(
+            "每行输入一个常量名称和有限数值；t、pi、e 与函数名不可作为常量名。"
+        )
+        self.constants_table.setMinimumHeight(132)
+        constants_label.setBuddy(self.constants_table)
+        parameter_layout.addWidget(self.constants_table, 1)
+        expression_hint = QLabel(
+            "模板只填充起始定义，可继续编辑。常量名使用字母、数字和下划线；"
+            "可用 t、pi、e、0–16 次整数幂和 sin/cos，不执行 Python 代码。"
+        )
+        expression_hint.setObjectName("sectionHint")
+        expression_hint.setWordWrap(True)
+        parameter_layout.addWidget(expression_hint)
+        parameter_columns.addWidget(parameter_editor, 3)
+
+        preview_frame = QFrame()
+        preview_frame.setObjectName("curvePreviewFrame")
+        preview_layout = QVBoxLayout(preview_frame)
+        preview_layout.setContentsMargins(10, 9, 10, 10)
+        preview_title = QLabel("等轴预览")
+        preview_title.setObjectName("fieldLabel")
+        preview_layout.addWidget(preview_title)
+        self.parametric_preview = ParametricCurvePreview()
+        preview_layout.addWidget(self.parametric_preview, 1)
+        parameter_columns.addWidget(preview_frame, 2)
+        self.definition_stack.addWidget(parameter_page)
+        root.addWidget(self.definition_stack, 1)
 
         self.feedback_label = QLabel()
-        self.feedback_label.setObjectName("sectionHint")
+        self.feedback_label.setObjectName("modelerStatus")
+        self.feedback_label.setAccessibleName("空间曲线定义状态")
         self.feedback_label.setWordWrap(True)
         root.addWidget(self.feedback_label)
 
@@ -1164,11 +1463,151 @@ class SpatialCurveDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         root.addWidget(self.buttons)
 
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(220)
+        self._preview_timer.timeout.connect(self._refresh_state)
         self.kind_combo.currentIndexChanged.connect(self._curve_kind_changed)
-        self.degree_spin.valueChanged.connect(self._refresh_state)
-        self.weights_edit.textChanged.connect(self._refresh_state)
-        self.points_edit.textChanged.connect(self._refresh_state)
+        self.degree_spin.valueChanged.connect(self._schedule_refresh)
+        self.weights_edit.textChanged.connect(self._schedule_refresh)
+        self.points_edit.textChanged.connect(self._schedule_refresh)
+        self.parametric_template_combo.currentIndexChanged.connect(
+            self._apply_parametric_template
+        )
+        self.domain_start_spin.textChanged.connect(self._schedule_refresh)
+        self.domain_end_spin.textChanged.connect(self._schedule_refresh)
+        for editor in self.expression_edits.values():
+            editor.textChanged.connect(self._schedule_refresh)
+        self.constants_table.itemChanged.connect(self._schedule_refresh)
+        self.add_constant_button.clicked.connect(self._add_constant_row)
+        self.remove_constant_button.clicked.connect(self._remove_constant_row)
+        self._apply_parametric_template()
+        self._curve_kind_changed()
+        if initial_definition is not None:
+            self._load_initial_definition(initial_definition)
+            self.setWindowTitle("编辑参数曲线")
+            self.title_label.setText("编辑参数曲线")
+            self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用曲线")
+
+    @staticmethod
+    def template_label(template_id: str) -> str:
+        return _parametric_template_label(template_id)
+
+    def _schedule_refresh(self, *_args):
+        if not self._loading_template:
+            if (
+                self.kind_combo.currentData() == self.PARAMETRIC
+                and self.parametric_template_combo.currentData() != "custom"
+            ):
+                self.parametric_template_combo.blockSignals(True)
+                try:
+                    self.parametric_template_combo.setCurrentIndex(
+                        self.parametric_template_combo.findData("custom")
+                    )
+                finally:
+                    self.parametric_template_combo.blockSignals(False)
+            self._preview_timer.start()
+
+    def _replace_constants(self, constants):
+        self.constants_table.blockSignals(True)
+        try:
+            self.constants_table.setRowCount(0)
+            for name, value in constants.items():
+                row = self.constants_table.rowCount()
+                self.constants_table.insertRow(row)
+                self.constants_table.setItem(row, 0, QTableWidgetItem(str(name)))
+                self.constants_table.setItem(
+                    row,
+                    1,
+                    QTableWidgetItem(format(float(value), ".17g")),
+                )
+        finally:
+            self.constants_table.blockSignals(False)
+
+    def _load_initial_definition(self, definition):
+        if not isinstance(definition, dict) or definition.get("kind") != self.PARAMETRIC:
+            return
+        template_id = str(definition.get("template", "custom"))
+        if self.parametric_template_combo.findData(template_id) < 0:
+            template_id = "custom"
+        self.kind_combo.blockSignals(True)
+        self.parametric_template_combo.blockSignals(True)
+        self._loading_template = True
+        try:
+            self.kind_combo.setCurrentIndex(
+                self.kind_combo.findData(self.PARAMETRIC)
+            )
+            self.definition_stack.setCurrentIndex(1)
+            self.parametric_template_combo.setCurrentIndex(
+                self.parametric_template_combo.findData(template_id)
+            )
+            domain = definition.get("domain", (0.0, 1.0))
+            self.domain_start_spin.setValue(float(domain[0]))
+            self.domain_end_spin.setValue(float(domain[1]))
+            expressions = definition.get("expressions", {})
+            for coordinate, editor in self.expression_edits.items():
+                editor.setText(str(expressions.get(coordinate, "0")))
+            self._replace_constants(definition.get("constants", {}))
+        finally:
+            self._loading_template = False
+            self.kind_combo.blockSignals(False)
+            self.parametric_template_combo.blockSignals(False)
         self._refresh_state()
+
+    def _apply_parametric_template(self, *_args):
+        template_id = str(self.parametric_template_combo.currentData() or "custom")
+        template = self.PARAMETRIC_TEMPLATES[template_id]
+        self._loading_template = True
+        try:
+            self.domain_start_spin.setValue(float(template["domain"][0]))
+            self.domain_end_spin.setValue(float(template["domain"][1]))
+            for coordinate, editor in self.expression_edits.items():
+                editor.setText(str(template["expressions"][coordinate]))
+            self._replace_constants(template["constants"])
+        finally:
+            self._loading_template = False
+        self._refresh_state()
+
+    def _add_constant_row(self):
+        if self.constants_table.rowCount() >= 32:
+            return
+        row = self.constants_table.rowCount()
+        self.constants_table.insertRow(row)
+        self.constants_table.setItem(row, 0, QTableWidgetItem(""))
+        self.constants_table.setItem(row, 1, QTableWidgetItem(""))
+        self.constants_table.setCurrentCell(row, 0)
+        self.constants_table.editItem(self.constants_table.item(row, 0))
+        self._schedule_refresh()
+
+    def _remove_constant_row(self):
+        row = self.constants_table.currentRow()
+        if row >= 0:
+            self.constants_table.removeRow(row)
+            self._refresh_state()
+
+    def _parse_constants(self):
+        constants = {}
+        for row in range(self.constants_table.rowCount()):
+            name_item = self.constants_table.item(row, 0)
+            value_item = self.constants_table.item(row, 1)
+            name = "" if name_item is None else name_item.text().strip()
+            value_text = "" if value_item is None else value_item.text().strip()
+            if not name and not value_text:
+                raise ValueError(f"常量表第 {row + 1} 行尚未填写完整。")
+            if not name:
+                raise ValueError(f"常量表第 {row + 1} 行缺少名称。")
+            if not value_text:
+                raise ValueError(f"常量 {name} 缺少数值。")
+            if name in constants:
+                raise ValueError(f"参数曲线常量名称重复：{name}")
+            try:
+                value = float(value_text)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"参数曲线常量 {name} 必须是有限数值。") from exc
+            if not isfinite(value):
+                raise ValueError(f"参数曲线常量 {name} 必须是有限数值。")
+            constants[name] = value
+        return constants
 
     def _parse_points(self):
         points = []
@@ -1186,8 +1625,38 @@ class SpatialCurveDialog(QDialog):
         return tuple(points)
 
     def definition(self):
-        points = self._parse_points()
         kind = self.kind_combo.currentData()
+        if kind == self.PARAMETRIC:
+            try:
+                domain_start = self.domain_start_spin.value()
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("参数曲线定义域下限必须是有限数值。") from exc
+            if not isfinite(domain_start):
+                raise ValueError("参数曲线定义域下限必须是有限数值。")
+            try:
+                domain_end = self.domain_end_spin.value()
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("参数曲线定义域上限必须是有限数值。") from exc
+            if not isfinite(domain_end):
+                raise ValueError("参数曲线定义域上限必须是有限数值。")
+            raw_parameters = {
+                "domain": (domain_start, domain_end),
+                "expressions": {
+                    coordinate: editor.text().strip()
+                    for coordinate, editor in self.expression_edits.items()
+                },
+                "constants": self._parse_constants(),
+                "template": str(
+                    self.parametric_template_combo.currentData() or "custom"
+                ),
+            }
+            geometry = BeamGeometryDefinition(
+                kind=self.PARAMETRIC,
+                parameters=raw_parameters,
+            )
+            return {"kind": kind, **dict(geometry.parameters)}
+
+        points = self._parse_points()
         if kind == self.ARC:
             if len(points) != 3:
                 raise ValueError("任意平面圆弧必须恰好输入三个点。")
@@ -1225,7 +1694,9 @@ class SpatialCurveDialog(QDialog):
         }
 
     def _curve_kind_changed(self, *_args):
-        if self.kind_combo.currentData() == self.NURBS:
+        kind = self.kind_combo.currentData()
+        self.definition_stack.setCurrentIndex(1 if kind == self.PARAMETRIC else 0)
+        if kind == self.NURBS:
             try:
                 point_count = len(self._parse_points())
             except (TypeError, ValueError):
@@ -1234,31 +1705,115 @@ class SpatialCurveDialog(QDialog):
                 self.degree_spin.setValue(point_count - 1)
         self._refresh_state()
 
+    @staticmethod
+    def _set_validation_state(widget, state=""):
+        widget.setProperty("validationState", state)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _clear_validation_states(self):
+        for widget in (
+            self.points_edit,
+            self.weights_edit,
+            self.domain_start_spin,
+            self.domain_end_spin,
+            self.constants_table,
+            self.degree_spin,
+            *self.expression_edits.values(),
+        ):
+            self._set_validation_state(widget)
+
+    def _target_error(self, message):
+        text = str(message)
+        target = None
+        for coordinate, editor in self.expression_edits.items():
+            if text.startswith(f"{coordinate}(t)"):
+                target = editor
+                break
+        if target is None and "定义域" in text:
+            target = (
+                self.domain_start_spin
+                if "下限" in text
+                else self.domain_end_spin
+            )
+        if target is None and "常量" in text:
+            target = self.constants_table
+        if target is None and self.kind_combo.currentData() != self.PARAMETRIC:
+            if "次数" in text:
+                target = self.degree_spin
+            else:
+                target = self.weights_edit if "权重" in text else self.points_edit
+        if (
+            target is None
+            and self.kind_combo.currentData() == self.PARAMETRIC
+            and ("参数曲线" in text or "参数表达式" in text)
+        ):
+            for editor in self.expression_edits.values():
+                self._set_validation_state(editor, "error")
+            target = self.expression_edits["x"]
+        if target is not None:
+            self._set_validation_state(target, "error")
+        return target
+
     def _refresh_state(self, *_args):
-        is_nurbs = self.kind_combo.currentData() == self.NURBS
+        self._preview_timer.stop()
+        self._clear_validation_states()
+        self._validated_definition = None
+        self._last_error_target = None
+        kind = self.kind_combo.currentData()
+        is_nurbs = kind == self.NURBS
         self.degree_label.setVisible(is_nurbs)
         self.degree_spin.setVisible(is_nurbs)
         self.weights_label.setVisible(is_nurbs)
         self.weights_edit.setVisible(is_nurbs)
         try:
             definition = self.definition()
-            point_count = len(definition["points"])
-            self.feedback_label.setText(
-                f"可创建 · {point_count} 个定义点"
-                + (f" · {definition['degree']} 次" if is_nurbs else "")
-            )
+            if kind == self.PARAMETRIC:
+                sample_count = parametric_recommended_sample_count(definition)
+                samples = tuple(
+                    parametric_point_and_derivative(
+                        definition,
+                        index / (sample_count - 1),
+                    )[0]
+                    for index in range(sample_count)
+                )
+                self.parametric_preview.set_samples(samples)
+                spans = tuple(
+                    max(point[axis] for point in samples)
+                    - min(point[axis] for point in samples)
+                    for axis in range(3)
+                )
+                self.feedback_label.setText(
+                    "可创建 · 参数方程 · "
+                    f"跨度 X {spans[0]:.5g} / Y {spans[1]:.5g} / Z {spans[2]:.5g} m"
+                )
+            else:
+                point_count = len(definition["points"])
+                self.feedback_label.setText(
+                    f"可创建 · {point_count} 个定义点"
+                    + (f" · {definition['degree']} 次" if is_nurbs else "")
+                )
             valid = True
-        except (TypeError, ValueError) as exc:
+            state = "ready"
+            self._validated_definition = definition
+        except (TypeError, ValueError, OverflowError) as exc:
             self.feedback_label.setText(str(exc))
+            self._last_error_target = self._target_error(str(exc))
+            self.parametric_preview.set_samples(())
             valid = False
+            state = "error"
+        self.feedback_label.setProperty("state", state)
+        self.feedback_label.style().unpolish(self.feedback_label)
+        self.feedback_label.style().polish(self.feedback_label)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(valid)
+        return valid
 
     def accept(self):
-        try:
-            self._definition = self.definition()
-        except (TypeError, ValueError) as exc:
-            self.feedback_label.setText(str(exc))
+        if not self._refresh_state():
+            if self._last_error_target is not None:
+                self._last_error_target.setFocus(Qt.FocusReason.OtherFocusReason)
             return
+        self._definition = self._validated_definition
         super().accept()
 
     @property
@@ -1674,7 +2229,7 @@ class BeamModelerDialog(QDialog):
         self.spatial_curve_button = QPushButton("空间曲线…")
         self.spatial_curve_button.setObjectName("modelerPathButton")
         self.spatial_curve_button.setToolTip(
-            "通过三个空间点创建任意平面圆弧，或通过控制点创建 B 样条/NURBS"
+            "通过三点圆弧、x(t)/y(t)/z(t) 参数方程或控制点创建空间曲线"
         )
         self.spatial_curve_button.clicked.connect(self._create_spatial_curve)
         action_row.addWidget(self.spatial_curve_button)
@@ -2265,6 +2820,11 @@ class BeamModelerDialog(QDialog):
                     f"{geometry.parameters['degree']} 次 NURBS · "
                     f"{len(geometry.parameters['control_points'])} 控制点"
                 )
+            elif geometry.kind == "parametric_curve":
+                template = _parametric_template_label(
+                    geometry.parameters.get("template", "custom")
+                )
+                path_kind = f"参数方程曲线 · {template}"
         self.current_path_label.setText(
             f"当前路径 · {path_kind} · {len(project.elements)} 段"
         )
@@ -2548,6 +3108,7 @@ class BeamModelerDialog(QDialog):
                 )
                 is_arc = element.geometry.kind == "circular_arc"
                 is_nurbs = element.geometry.kind == "nurbs_curve"
+                is_parametric = element.geometry.kind == "parametric_curve"
                 if is_arc:
                     geometry_text = "参数化圆弧"
                 elif is_nurbs:
@@ -2555,6 +3116,14 @@ class BeamModelerDialog(QDialog):
                     geometry_text = (
                         f"{parameters['degree']} 次 NURBS · "
                         f"{len(parameters['control_points'])} 控制点"
+                    )
+                elif is_parametric:
+                    parameters = element.geometry.parameters
+                    geometry_text = (
+                        "参数方程曲线 · "
+                        + _parametric_template_label(
+                            parameters.get("template", "custom")
+                        )
                     )
                 else:
                     geometry_text = "直线"
@@ -2582,7 +3151,9 @@ class BeamModelerDialog(QDialog):
                     self.element_family_combo.addItem(element.family, element.family)
                     family_index = self.element_family_combo.count() - 1
                 self.element_family_combo.setCurrentIndex(family_index)
-                self.element_family_combo.setEnabled(not (is_arc or is_nurbs))
+                self.element_family_combo.setEnabled(
+                    not (is_arc or is_nurbs or is_parametric)
+                )
                 self.element_section_combo.setCurrentIndex(
                     max(self.element_section_combo.findData(element.section_id), 0)
                 )
@@ -2768,7 +3339,7 @@ class BeamModelerDialog(QDialog):
             answer = QMessageBox.question(
                 self,
                 "替换当前模型",
-                "参数化生成会替换当前几何，并清空"
+                "新建路径会替换当前几何，并清空"
                 + "和".join(cleared_items)
                 + "。此操作可以撤销，是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2807,7 +3378,23 @@ class BeamModelerDialog(QDialog):
     def _create_spatial_curve(self):
         if not self._confirm_geometry_replacement():
             return
-        dialog = SpatialCurveDialog(self)
+        initial_definition = None
+        if (
+            len(self._project.elements) == 1
+            and self._project.elements[0].geometry.kind == "parametric_curve"
+        ):
+            initial_definition = {
+                "kind": "parametric_curve",
+                **dict(self._project.elements[0].geometry.parameters),
+            }
+        dialog = (
+            SpatialCurveDialog(self)
+            if initial_definition is None
+            else SpatialCurveDialog(
+                self,
+                initial_definition=initial_definition,
+            )
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -2822,6 +3409,19 @@ class BeamModelerDialog(QDialog):
                     end=end,
                 )
                 description = "新建任意平面圆弧"
+            elif definition["kind"] == "parametric_curve":
+                after = PathBeamEditor.create_parametric_curve(
+                    before,
+                    domain=definition["domain"],
+                    expressions=definition["expressions"],
+                    constants=definition["constants"],
+                    template=definition["template"],
+                )
+                description = (
+                    "更新参数方程曲线"
+                    if initial_definition is not None
+                    else "新建参数方程曲线"
+                )
             else:
                 after = PathBeamEditor.create_nurbs_curve(
                     before,

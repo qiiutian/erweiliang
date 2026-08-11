@@ -15,6 +15,14 @@ from ifem.domain.project import (
     StructuralNode,
     new_entity_id,
 )
+from ifem.domain.parametric_expressions import (
+    normalize_parametric_curve,
+    parametric_arc_length,
+    parametric_curve_is_xy,
+    parametric_parameter_at_arc_length,
+    parametric_point_and_derivative,
+    parametric_recommended_sample_count,
+)
 from ifem.domain.parametric_curves import (
     clamped_uniform_knots,
     nurbs_arc_length,
@@ -234,17 +242,99 @@ class PathBeamEditor:
         return resolved
 
     @staticmethod
+    def _curve_point_and_derivative(
+        project: ProjectDocument,
+        element: BeamElement,
+        parameter: float,
+    ):
+        kind = element.geometry.kind
+        if kind == "line":
+            node_a, node_b = PathBeamEditor.element_nodes(project, element)
+            derivative = tuple(
+                float(right) - float(left)
+                for left, right in zip(node_a.coordinates, node_b.coordinates)
+            )
+            return (
+                _interpolate(node_a.coordinates, node_b.coordinates, parameter),
+                derivative,
+            )
+        if kind == "circular_arc":
+            parameters = element.geometry.parameters
+            sweep = radians(parameters["sweep_degrees"])
+            radius_vector = _rotate_about_axis(
+                parameters["start_vector"],
+                parameters["normal"],
+                sweep * parameter,
+            )
+            point = tuple(
+                float(center) + float(offset)
+                for center, offset in zip(parameters["center"], radius_vector)
+            )
+            derivative = tuple(
+                sweep * value
+                for value in _cross(parameters["normal"], radius_vector)
+            )
+            return point, derivative
+        if kind == "nurbs_curve":
+            return nurbs_point_and_derivative(element.geometry.parameters, parameter)
+        if kind == "parametric_curve":
+            return parametric_point_and_derivative(
+                element.geometry.parameters,
+                parameter,
+            )
+        raise ValueError(f"暂不支持的梁几何类型：{kind}")
+
+    @staticmethod
+    def _curve_arc_length(
+        project: ProjectDocument,
+        element: BeamElement,
+        start: float,
+        end: float,
+    ) -> float:
+        kind = element.geometry.kind
+        if kind == "line":
+            node_a, node_b = PathBeamEditor.element_nodes(project, element)
+            return abs(end - start) * _distance(
+                node_a.coordinates,
+                node_b.coordinates,
+            )
+        if kind == "circular_arc":
+            parameters = element.geometry.parameters
+            full_length = float(parameters["radius"]) * abs(
+                radians(parameters["sweep_degrees"])
+            )
+            return abs(end - start) * full_length
+        if kind == "nurbs_curve":
+            return nurbs_arc_length(element.geometry.parameters, start, end)
+        if kind == "parametric_curve":
+            return parametric_arc_length(element.geometry.parameters, start, end)
+        raise ValueError(f"暂不支持的梁几何类型：{kind}")
+
+    @staticmethod
+    def _curve_parameter_at_length(
+        project: ProjectDocument,
+        element: BeamElement,
+        distance: float,
+    ) -> float:
+        kind = element.geometry.kind
+        if kind == "nurbs_curve":
+            return nurbs_parameter_at_arc_length(element.geometry.parameters, distance)
+        if kind == "parametric_curve":
+            return parametric_parameter_at_arc_length(
+                element.geometry.parameters,
+                distance,
+            )
+        length = PathBeamEditor._curve_arc_length(project, element, 0.0, 1.0)
+        target = float(distance)
+        tolerance = max(length, 1.0) * 1.0e-11
+        if not isfinite(target) or target < -tolerance or target > length + tolerance:
+            raise ValueError(f"梁实体局部弧长必须位于 [0, {length:.8g}]。")
+        return min(1.0, max(0.0, target / length))
+
+    @staticmethod
     def element_length(project: ProjectDocument, element: BeamElement | str) -> float:
         element = PathBeamEditor._resolve_element(project, element)
-        if element.geometry.kind == "circular_arc":
-            parameters = element.geometry.parameters
-            return float(parameters["radius"]) * abs(radians(parameters["sweep_degrees"]))
-        if element.geometry.kind == "nurbs_curve":
-            return nurbs_arc_length(element.geometry.parameters)
-        if element.geometry.kind != "line":
-            raise ValueError(f"暂不支持的梁几何类型：{element.geometry.kind}")
-        node_a, node_b = PathBeamEditor.element_nodes(project, element)
-        return _distance(node_a.coordinates, node_b.coordinates)
+        return PathBeamEditor._curve_arc_length(project, element, 0.0, 1.0)
 
     @staticmethod
     def element_arc_length(
@@ -258,9 +348,7 @@ class PathBeamEditor:
         right = float(end)
         if not all(isfinite(value) and 0.0 <= value <= 1.0 for value in (left, right)):
             raise ValueError("梁实体弧长区间必须位于 [0, 1]。")
-        if element.geometry.kind == "nurbs_curve":
-            return nurbs_arc_length(element.geometry.parameters, left, right)
-        return abs(right - left) * PathBeamEditor.element_length(project, element)
+        return PathBeamEditor._curve_arc_length(project, element, left, right)
 
     @staticmethod
     def element_parameter_at_length(
@@ -269,14 +357,7 @@ class PathBeamEditor:
         distance: float,
     ) -> float:
         element = PathBeamEditor._resolve_element(project, element)
-        if element.geometry.kind == "nurbs_curve":
-            return nurbs_parameter_at_arc_length(element.geometry.parameters, distance)
-        length = PathBeamEditor.element_length(project, element)
-        target = float(distance)
-        tolerance = max(length, 1.0) * 1.0e-11
-        if not isfinite(target) or target < -tolerance or target > length + tolerance:
-            raise ValueError(f"梁实体局部弧长必须位于 [0, {length:.8g}]。")
-        return min(1.0, max(0.0, target / length))
+        return PathBeamEditor._curve_parameter_at_length(project, element, distance)
 
     @staticmethod
     def total_length(project: ProjectDocument) -> float:
@@ -295,28 +376,12 @@ class PathBeamEditor:
         parameter = float(local_coordinate)
         if not 0.0 <= parameter <= 1.0:
             raise ValueError("梁单元局部坐标必须位于 [0, 1]。")
-        if element.geometry.kind == "circular_arc":
-            parameters = element.geometry.parameters
-            angle = radians(parameters["sweep_degrees"]) * parameter
-            radius_vector = _rotate_about_axis(
-                parameters["start_vector"],
-                parameters["normal"],
-                angle,
-            )
-            return tuple(
-                float(center) + float(offset)
-                for center, offset in zip(parameters["center"], radius_vector)
-            )
-        if element.geometry.kind == "nurbs_curve":
-            point, _derivative = nurbs_point_and_derivative(
-                element.geometry.parameters,
-                parameter,
-            )
-            return point
-        if element.geometry.kind != "line":
-            raise ValueError(f"暂不支持的梁几何类型：{element.geometry.kind}")
-        node_a, node_b = PathBeamEditor.element_nodes(project, element)
-        return _interpolate(node_a.coordinates, node_b.coordinates, parameter)
+        point, _derivative = PathBeamEditor._curve_point_and_derivative(
+            project,
+            element,
+            parameter,
+        )
+        return point
 
     @staticmethod
     def tangent_on_element(
@@ -326,31 +391,12 @@ class PathBeamEditor:
     ) -> tuple[float, float, float]:
         element = PathBeamEditor._resolve_element(project, element)
         parameter = min(1.0, max(0.0, float(local_coordinate)))
-        if element.geometry.kind == "circular_arc":
-            parameters = element.geometry.parameters
-            angle = radians(parameters["sweep_degrees"]) * parameter
-            radius_vector = _rotate_about_axis(
-                parameters["start_vector"],
-                parameters["normal"],
-                angle,
-            )
-            tangent = _cross(parameters["normal"], radius_vector)
-            if float(parameters["sweep_degrees"]) < 0.0:
-                tangent = tuple(-value for value in tangent)
-            return _normalize(tangent)
-        if element.geometry.kind == "nurbs_curve":
-            _point, derivative = nurbs_point_and_derivative(
-                element.geometry.parameters,
-                parameter,
-            )
-            return _normalize(derivative)
-        node_a, node_b = PathBeamEditor.element_nodes(project, element)
-        return _normalize(
-            tuple(
-                float(right) - float(left)
-                for left, right in zip(node_a.coordinates, node_b.coordinates)
-            )
+        _point, derivative = PathBeamEditor._curve_point_and_derivative(
+            project,
+            element,
+            parameter,
         )
+        return _normalize(derivative)
 
     @staticmethod
     def section_frame(
@@ -364,12 +410,12 @@ class PathBeamEditor:
     ]:
         element = PathBeamEditor._resolve_element(project, element)
         tangent = PathBeamEditor.tangent_on_element(project, element, local_coordinate)
-        if element.geometry.kind == "nurbs_curve":
-            return PathBeamEditor._nurbs_section_frame(
+        if element.geometry.kind in {"nurbs_curve", "parametric_curve"}:
+            return PathBeamEditor.section_frames(
                 project,
                 element,
-                local_coordinate,
-            )
+                (local_coordinate,),
+            )[0]
         reference = (
             tuple(float(value) for value in element.geometry.parameters["normal"])
             if element.geometry.kind == "circular_arc"
@@ -386,23 +432,27 @@ class PathBeamEditor:
         return tangent, normal, binormal
 
     @staticmethod
-    def _nurbs_section_frame(
+    def section_frames(
         project: ProjectDocument,
-        element: BeamElement,
-        local_coordinate: float,
+        element: BeamElement | str,
+        local_coordinates,
     ):
-        target_xi = min(1.0, max(0.0, float(local_coordinate)))
-        previous_tangent = PathBeamEditor.tangent_on_element(project, element, 0.0)
-        reference = (0.0, 0.0, 1.0)
-        normal = _cross(reference, previous_tangent)
-        if _dot(normal, normal) <= _GEOMETRY_TOLERANCE**2:
-            normal = _cross((0.0, 1.0, 0.0), previous_tangent)
-        normal = _normalize(normal)
-        control_count = len(element.geometry.parameters["control_points"])
-        steps = max(1, ceil(target_xi * max(32, 12 * (control_count - 1))))
-        for index in range(1, steps + 1):
-            xi = target_xi * index / steps
-            tangent = PathBeamEditor.tangent_on_element(project, element, xi)
+        """Return query-independent frames on one canonical transport path."""
+
+        element = PathBeamEditor._resolve_element(project, element)
+        coordinates = tuple(float(value) for value in local_coordinates)
+        if not all(isfinite(value) and 0.0 <= value <= 1.0 for value in coordinates):
+            raise ValueError("截面标架局部坐标必须位于 [0, 1]。")
+        if not coordinates:
+            return ()
+        if element.geometry.kind not in {"nurbs_curve", "parametric_curve"}:
+            return tuple(
+                PathBeamEditor.section_frame(project, element, value)
+                for value in coordinates
+            )
+
+        def transported_normal(previous_tangent, previous_normal, tangent):
+            normal = previous_normal
             axis = _cross(previous_tangent, tangent)
             axis_length = sqrt(_dot(axis, axis))
             alignment = max(-1.0, min(1.0, _dot(previous_tangent, tangent)))
@@ -420,11 +470,57 @@ class PathBeamEditor:
                 normal = _cross((0.0, 0.0, 1.0), tangent)
                 if _dot(normal, normal) <= _GEOMETRY_TOLERANCE**2:
                     normal = _cross((0.0, 1.0, 0.0), tangent)
-            normal = _normalize(normal)
+            return _normalize(normal)
+
+        start_tangent = PathBeamEditor.tangent_on_element(project, element, 0.0)
+        reference = (0.0, 0.0, 1.0)
+        start_normal = _cross(reference, start_tangent)
+        if _dot(start_normal, start_normal) <= _GEOMETRY_TOLERANCE**2:
+            start_normal = _cross((0.0, 1.0, 0.0), start_tangent)
+        start_normal = _normalize(start_normal)
+        if element.geometry.kind == "nurbs_curve":
+            control_count = len(element.geometry.parameters["control_points"])
+            base_steps = max(32, 12 * (control_count - 1))
+        else:
+            base_steps = parametric_recommended_sample_count(
+                element.geometry.parameters
+            ) - 1
+
+        # Build one fixed path first.  Query coordinates may add a final partial
+        # step, but can never change the transport used by another coordinate.
+        canonical_frames = [(start_tangent, start_normal)]
+        previous_tangent = start_tangent
+        normal = start_normal
+        for index in range(1, base_steps + 1):
+            tangent = PathBeamEditor.tangent_on_element(
+                project,
+                element,
+                index / base_steps,
+            )
+            normal = transported_normal(previous_tangent, normal, tangent)
+            canonical_frames.append((tangent, normal))
             previous_tangent = tangent
-        tangent = previous_tangent
-        binormal = _normalize(_cross(tangent, normal))
-        return tangent, normal, binormal
+
+        frames = []
+        for target_xi in coordinates:
+            left_index = min(base_steps, int(target_xi * base_steps))
+            base_xi = left_index / base_steps
+            tangent, target_normal = canonical_frames[left_index]
+            if target_xi > base_xi:
+                target_tangent = PathBeamEditor.tangent_on_element(
+                    project,
+                    element,
+                    target_xi,
+                )
+                target_normal = transported_normal(
+                    tangent,
+                    target_normal,
+                    target_tangent,
+                )
+                tangent = target_tangent
+            binormal = _normalize(_cross(tangent, target_normal))
+            frames.append((tangent, target_normal, binormal))
+        return tuple(frames)
 
     @staticmethod
     def sensor_orientation(
@@ -591,6 +687,11 @@ class PathBeamEditor:
         elif element.geometry.kind == "nurbs_curve":
             control_count = len(element.geometry.parameters["control_points"])
             count = sample_count or min(241, max(41, 16 * (control_count - 1) + 1))
+        elif element.geometry.kind == "parametric_curve":
+            count = max(
+                int(sample_count or 0),
+                parametric_recommended_sample_count(element.geometry.parameters),
+            )
         else:
             raise ValueError(f"暂不支持的梁几何类型：{element.geometry.kind}")
         count = max(2, int(count))
@@ -938,6 +1039,12 @@ class PathBeamEditor:
                 for element in project.elements
             ):
                 raise ValueError("当前模型包含空间 NURBS 曲线，不能直接切换为二维建模。")
+            if any(
+                element.geometry.kind == "parametric_curve"
+                and not parametric_curve_is_xy(element.geometry.parameters)
+                for element in project.elements
+            ):
+                raise ValueError("当前模型包含空间参数曲线，不能直接切换为二维建模。")
         elements = tuple(
             replace(
                 element,
@@ -2363,6 +2470,61 @@ class PathBeamEditor:
         return replace(blank, elements=(element,))
 
     @staticmethod
+    def create_parametric_curve(
+        project: ProjectDocument,
+        *,
+        expressions: Mapping[str, str],
+        domain=(0.0, 1.0),
+        constants: Mapping[str, float] | None = None,
+        template: str = "custom",
+    ) -> ProjectDocument:
+        parameters = normalize_parametric_curve(
+            {
+                "domain": tuple(domain),
+                "expressions": dict(expressions),
+                "constants": {} if constants is None else dict(constants),
+                "template": template,
+            }
+        )
+        geometry = BeamGeometryDefinition(
+            kind="parametric_curve",
+            parameters=parameters,
+        )
+        sampled_points = tuple(
+            parametric_point_and_derivative(parameters, index / 64.0)[0]
+            for index in range(65)
+        )
+        modeling_space = (
+            "3d"
+            if project.modeling_space == "3d"
+            or not parametric_curve_is_xy(parameters)
+            else "2d"
+        )
+        start = sampled_points[0]
+        end = sampled_points[-1]
+        nodes = (
+            StructuralNode(new_entity_id("node"), start),
+            StructuralNode(new_entity_id("node"), end),
+        )
+        blank = project.revised(
+            modeling_space=modeling_space,
+            nodes=nodes,
+            elements=(),
+            sensors=(),
+            boundary_conditions=(),
+        )
+        element = PathBeamEditor._new_element(
+            blank,
+            (nodes[0].identifier, nodes[1].identifier),
+            family=PathBeamEditor._family_for_geometry(
+                modeling_space,
+                "parametric_curve",
+            ),
+            geometry=geometry,
+        )
+        return replace(blank, elements=(element,))
+
+    @staticmethod
     def _circular_arc_geometry(
         *,
         radius: float,
@@ -2660,6 +2822,8 @@ class PathBeamEditor:
                         kind = "二维圆弧梁"
                     elif len(elements) == 1 and geometry_kinds == ("nurbs_curve",):
                         kind = "二维样条曲梁"
+                    elif len(elements) == 1 and geometry_kinds == ("parametric_curve",):
+                        kind = "二维参数曲梁"
                     else:
                         kind = "二维曲梁"
                 elif collinear:
@@ -2682,6 +2846,9 @@ class PathBeamEditor:
                     kind = (
                         "三维样条曲梁"
                         if len(elements) == 1 and geometry_kinds == ("nurbs_curve",)
+                        else "三维参数曲梁"
+                        if len(elements) == 1
+                        and geometry_kinds == ("parametric_curve",)
                         else "三维曲梁"
                     )
                 elif collinear:

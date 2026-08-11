@@ -326,10 +326,11 @@ class BeamGeometry3DView(QWidget):
                 mesh = centerline.tube(radius=display_size * 0.5, n_sides=20)
             else:
                 local_coordinates = np.linspace(0.0, 1.0, len(points))
-                frames = [
-                    PathBeamEditor.section_frame(self.project, element, value)
-                    for value in local_coordinates
-                ]
+                frames = PathBeamEditor.section_frames(
+                    self.project,
+                    element,
+                    local_coordinates,
+                )
                 normals = np.asarray([frame[1] for frame in frames], dtype=float)
                 binormals = np.asarray([frame[2] for frame in frames], dtype=float)
                 mesh_points, mesh_faces = sweep_section_mesh(

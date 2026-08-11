@@ -1,12 +1,19 @@
+import tempfile
 import unittest
 from dataclasses import replace
 from math import pi, sqrt
+from pathlib import Path
 
 import numpy as np
 
 from config_adapter import get_sample_config
 from ifem.domain.project import ProjectDocument, empty_beam_project
-from ifem.infrastructure import legacy_config_from_project, project_from_legacy_config
+from ifem.infrastructure import (
+    legacy_config_from_project,
+    load_project,
+    project_from_legacy_config,
+    save_project,
+)
 from ifem.modeling import PathBeamEditor
 from ifem.modeling.section_geometry import section_boundary_point
 
@@ -67,6 +74,90 @@ class PathBeamEditorTests(unittest.TestCase):
         self.assertEqual(len(restored.nodes), 2)
         self.assertEqual(len(restored.elements), 1)
         self.assertEqual(restored.elements[0].geometry, arc.elements[0].geometry)
+
+    def test_parametric_helix_uses_true_arc_length_frames_and_project_round_trip(self):
+        helix = PathBeamEditor.create_parametric_curve(
+            empty_beam_project(modeling_space="2d"),
+            domain=(0.0, 1.0),
+            expressions={
+                "x": "R*cos(2*pi*N*t)",
+                "y": "R*sin(2*pi*N*t)",
+                "z": "H*t",
+            },
+            constants={"R": 1.0, "N": 2.0, "H": 2.0},
+            template="helix",
+        )
+        element = helix.elements[0]
+
+        self.assertEqual(helix.schema_version, 7)
+        self.assertEqual(helix.modeling_space, "3d")
+        self.assertEqual(element.geometry.kind, "parametric_curve")
+        self.assertEqual(
+            element.geometry.parameters["language"],
+            "ifem-math-v1",
+        )
+        self.assertEqual(PathBeamEditor.capability(helix).kind, "三维参数曲梁")
+        self.assertAlmostEqual(
+            PathBeamEditor.element_length(helix, element),
+            sqrt((4.0 * pi) ** 2 + 2.0**2),
+            places=8,
+        )
+        np.testing.assert_allclose(
+            PathBeamEditor.point_on_element(helix, element, 0.5),
+            (1.0, 0.0, 1.0),
+            atol=1.0e-12,
+        )
+
+        tangent, normal, binormal = PathBeamEditor.section_frame(helix, element, 0.37)
+        frame = np.asarray((tangent, normal, binormal), dtype=float)
+        np.testing.assert_allclose(frame @ frame.T, np.eye(3), atol=1.0e-10)
+
+        samples = PathBeamEditor.sample_element(helix, element)
+        coordinates = tuple(index / (len(samples) - 1) for index in range(len(samples)))
+        frames = PathBeamEditor.section_frames(helix, element, coordinates)
+        self.assertEqual(len(frames), len(samples))
+        for index in (0, len(frames) // 2, len(frames) - 1):
+            np.testing.assert_allclose(
+                frames[index],
+                PathBeamEditor.section_frame(helix, element, coordinates[index]),
+                atol=1.0e-10,
+            )
+
+        target_xi = 0.37
+        distance = PathBeamEditor.element_arc_length(
+            helix,
+            element,
+            0.0,
+            target_xi,
+        )
+        _index, resolved, resolved_xi = PathBeamEditor.element_at_path_distance(
+            helix,
+            distance,
+        )
+        self.assertEqual(resolved.identifier, element.identifier)
+        self.assertAlmostEqual(resolved_xi, target_xi, places=8)
+
+        with_sensor = PathBeamEditor.add_sensor(
+            helix,
+            element.identifier,
+            target_xi,
+            "top",
+        )
+        restored = ProjectDocument.from_dict(with_sensor.to_dict())
+        self.assertEqual(restored.to_dict(), with_sensor.to_dict())
+        with tempfile.TemporaryDirectory() as directory:
+            project_path = Path(directory) / "parametric.ifemproj"
+            save_project(project_path, with_sensor)
+            restored = load_project(project_path)
+        self.assertEqual(restored.to_dict(), with_sensor.to_dict())
+        self.assertAlmostEqual(
+            PathBeamEditor.sensor_location(
+                restored,
+                restored.sensors[0].identifier,
+            ).path_distance,
+            distance,
+            places=8,
+        )
 
     def test_tilted_three_point_arc_keeps_exact_spatial_plane(self):
         normal = np.asarray((1.0, 1.0, 1.0), dtype=float)
@@ -292,6 +383,60 @@ class PathBeamEditorTests(unittest.TestCase):
         )
         self.assertAlmostEqual(weighted_length, 20.09973156, places=7)
         self.assertAlmostEqual(weighted_length, split_length, places=8)
+
+    def test_nurbs_bulk_frames_match_single_frames_and_surface_pick(self):
+        project = PathBeamEditor.create_nurbs_curve(
+            empty_beam_project(modeling_space="3d"),
+            control_points=(
+                (0.0, 0.0, 0.0),
+                (-2.0, 6.0, 0.5),
+                (-1.0, 5.0, -0.1),
+                (-0.4, -6.0, 1.8),
+                (3.0, 6.0, -3.0),
+                (6.0, 0.0, 0.0),
+            ),
+            degree=3,
+        )
+        element = project.elements[0]
+        coordinates = tuple(float(value) for value in np.linspace(0.0, 1.0, 81))
+        frames = PathBeamEditor.section_frames(project, element, coordinates)
+
+        for index in (1, 7, 28, 57, 79):
+            np.testing.assert_allclose(
+                frames[index],
+                PathBeamEditor.section_frame(project, element, coordinates[index]),
+                atol=1.0e-12,
+            )
+
+        index = 28
+        xi = coordinates[index]
+        centerline = np.asarray(
+            PathBeamEditor.point_on_element(project, element, xi),
+            dtype=float,
+        )
+        _tangent, normal, binormal = (
+            np.asarray(vector, dtype=float) for vector in frames[index]
+        )
+        section = next(
+            item for item in project.sections if item.identifier == element.section_id
+        )
+        boundary = section_boundary_point(section, 0.0)
+        rendered_point = (
+            centerline
+            + normal * boundary.local_position[0]
+            + binormal * boundary.local_position[1]
+        )
+        location = PathBeamEditor.surface_location_from_point(
+            project,
+            rendered_point,
+        )
+
+        self.assertAlmostEqual(location.local_coordinate, xi, places=5)
+        angle_error = min(
+            abs(location.surface_angle_degrees),
+            abs(360.0 - location.surface_angle_degrees),
+        )
+        self.assertLess(angle_error, 1.0e-4)
 
     def test_nurbs_surface_pick_recovers_curve_and_section_coordinates(self):
         project = PathBeamEditor.create_nurbs_curve(

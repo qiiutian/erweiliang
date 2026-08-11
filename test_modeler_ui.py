@@ -2142,6 +2142,116 @@ class ModelerUiTests(unittest.TestCase):
             dialog.definition()
         dialog.close()
 
+    def test_spatial_curve_dialog_builds_parametric_templates_and_targets_errors(self):
+        dialog = SpatialCurveDialog()
+        dialog.kind_combo.setCurrentIndex(
+            dialog.kind_combo.findData(SpatialCurveDialog.PARAMETRIC)
+        )
+
+        helix = dialog.definition()
+
+        self.assertEqual(helix["kind"], "parametric_curve")
+        self.assertEqual(helix["template"], "helix")
+        self.assertEqual(helix["domain"], (0.0, 1.0))
+        self.assertEqual(helix["constants"]["R"], 1.0)
+        self.assertIn("cos", helix["expressions"]["x"])
+        self.assertEqual(len(dialog.parametric_preview.samples), 129)
+        self.assertEqual(
+            dialog.expression_edits["x"].accessibleName(),
+            "参数表达式 x(t)",
+        )
+        self.assertEqual(
+            dialog.constants_table.accessibleName(),
+            "参数曲线用户常量表",
+        )
+        self.assertTrue(
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+        )
+
+        reopened = SpatialCurveDialog(initial_definition=helix)
+        self.assertEqual(
+            reopened.kind_combo.currentData(),
+            SpatialCurveDialog.PARAMETRIC,
+        )
+        self.assertEqual(reopened.definition(), helix)
+        self.assertEqual(reopened.windowTitle(), "编辑参数曲线")
+        self.assertEqual(
+            reopened.buttons.button(QDialogButtonBox.StandardButton.Ok).text(),
+            "应用曲线",
+        )
+        reopened.close()
+
+        precise = {
+            "kind": "parametric_curve",
+            "language": "ifem-math-v1",
+            "domain": (0.12345678912345, 1.98765432198765),
+            "expressions": {"x": "C*t", "y": "0", "z": "0"},
+            "constants": {"C": 1.2345678901234567},
+            "template": "custom",
+        }
+        precise_reopened = SpatialCurveDialog(initial_definition=precise)
+        self.assertEqual(precise_reopened.definition(), precise)
+        precise_reopened.close()
+
+        dialog.parametric_template_combo.setCurrentIndex(
+            dialog.parametric_template_combo.findData("parabola")
+        )
+        parabola = dialog.definition()
+        self.assertEqual(parabola["template"], "parabola")
+        self.assertEqual(parabola["expressions"]["y"], "4*H*t*(1-t)")
+
+        dialog.parametric_template_combo.setCurrentIndex(
+            dialog.parametric_template_combo.findData("custom")
+        )
+        dialog.expression_edits["x"].setText("open('curve')")
+        dialog._refresh_state()
+        self.assertFalse(
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+        )
+        self.assertEqual(
+            dialog.expression_edits["x"].property("validationState"),
+            "error",
+        )
+        self.assertIn("x(t)", dialog.feedback_label.text())
+        self.assertEqual(dialog.parametric_preview.samples, ())
+
+        dialog.expression_edits["x"].setText("1/(t-0.5)")
+        dialog._refresh_state()
+        self.assertEqual(
+            dialog.expression_edits["x"].property("validationState"),
+            "error",
+        )
+        self.assertIn("只允许除以", dialog.feedback_label.text())
+        self.assertEqual(dialog.parametric_preview.samples, ())
+
+        dialog.expression_edits["x"].setText("t")
+        dialog.domain_end_spin.setValue(dialog.domain_start_spin.value())
+        dialog._refresh_state()
+        self.assertEqual(
+            dialog.domain_end_spin.property("validationState"),
+            "error",
+        )
+        self.assertIn("t₀ < t₁", dialog.feedback_label.text())
+
+        dialog.domain_end_spin.setValue(1.0)
+        dialog.domain_start_spin.setText("")
+        dialog._refresh_state()
+        self.assertEqual(
+            dialog.domain_start_spin.property("validationState"),
+            "error",
+        )
+        dialog.domain_start_spin.setValue(0.0)
+        dialog._add_constant_row()
+        dialog.constants_table.item(0, 0).setText("t")
+        dialog.constants_table.item(0, 1).setText("2")
+        dialog._refresh_state()
+        self.assertEqual(
+            dialog.constants_table.property("validationState"),
+            "error",
+        )
+        self.assertIn("已保留", dialog.feedback_label.text())
+        dialog.close()
+
     def test_modeler_creates_single_nurbs_entity_and_supports_undo(self):
         project = PathBeamEditor.create_straight_beam(
             empty_beam_project(modeling_space="3d"),
@@ -2181,6 +2291,53 @@ class ModelerUiTests(unittest.TestCase):
         self.assertEqual(dialog.project.modeling_space, "3d")
         self.assertIn("3 次 NURBS", dialog.current_path_label.toolTip())
         self.assertIn("4 控制点", dialog.current_path_label.toolTip())
+        dialog.undo_stack.undo()
+        self.assertEqual(dialog.project.elements[0].geometry.kind, "line")
+        dialog.close()
+
+    def test_modeler_creates_parametric_curve_and_supports_undo(self):
+        project = PathBeamEditor.create_straight_beam(
+            empty_beam_project(modeling_space="3d"),
+            length=2.0,
+            element_count=1,
+        )
+        dialog = BeamModelerDialog(project)
+
+        class AcceptedParametricCurveDialog:
+            ARC = SpatialCurveDialog.ARC
+
+            def __init__(self, _parent=None):
+                self.curve_definition = {
+                    "kind": "parametric_curve",
+                    "domain": (0.0, 1.0),
+                    "expressions": {
+                        "x": "R*cos(2*pi*N*t)",
+                        "y": "R*sin(2*pi*N*t)",
+                        "z": "H*t",
+                    },
+                    "constants": {"R": 1.0, "N": 2.0, "H": 2.0},
+                    "template": "helix",
+                }
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+        with patch(
+            "ifem.ui.modeler.SpatialCurveDialog",
+            AcceptedParametricCurveDialog,
+        ):
+            dialog._create_spatial_curve()
+
+        element = dialog.project.elements[0]
+        self.assertEqual(element.geometry.kind, "parametric_curve")
+        self.assertEqual(element.geometry.parameters["template"], "helix")
+        self.assertEqual(element.geometry.parameters["domain"], (0.0, 1.0))
+        self.assertIn("参数方程曲线", dialog.current_path_label.toolTip())
+        self.assertIn("空间螺旋线", dialog.current_path_label.toolTip())
+        dialog._selection_changed("element", element.identifier)
+        self.assertIn("参数方程曲线", dialog.element_geometry_label.text())
+        self.assertFalse(dialog.element_family_combo.isEnabled())
+
         dialog.undo_stack.undo()
         self.assertEqual(dialog.project.elements[0].geometry.kind, "line")
         dialog.close()

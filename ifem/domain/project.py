@@ -6,10 +6,16 @@ from math import cos, isfinite, radians, sin, sqrt
 from typing import Any
 from uuid import uuid4
 
+from ifem.domain.parametric_expressions import (
+    normalize_parametric_curve,
+    parametric_curve_is_xy,
+    parametric_point_and_derivative,
+    validate_parametric_regularity,
+)
 from ifem.domain.parametric_curves import validate_nurbs_regularity
 
 
-CURRENT_PROJECT_SCHEMA_VERSION = 6
+CURRENT_PROJECT_SCHEMA_VERSION = 7
 
 
 def _normalize_json_value(
@@ -186,6 +192,9 @@ class BeamGeometryDefinition:
                     "plane": plane,
                 }
             )
+        elif kind == "parametric_curve":
+            parameters = normalize_parametric_curve(parameters)
+            validate_parametric_regularity(parameters)
         elif kind == "nurbs_curve":
             raw_points = parameters.get("control_points", ())
             if not isinstance(raw_points, (list, tuple)):
@@ -581,6 +590,12 @@ def _infer_modeling_space(
         for element in elements
     ):
         return "3d"
+    if any(
+        element.geometry.kind == "parametric_curve"
+        and not parametric_curve_is_xy(element.geometry.parameters)
+        for element in elements
+    ):
+        return "3d"
     return "2d"
 
 
@@ -638,6 +653,12 @@ class ProjectDocument:
                 for element in elements
             ):
                 raise ValueError("二维模型中的 NURBS 控制点必须位于 XY 平面。")
+            if any(
+                element.geometry.kind == "parametric_curve"
+                and not parametric_curve_is_xy(element.geometry.parameters)
+                for element in elements
+            ):
+                raise ValueError("二维模型中的参数曲线必须位于 XY 平面。")
 
         node_ids = {node.identifier for node in nodes}
         nodes_by_id = {node.identifier: node for node in nodes}
@@ -698,6 +719,29 @@ class ProjectDocument:
                 ):
                     raise ValueError(
                         f"NURBS 梁单元 {element.identifier} 的控制曲线端点必须与结构节点一致。"
+                    )
+            if element.geometry.kind == "parametric_curve":
+                curve_endpoints = (
+                    parametric_point_and_derivative(
+                        element.geometry.parameters,
+                        0.0,
+                    )[0],
+                    parametric_point_and_derivative(
+                        element.geometry.parameters,
+                        1.0,
+                    )[0],
+                )
+                scale = max(
+                    _point_distance(curve_endpoints[0], curve_endpoints[1]),
+                    1.0,
+                )
+                if any(
+                    _point_distance(nodes_by_id[node_id].coordinates, endpoint)
+                    > scale * 1.0e-8
+                    for node_id, endpoint in zip(element.node_ids, curve_endpoints)
+                ):
+                    raise ValueError(
+                        f"参数曲线梁单元 {element.identifier} 的表达式端点必须与结构节点一致。"
                     )
             if element.material_id is not None and element.material_id not in material_ids:
                 raise ValueError(f"梁单元 {element.identifier} 引用了不存在的材料。")
@@ -768,7 +812,7 @@ class ProjectDocument:
             raise ValueError("项目 schema_version 必须是整数。")
         if source_version < 1 or source_version > CURRENT_PROJECT_SCHEMA_VERSION:
             raise ValueError(f"不支持的项目版本：{source_version}")
-        if source_version in {1, 2, 3, 4, 5}:
+        if source_version in {1, 2, 3, 4, 5, 6}:
             data["schema_version"] = CURRENT_PROJECT_SCHEMA_VERSION
         nodes = tuple(StructuralNode(**item) for item in data.get("nodes", []))
         elements = tuple(BeamElement(**item) for item in data.get("elements", []))

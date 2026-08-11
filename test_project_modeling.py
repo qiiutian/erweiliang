@@ -155,6 +155,24 @@ class ProjectDocumentTests(unittest.TestCase):
                 weights=(1.0, 1.0e7, 1.0),
             )
 
+        parametric = PathBeamEditor.create_parametric_curve(
+            empty_beam_project(modeling_space="3d"),
+            expressions={
+                "x": "t",
+                "y": "0",
+                "z": "sin(2*pi*t)",
+            },
+        )
+        disguised_2d = parametric.to_dict()
+        disguised_2d["modeling_space"] = "2d"
+        with self.assertRaisesRegex(ValueError, "参数曲线必须位于 XY 平面"):
+            ProjectDocument.from_dict(disguised_2d)
+
+        disconnected_parametric = parametric.to_dict()
+        disconnected_parametric["nodes"][1]["coordinates"] = (2.0, 0.0, 0.0)
+        with self.assertRaisesRegex(ValueError, "表达式端点必须与结构节点一致"):
+            ProjectDocument.from_dict(disconnected_parametric)
+
     def test_project_dictionary_and_file_round_trip_keep_ids(self):
         restored = ProjectDocument.from_dict(self.project.to_dict())
         self.assertEqual(restored.identifier, self.project.identifier)
@@ -183,7 +201,7 @@ class ProjectDocumentTests(unittest.TestCase):
         restored = ProjectDocument.from_dict(payload)
 
         self.assertEqual(restored.schema_version, CURRENT_PROJECT_SCHEMA_VERSION)
-        self.assertEqual(CURRENT_PROJECT_SCHEMA_VERSION, 6)
+        self.assertEqual(CURRENT_PROJECT_SCHEMA_VERSION, 7)
         self.assertIsNone(restored.analysis_cases[0].algorithm_version)
         self.assertIsNone(restored.analysis_cases[0].parameter_schema_version)
         self.assertEqual(
@@ -213,7 +231,7 @@ class ProjectDocumentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不支持的字段.*vendor_extension"):
             ProjectDocument.from_dict(payload)
 
-    def test_schema_v6_analysis_case_round_trip_preserves_opaque_parameters(self):
+    def test_schema_v6_migrates_to_v7_and_preserves_opaque_parameters(self):
         source_parameters = {
             "gauss_n": 4,
             "plugin_state": {
@@ -234,12 +252,17 @@ class ProjectDocumentTests(unittest.TestCase):
             analysis_case.parameters["plugin_state"]["weights"],
             [1, 2.5, None, "原样保留"],
         )
+        payload = versioned.to_dict()
+        payload["schema_version"] = 6
+        migrated = ProjectDocument.from_dict(payload)
+        self.assertEqual(migrated.schema_version, 7)
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "versioned.ifemproj"
-            save_project(path, versioned)
+            save_project(path, migrated)
             restored = load_project(path)
 
-        self.assertEqual(restored.to_dict(), versioned.to_dict())
+        self.assertEqual(restored.to_dict(), migrated.to_dict())
         self.assertEqual(restored.analysis_cases[0].algorithm_version, "1.0.0")
         self.assertEqual(restored.analysis_cases[0].parameter_schema_version, "2")
 
