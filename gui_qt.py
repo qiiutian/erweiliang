@@ -10,7 +10,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal, QSize
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -57,6 +57,7 @@ from config_adapter import (
     true_point_rows_from_config,
 )
 from ifem.application import get_default_analysis_service, match_project_algorithms
+from ifem.ui.studio import CommandPalette, ElidingLabel, StudioCommand, WorkspaceRail, line_icon
 from ifem.application.parameter_validation import (
     parameter_field,
     validate_parameters,
@@ -80,7 +81,6 @@ from ifem.ui.start_center import (
     StartupRequest,
 )
 from ifem.ui.theme import (
-    AppearanceDialog,
     apply_application_theme,
     compose_stylesheet,
     current_theme_id,
@@ -3211,17 +3211,17 @@ class ReconstructionMainWindow(QMainWindow):
         central.setObjectName("appRoot")
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(12, 10, 12, 7)
+        root_layout.setContentsMargins(10, 10, 12, 7)
         root_layout.setSpacing(10)
 
         top_bar = QFrame()
         top_bar.setObjectName("topBar")
         toolbar = QHBoxLayout(top_bar)
-        toolbar.setContentsMargins(12, 9, 10, 9)
+        toolbar.setContentsMargins(14, 8, 10, 8)
         toolbar.setSpacing(7)
         self.top_bar_shadow = QGraphicsDropShadowEffect(top_bar)
-        self.top_bar_shadow.setBlurRadius(18)
-        self.top_bar_shadow.setOffset(0, 3)
+        self.top_bar_shadow.setBlurRadius(10)
+        self.top_bar_shadow.setOffset(0, 2)
         top_bar.setGraphicsEffect(self.top_bar_shadow)
         self._update_theme_shadow()
 
@@ -3235,12 +3235,24 @@ class ReconstructionMainWindow(QMainWindow):
         identity.setSpacing(1)
         app_title = QLabel("iFEM")
         app_title.setObjectName("appTitle")
-        self.app_subtitle = QLabel("未命名项目 · 未保存")
+        self.app_subtitle = ElidingLabel("未命名项目 · 未保存")
         self.app_subtitle.setObjectName("appSubtitle")
+        self.app_subtitle.setMinimumWidth(130)
+        self.app_subtitle.setMaximumWidth(360)
         identity.addWidget(app_title)
         identity.addWidget(self.app_subtitle)
-        toolbar.addLayout(identity)
-        toolbar.addStretch(1)
+        toolbar.addLayout(identity, 1)
+
+        self.command_button = QPushButton("搜索命令    Ctrl+K")
+        self.command_button.setObjectName("commandLauncher")
+        self.command_button.setToolTip("查找工作区、建模、运行、保存和显示命令（Ctrl+K）")
+        self.command_button.setAccessibleName("搜索命令")
+        self.command_button.clicked.connect(self.show_command_palette)
+        toolbar.addWidget(self.command_button)
+        self.command_action = QAction("搜索命令", self)
+        self.command_action.setShortcut(QKeySequence("Ctrl+K"))
+        self.command_action.triggered.connect(self.show_command_palette)
+        self.addAction(self.command_action)
 
         command_cluster = QFrame()
         command_cluster.setObjectName("commandCluster")
@@ -3252,6 +3264,7 @@ class ReconstructionMainWindow(QMainWindow):
             ("打开", self.open_project, "从项目库打开项目（Ctrl+O）", "Ctrl+O"),
             ("保存", self.save_current_project, "保存到 iFEM 项目库（Ctrl+S）", "Ctrl+S"),
         ]
+        self.project_action_buttons = []
         for text, handler, tooltip, shortcut in project_actions:
             button = QPushButton(text)
             button.setObjectName("topBarButton")
@@ -3259,6 +3272,7 @@ class ReconstructionMainWindow(QMainWindow):
             button.setShortcut(QKeySequence(shortcut))
             button.clicked.connect(handler)
             command_layout.addWidget(button)
+            self.project_action_buttons.append(button)
 
         more_menu = QMenu(self)
         save_as_action = more_menu.addAction("另存项目…")
@@ -3266,10 +3280,8 @@ class ReconstructionMainWindow(QMainWindow):
         sample_action = more_menu.addAction("载入示例")
         sample_action.triggered.connect(self.load_sample_data)
         more_menu.addSeparator()
-        appearance_action = more_menu.addAction("界面风格…")
-        appearance_action.setShortcut(QKeySequence("Ctrl+,"))
-        appearance_action.setToolTip("切换整个软件的配色风格（Ctrl+,）")
-        appearance_action.triggered.connect(self.show_appearance_settings)
+        reset_layout_action = more_menu.addAction("重置工作区布局")
+        reset_layout_action.triggered.connect(self.reset_workspace_layout)
         more_menu.addSeparator()
         exchange_action = more_menu.addAction("打开数据交换")
         exchange_action.triggered.connect(self.show_data_exchange)
@@ -3279,10 +3291,9 @@ class ReconstructionMainWindow(QMainWindow):
         import_json_action.triggered.connect(self.import_json_to_form)
         self.more_button = QPushButton("更多")
         self.more_button.setObjectName("topBarButton")
-        self.more_button.setToolTip("另存项目、切换界面风格或进行 JSON 数据交换")
+        self.more_button.setToolTip("另存项目、恢复工作区布局或进行 JSON 数据交换")
         self.more_button.setMenu(more_menu)
         command_layout.addWidget(self.more_button)
-        self.appearance_action = appearance_action
         self.save_as_action = QAction("另存项目", self)
         self.save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self.save_as_action.setToolTip("以新名称保存到项目库（Ctrl+Shift+S）")
@@ -3326,29 +3337,31 @@ class ReconstructionMainWindow(QMainWindow):
         self.main_split = main_split
         main_split.setChildrenCollapsible(False)
         main_split.setHandleWidth(8)
-        root_layout.addWidget(main_split, 1)
+        workspace_body = QHBoxLayout()
+        workspace_body.setSpacing(10)
+        workspace_body.addWidget(main_split, 1)
+        root_layout.addLayout(workspace_body, 1)
 
-        left_panel = QWidget()
+        left_panel = QFrame()
+        left_panel.setObjectName("inputInspector")
         self.left_panel = left_panel
-        left_panel.setMinimumWidth(420)
+        left_panel.setMinimumWidth(380)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setContentsMargins(12, 12, 12, 10)
         left_layout.setSpacing(9)
         main_split.addWidget(left_panel)
 
         left_heading = QHBoxLayout()
-        left_accent = QFrame()
-        left_accent.setObjectName("sectionAccent")
-        left_accent.setFixedSize(3, 30)
-        left_heading.addWidget(left_accent, 0, Qt.AlignmentFlag.AlignVCenter)
         left_title_box = QVBoxLayout()
         left_title_box.setSpacing(0)
-        left_title = QLabel("模型与输入")
+        left_title = QLabel("模型与方法")
+        self.input_heading_title = left_title
         left_title.setObjectName("sectionTitle")
-        left_hint = QLabel("组织几何、测点与约束，布置示意在下方同步更新")
+        left_hint = QLabel("01 / 准备分析")
+        self.input_heading_hint = left_hint
         left_hint.setObjectName("sectionHint")
-        left_title_box.addWidget(left_title)
         left_title_box.addWidget(left_hint)
+        left_title_box.addWidget(left_title)
         left_heading.addLayout(left_title_box)
         left_heading.addStretch(1)
         self.input_status_label = QPushButton("检查中")
@@ -3368,16 +3381,25 @@ class ReconstructionMainWindow(QMainWindow):
         left_layout.addLayout(left_heading)
 
         left_split = QSplitter(Qt.Orientation.Vertical)
+        self.left_split = left_split
         left_split.setChildrenCollapsible(False)
         left_split.setHandleWidth(8)
         left_layout.addWidget(left_split, 1)
 
         self.left_tabs = QTabWidget()
+        self.left_tabs.setObjectName("inputPages")
         self.left_tabs.setAccessibleName("模型与输入工作区")
         left_split.addWidget(self.left_tabs)
         self._build_left_tabs()
+        self.left_tabs.tabBar().hide()
+        self.workspace_rail = WorkspaceRail(self.left_tab_names)
+        self.workspace_rail.page_requested.connect(self._focus_input_tab)
+        self.workspace_rail.search_requested.connect(self.show_command_palette)
+        self.left_tabs.currentChanged.connect(self._sync_workspace_navigation)
+        workspace_body.insertWidget(0, self.workspace_rail)
 
         preview_group = QGroupBox("梁与传感器布置")
+        self.preview_group = preview_group
         preview_group.setObjectName("workspaceGroup")
         preview_group.setMinimumHeight(150)
         preview_layout = QVBoxLayout(preview_group)
@@ -3393,34 +3415,45 @@ class ReconstructionMainWindow(QMainWindow):
         left_split.setSizes([550, 170])
         left_split.setStretchFactor(0, 3)
         left_split.setStretchFactor(1, 1)
+        self.preview_toggle = QPushButton("收起测点布置")
+        self.preview_toggle.setObjectName("panelToggle")
+        self.preview_toggle.setCheckable(True)
+        self.preview_toggle.setChecked(True)
+        self.preview_toggle.setToolTip("收起辅助预览，为输入表单提供更多空间")
+        self.preview_toggle.toggled.connect(self._toggle_preview)
+        left_layout.addWidget(self.preview_toggle)
         self.refresh_measurement_preview()
 
         right_panel = QWidget()
-        right_panel.setMinimumWidth(700)
+        right_panel.setMinimumWidth(640)
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(9)
         main_split.addWidget(right_panel)
 
         right_heading = QHBoxLayout()
-        right_accent = QFrame()
-        right_accent.setObjectName("sectionAccent")
-        right_accent.setFixedSize(3, 30)
-        right_heading.addWidget(right_accent, 0, Qt.AlignmentFlag.AlignVCenter)
         right_title_box = QVBoxLayout()
         right_title_box.setSpacing(0)
-        right_title = QLabel("重构与观察")
+        right_title = QLabel("结果工作区")
         right_title.setObjectName("sectionTitle")
-        right_hint = QLabel("在形状、应变与应力之间切换，并读取精确结果")
+        right_hint = QLabel("02 / 计算与观察")
         right_hint.setObjectName("sectionHint")
-        right_title_box.addWidget(right_title)
         right_title_box.addWidget(right_hint)
+        right_title_box.addWidget(right_title)
         right_heading.addLayout(right_title_box)
         right_heading.addStretch(1)
+        self.result_toggle = QPushButton("结果表格")
+        self.result_toggle.setObjectName("panelToggle")
+        self.result_toggle.setCheckable(True)
+        self.result_toggle.setChecked(True)
+        self.result_toggle.setToolTip("显示或收起精确结果表格（Ctrl+J）")
+        self.result_toggle.toggled.connect(self._toggle_results)
+        self.result_toggle.setShortcut(QKeySequence("Ctrl+J"))
+        right_heading.addWidget(self.result_toggle)
         self.run_status_label = QLabel("等待运行")
         self.run_status_label.setObjectName("statusBadge")
         self.run_status_label.setProperty("state", "idle")
-        self.run_status_label.setMinimumWidth(168)
+        self.run_status_label.setMinimumWidth(130)
         self.run_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right_heading.addWidget(self.run_status_label, 0, Qt.AlignmentFlag.AlignVCenter)
         right_layout.addLayout(right_heading)
@@ -3455,7 +3488,7 @@ class ReconstructionMainWindow(QMainWindow):
             metric_layout.setSpacing(0)
             metric_name = QLabel(name)
             metric_name.setObjectName("metricName")
-            metric_value = QLabel(default_value)
+            metric_value = ElidingLabel(default_value)
             metric_value.setObjectName("metricValue")
             metric_layout.addWidget(metric_name)
             metric_layout.addWidget(metric_value)
@@ -3470,10 +3503,11 @@ class ReconstructionMainWindow(QMainWindow):
         right_split.setHandleWidth(8)
         right_layout.addWidget(right_split, 1)
 
-        plot_group = QGroupBox("重构场可视化")
+        plot_group = QGroupBox("")
+        plot_group.setAccessibleName("重构场可视化")
         plot_group.setObjectName("workspaceGroup")
         plot_group_layout = QVBoxLayout(plot_group)
-        plot_group_layout.setContentsMargins(10, 12, 10, 10)
+        plot_group_layout.setContentsMargins(10, 10, 10, 8)
         plot_group_layout.setSpacing(8)
         right_split.addWidget(plot_group)
 
@@ -3483,10 +3517,6 @@ class ReconstructionMainWindow(QMainWindow):
         view_toolbar_layout = QHBoxLayout(view_toolbar)
         view_toolbar_layout.setContentsMargins(8, 5, 8, 5)
         view_toolbar_layout.setSpacing(4)
-        view_label = QLabel("结果")
-        view_label.setObjectName("fieldLabel")
-        view_toolbar_layout.addWidget(view_label)
-
         self.view_button_group = QButtonGroup(self)
         self.view_button_group.setExclusive(True)
         self.view_buttons = {}
@@ -3523,9 +3553,6 @@ class ReconstructionMainWindow(QMainWindow):
         toolbar_divider.setObjectName("toolbarDivider")
         toolbar_divider.setFrameShape(QFrame.Shape.VLine)
         view_toolbar_layout.addWidget(toolbar_divider)
-        display_label = QLabel("空间")
-        display_label.setObjectName("fieldLabel")
-        view_toolbar_layout.addWidget(display_label)
         self.display_button_group = QButtonGroup(self)
         self.display_button_group.setExclusive(True)
         self.display_buttons = {}
@@ -3550,9 +3577,6 @@ class ReconstructionMainWindow(QMainWindow):
         scale_divider.setObjectName("toolbarDivider")
         scale_divider.setFrameShape(QFrame.Shape.VLine)
         view_toolbar_layout.addWidget(scale_divider)
-        scale_label = QLabel("比例")
-        scale_label.setObjectName("fieldLabel")
-        view_toolbar_layout.addWidget(scale_label)
         self.scale_button_group = QButtonGroup(self)
         self.scale_button_group.setExclusive(True)
         self.scale_buttons = {}
@@ -3573,7 +3597,7 @@ class ReconstructionMainWindow(QMainWindow):
         self.scale_buttons["fit"].setChecked(True)
 
         view_toolbar_layout.addStretch(1)
-        self.display_settings_button = QPushButton("显示设置")
+        self.display_settings_button = QPushButton("设置")
         self.display_settings_button.setObjectName("displayModeButton")
         self.display_settings_button.setCheckable(True)
         self.display_settings_button.setToolTip(
@@ -3663,7 +3687,7 @@ class ReconstructionMainWindow(QMainWindow):
         result_group.setObjectName("workspaceGroup")
         result_group.setMinimumHeight(145)
         result_layout = QVBoxLayout(result_group)
-        result_layout.setContentsMargins(6, 8, 6, 5)
+        result_layout.setContentsMargins(10, 20, 10, 6)
         right_split.addWidget(result_group)
         right_split.setSizes([700, 155])
         right_split.setStretchFactor(0, 4)
@@ -3714,9 +3738,12 @@ class ReconstructionMainWindow(QMainWindow):
             self.message_text, "运行信息"
         )
 
-        main_split.setSizes([520, 1100])
-        main_split.setStretchFactor(0, 1)
-        main_split.setStretchFactor(1, 2)
+        main_split.setSizes([430, 1100])
+        main_split.setStretchFactor(0, 0)
+        main_split.setStretchFactor(1, 1)
+
+        self._sync_workspace_navigation(0)
+        self._refresh_studio_icons()
 
         self._connect_change_tracking()
         self._render_empty_plot()
@@ -3731,6 +3758,62 @@ class ReconstructionMainWindow(QMainWindow):
         compute_status.setToolTip("当前算法在本机进程中运行")
         status_bar.addPermanentWidget(units_status)
         status_bar.addPermanentWidget(compute_status)
+
+    def _refresh_studio_icons(self):
+        primary = self._theme_color("primary")
+        self.workspace_rail.apply_theme(self.current_theme_id)
+        for button, icon in zip(self.project_action_buttons, ("plus", "open", "save")):
+            button.setIcon(line_icon(icon, primary, 16))
+            button.setIconSize(QSize(16, 16))
+        for button, icon in ((self.modeler_button, "model"), (self.command_button, "search"),
+                             (self.result_toggle, "table"), (self.preview_toggle, "sensors")):
+            button.setIcon(line_icon(icon, primary, 17))
+        self.run_button.setIcon(line_icon("play", self._theme_color("on_primary"), 16))
+
+    def _sync_workspace_navigation(self, index):
+        self.workspace_rail.set_current(index)
+        titles = ("模型与方法", "测点与数据", "边界约束", "实测与对比", "数据交换")
+        self.input_heading_title.setText(titles[index])
+        self.input_heading_hint.setText(f"{index + 1:02d} / 准备分析")
+
+    def _toggle_preview(self, visible):
+        self.preview_group.setVisible(visible)
+        self.preview_toggle.setText("收起测点布置" if visible else "展开测点布置")
+
+    def _toggle_results(self, visible):
+        if hasattr(self, "result_group"):
+            self.result_group.setVisible(visible and not self.focus_mode_button.isChecked())
+
+    def reset_workspace_layout(self):
+        self.focus_mode_button.setChecked(False)
+        self.preview_toggle.setChecked(True)
+        self.result_toggle.setChecked(True)
+        self.main_split.setSizes([430, max(640, self.width() - 540)])
+        self.left_split.setSizes([550, 160])
+        self.right_split.setSizes([650, 155])
+        self.statusBar().showMessage("已恢复默认工作区布局", 4000)
+
+    def show_command_palette(self):
+        commands = [
+            StudioCommand(f"打开{name}工作区", f"Alt+{index + 1} · {self._left_tab_tooltips[index]}",
+                          lambda i=index: self._focus_input_tab(i), not self._analysis_busy)
+            for index, name in enumerate(self.left_tab_names)
+        ]
+        commands.extend([
+            StudioCommand("运行重构", "F5 · 校验并计算当前方法", self.run_reconstruction, self.run_button.isEnabled(), "run solve"),
+            StudioCommand("交互建模", "Ctrl+M · 几何、截面与表面测点", self.open_interactive_modeler, not self._analysis_busy, "model"),
+            StudioCommand("保存项目", "Ctrl+S · 保存当前项目", self.save_current_project, not self._analysis_busy, "save"),
+            StudioCommand("打开项目", "Ctrl+O · 从项目库选择", self.open_project, not self._analysis_busy, "open"),
+            StudioCommand("切换专注模式", "隐藏输入和表格，扩大视口", self.focus_mode_button.toggle),
+            StudioCommand("显示或收起结果表格", "Ctrl+J · 精确结果数据", self.result_toggle.toggle),
+            StudioCommand("显示或收起测点布置", "为输入表单提供更多空间", self.preview_toggle.toggle),
+            StudioCommand("重置工作区布局", "恢复默认分区和面板", self.reset_workspace_layout),
+        ])
+        for mode, title in (("shape", "形态"), ("strain", "应变"), ("stress", "应力")):
+            commands.append(StudioCommand(f"查看{title}结果", "切换结果场", lambda m=mode: self._switch_view(m)))
+        dialog = CommandPalette(commands, self, theme_id=self.current_theme_id)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_command is not None:
+            dialog.selected_command.callback()
 
     @staticmethod
     def _create_scroll_page():
@@ -4272,11 +4355,15 @@ class ReconstructionMainWindow(QMainWindow):
                     index,
                     f"{self._left_tab_tooltips[index]}（Alt+{index + 1}）",
                 )
+            if hasattr(self, "workspace_rail"):
+                self.workspace_rail.set_issue(index, count, self.left_tabs.tabToolTip(index))
 
     def _focus_input_tab(self, index):
         if not 0 <= int(index) < self.left_tabs.count():
             return
         index = int(index)
+        if self.focus_mode_button.isChecked():
+            self.focus_mode_button.setChecked(False)
         self.left_tabs.setCurrentIndex(index)
         targets = (
             self.node_x_edit,
@@ -4313,7 +4400,7 @@ class ReconstructionMainWindow(QMainWindow):
         issue = self._readiness_issues[0]
         tab_index = issue["tab"]
         widget = issue.get("widget")
-        self.left_tabs.setCurrentIndex(tab_index)
+        self._focus_input_tab(tab_index)
         if widget in {
             self.y_min_edit,
             self.y_max_edit,
@@ -5437,8 +5524,7 @@ class ReconstructionMainWindow(QMainWindow):
         )
 
     def show_data_exchange(self):
-        self.left_tabs.setCurrentIndex(4)
-        self.json_text.setFocus()
+        self._focus_input_tab(4)
 
     def refresh_json_from_form(self):
         try:
@@ -5954,7 +6040,7 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _toggle_focus_mode(self, enabled):
         self.left_panel.setVisible(not enabled)
-        self.result_group.setVisible(not enabled)
+        self.result_group.setVisible(not enabled and self.result_toggle.isChecked())
         self.focus_mode_button.setText("退出专注" if enabled else "专注")
         self.focus_mode_button.setToolTip(
             "恢复输入区和结果表格"
@@ -6486,21 +6572,6 @@ class ReconstructionMainWindow(QMainWindow):
         self.message_text.setPlainText(message)
         self.statusBar().showMessage(str(message).splitlines()[0], 6000)
 
-    def show_appearance_settings(self):
-        previous_theme_id = self.current_theme_id
-        dialog = AppearanceDialog(previous_theme_id, self)
-        dialog.theme_previewed.connect(
-            lambda theme_id: self.apply_theme(theme_id, persist=False)
-        )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.apply_theme(dialog.selected_theme_id, persist=True)
-            self.statusBar().showMessage(
-                f"已使用“{resolve_theme(self.current_theme_id).name}”界面风格",
-                4000,
-            )
-        else:
-            self.apply_theme(previous_theme_id, persist=False)
-
     def apply_theme(self, theme_id, *, persist=False):
         self.current_theme_id = apply_application_theme(
             theme_id,
@@ -6511,6 +6582,8 @@ class ReconstructionMainWindow(QMainWindow):
             compose_stylesheet(APP_STYLESHEET + STUDIO_THEME, self.current_theme_id)
         )
         self._update_theme_shadow()
+        if hasattr(self, "workspace_rail"):
+            self._refresh_studio_icons()
         if hasattr(self, "measurement_preview"):
             self.measurement_preview.set_theme(self.current_theme_id)
         if hasattr(self, "structure_3d_view"):

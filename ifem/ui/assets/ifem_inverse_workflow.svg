@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="420" viewBox="0 0 720 420" role="img" aria-labelledby="title desc">
+  <title id="title">逆有限元：从离散表面应变观测重构位移形态</title>
+  <desc id="desc">橙色贴片表示应变测点；蓝色带状网格表示由测量应变和约束重构的结构形态；虚线表示参考构形，竖向连线表示位移。变形夸张显示，仅为方法示意，不是计算结果，也不表示外载荷。</desc>
+  <defs>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset=".6" stop-color="#DCE7FB"/>
+      <stop offset="1" stop-color="#EAF0FC"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2856A6"/>
+      <stop offset=".55" stop-color="#376BC2"/>
+      <stop offset="1" stop-color="#21498D"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Restrained construction grid: context, not a plotted result field. -->
+  <g fill="none" stroke="#E9EDF4" stroke-width="1">
+    <path d="M74 99V344M211 99V344M348 99V344M485 99V344M622 99V344"/>
+    <path d="M51 140H665M51 222H665M51 304H665"/>
+  </g>
+
+  <!-- Measured strain: three observation traces with discrete samples. -->
+  <g transform="translate(76 37)" fill="none" stroke="#D76547" stroke-width="2" stroke-linecap="round">
+    <path d="M0 0H14l7 -6 8 11 8 -5H52" />
+    <path d="M0 17H8l8 5 12 -11 11 6H52" opacity=".75"/>
+    <path d="M0 34H18l9 -7 12 13 7 -6H52" opacity=".5"/>
+  </g>
+  <g font-family="Georgia" font-style="italic" fill="#9C402F">
+    <text x="147" y="62" font-size="36">ε</text>
+    <text x="165" y="42" font-size="17">m</text>
+  </g>
+  <path d="M181 56H222l38 65" fill="none" stroke="#D76547" stroke-width="1.4" opacity=".6"/>
+
+  <!-- Reference configuration is deliberately neutral and dashed. -->
+  <g fill="none" stroke="#BBC8DB" stroke-width="1.5" stroke-dasharray="6 6" stroke-linejoin="round">
+    <path d="M74 304H622l20 -22H94zM74 304v16H622v-16M622 320l20 -22v-16"/>
+    <path d="M211 304l20 -22M348 304l20 -22M485 304l20 -22"/>
+  </g>
+  <g fill="#FFFFFF" stroke="#BBC8DB" stroke-width="1.4">
+    <circle cx="74" cy="312" r="4"/><circle cx="211" cy="312" r="4"/>
+    <circle cx="348" cy="312" r="4"/><circle cx="485" cy="312" r="4"/><circle cx="622" cy="312" r="4"/>
+  </g>
+
+  <!-- Recovered nodal displacement, from reference to reconstructed state. -->
+  <g fill="none" stroke="#376BC2" stroke-width="1.6" stroke-linecap="round" opacity=".66">
+      <path d="M211 299V208.25" stroke-dasharray="4 7"/><path d="M207 215.25l4 -7 4 7"/>
+      <path d="M348 299V167" stroke-dasharray="4 7"/><path d="M344 174l4 -7 4 7"/>
+      <path d="M485 299V208.25" stroke-dasharray="4 7"/><path d="M481 215.25l4 -7 4 7"/>
+  </g>
+
+  <!-- One continuous reconstructed beam, not a stress contour or a load. -->
+  <path d="M74 304Q348 -26 622 304V320Q348 -10 74 320Z"
+        fill="url(#edge)" stroke="#21498D" stroke-width="1.3" stroke-linejoin="round"/>
+  <path d="M74 304Q348 -26 622 304L642 282Q368 -48 94 282Z"
+        fill="url(#top)" stroke="#2856A6" stroke-width="1.8" stroke-linejoin="round"/>
+  <path d="M622 304l20 -22v16l-20 22Z" fill="#21498D" stroke="#21498D" stroke-width="1"/>
+  <path d="M84 293Q358 -37 632 293" fill="none" stroke="#FFFFFF" stroke-width="1.3" opacity=".9"/>
+  <g fill="none" stroke="#2856A6" stroke-width="1.2" opacity=".55">
+      <path d="M74 320V304l20 -22" />
+      <path d="M142.5 247.81V231.81l20 -22" />
+      <path d="M211 196.25V180.25l20 -22" />
+      <path d="M279.5 165.31V149.31l20 -22" />
+      <path d="M348 155V139l20 -22" />
+      <path d="M416.5 165.31V149.31l20 -22" />
+      <path d="M485 196.25V180.25l20 -22" />
+      <path d="M553.5 247.81V231.81l20 -22" />
+      <path d="M622 320V304l20 -22" />
+  </g>
+  <g fill="#D76547" stroke="#9C402F" stroke-width="1" stroke-linejoin="round">
+      <polygon points="197.56,185.95 224.68,168.96 233.48,159.28 206.36,176.27" />
+      <polygon points="261.72,150.89 292.04,140.66 300.84,130.98 270.52,141.21" />
+      <polygon points="415.16,140.66 445.48,150.89 454.28,141.21 423.96,130.98" />
+      <polygon points="527.54,199 552.3,219.27 561.1,209.59 536.34,189.32" />
+  </g>
+  <g fill="#FFFFFF" stroke="#2856A6" stroke-width="1.7">
+      <circle cx="74" cy="312" r="4.5" />
+      <circle cx="211" cy="188.25" r="4.5" />
+      <circle cx="348" cy="147" r="4.5" />
+      <circle cx="485" cy="188.25" r="4.5" />
+      <circle cx="622" cy="312" r="4.5" />
+  </g>
+
+  <!-- Result label is displacement u, avoiding the appearance of load arrows. -->
+  <g fill="#2856A6" font-family="Georgia" font-style="italic">
+    <text x="553" y="64" font-size="36">u</text>
+  </g>
+  <path d="M549 77H508l-47 66" fill="none" stroke="#376BC2" stroke-width="1.4" opacity=".65"/>
+  <circle cx="461" cy="143" r="3" fill="#376BC2"/>
+
+  <!-- Compact method identity; the host provides accessible Chinese labels. -->
+  <g font-family="Avenir Next" text-anchor="middle">
+    <text x="348" y="374" font-size="24" font-weight="600" fill="#17253B">iFEM</text>
+  </g>
+  <path d="M266 367h37M393 367h37" fill="none" stroke="#BBC8DB" stroke-width="1.5"/>
+</svg>

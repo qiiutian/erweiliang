@@ -12,7 +12,7 @@ os.environ.setdefault(
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QLabel
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
 
 import gui_qt
 from ifem.domain.project import empty_beam_project
@@ -274,7 +274,14 @@ class ProjectLibraryTests(unittest.TestCase):
             self.assertEqual(dialog.project_path, path)
             self.assertTrue(dialog.project_is_saved)
             self.assertEqual(load_project(path).name, "建模器项目")
-            dialog.close()
+            # Naming/saving changes the document but does not apply it back to
+            # the workspace. Explicitly discard that pending application.
+            with patch.object(
+                QMessageBox, "question", return_value=QMessageBox.StandardButton.Discard,
+            ) as question:
+                dialog.close()
+            question.assert_called_once()
+            self.assertEqual(load_project(path).name, "建模器项目")
 
 
 if __name__ == "__main__":

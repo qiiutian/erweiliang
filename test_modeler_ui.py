@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(__file__), ".mplconfig"))
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
 
@@ -115,7 +115,12 @@ class ModelerUiTests(unittest.TestCase):
 
         self.assertEqual(window.modeler_button.shortcut().toString(), "Ctrl+M")
         self.assertEqual(window.run_button.shortcut().toString(), "Ctrl+Return")
-        self.assertEqual(window.appearance_action.shortcut().toString(), "Ctrl+,")
+        self.assertFalse(hasattr(window, "appearance_action"))
+        self.assertFalse(hasattr(window, "show_appearance_settings"))
+        self.assertNotIn(
+            "Ctrl+,",
+            [action.shortcut().toString() for action in window.findChildren(QAction)],
+        )
         self.assertTrue(window.measurement_editor.header_action_button.toolTip())
         window.close()
 

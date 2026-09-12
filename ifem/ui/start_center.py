@@ -1,41 +1,20 @@
-"""Functional start center shown before the main iFEM workspace."""
+"""Functional, animated start center shown before the main workbench."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import (
-    QBrush,
-    QColor,
-    QFont,
-    QLinearGradient,
-    QPainter,
-    QPainterPath,
-    QPen,
-    QPixmap,
-)
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
-    QDialog,
-    QFrame,
-    QGraphicsDropShadowEffect,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
+    QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
 from ifem.infrastructure.project_library import ProjectLibrary
 from ifem.ui.project_library import ProjectLibraryDialog
+from ifem.ui.start_animation import BeamReconstructionAnimation
 from ifem.ui.theme import (
-    ThemePicker,
-    apply_application_theme,
-    compose_stylesheet,
-    current_theme_id,
-    resolve_theme,
+    compose_stylesheet, current_theme_id, resolve_theme,
 )
 
 
@@ -44,9 +23,9 @@ START_OPEN = "open"
 START_SAMPLE = "sample"
 START_WORKSPACE = "workspace"
 _START_ACTIONS = {START_NEW, START_OPEN, START_SAMPLE, START_WORKSPACE}
-START_CENTER_HERO_PATH = (
-    Path(__file__).with_name("assets") / "start_center_hero.png"
-)
+# Retained as an editable static illustration, not loaded by the start center.
+START_CENTER_HERO_PATH = Path(__file__).with_name("assets") / "ifem_inverse_workflow.svg"
+BeamWorkflowPreview = BeamReconstructionAnimation
 
 
 @dataclass(frozen=True)
@@ -65,325 +44,55 @@ class StartupRequest:
             raise ValueError("仅打开项目操作可以包含项目路径。")
 
 
-START_CENTER_STYLESHEET = """
-QDialog#startCenter {
-    color: #23302a;
-    background: #eef2ef;
+def _start_stylesheet(theme_id):
+    c = resolve_theme(theme_id).colors
+    return compose_stylesheet("", theme_id) + f"""
+QDialog#startCenter, QFrame#startShell {{
+    background: {c['surface_subtle']}; color: {c['text']}; border: none;
     font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC";
     font-size: 13px;
-}
-QFrame#startShell {
-    background: #ffffff;
-    border: 1px solid #d7e0da;
-    border-radius: 20px;
-}
-QLabel#startBrandMark {
-    color: #ffffff;
-    background: #365b49;
-    border: 1px solid #2e4e3e;
-    border-radius: 11px;
-    font-family: "Avenir Next";
-    font-size: 17px;
-    font-weight: 700;
-}
-QLabel#startBrandTitle {
-    color: #1f2c25;
-    font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC";
-    font-size: 20px;
-    font-weight: 700;
-}
-QFrame#startActions {
-    background: #f8fafb;
-    border: 1px solid #d7e0da;
-    border-radius: 14px;
-}
-QFrame#startActionAccent {
-    background: #365b49;
-    border: none;
-    border-radius: 2px;
-}
-QLabel#startHeadline {
-    color: #203128;
-    font-size: 25px;
-    font-weight: 700;
-}
-QLabel#startDescription {
-    color: #657168;
-    font-size: 12px;
-}
-QLabel#startFileHint {
-    color: #77827b;
-    font-size: 10px;
-}
-QPushButton {
-    min-height: 44px;
-    padding: 0 16px;
-    color: #3d4d43;
-    background: #ffffff;
-    border: 1px solid #cbd7cf;
-    border-radius: 8px;
-    font-weight: 600;
-}
-QPushButton:hover {
-    color: #26382d;
-    background: #f1f5f2;
-    border-color: #9eafa3;
-}
-QPushButton:pressed {
-    background: #e6ece8;
-}
-QPushButton:focus {
-    border: 2px solid #527862;
-}
-QPushButton#startPrimary {
-    min-height: 52px;
-    color: #ffffff;
-    background: #365b49;
-    border: 1px solid #2f503f;
-    font-size: 14px;
-}
-QPushButton#startPrimary:hover {
-    background: #2d4e3e;
-    border-color: #284638;
-}
-QPushButton#startQuiet {
-    min-height: 35px;
-    color: #536158;
-    background: transparent;
-    border: 1px solid transparent;
-    padding: 0 8px;
-}
-QPushButton#startQuiet:hover {
-    color: #2f5945;
-    background: #ffffff;
-    border-color: #d7e0da;
-}
-QFrame#startDivider {
-    color: #e1e7e3;
-    background: #e1e7e3;
-    border: none;
-}
+}}
+QFrame#startActions {{ background: transparent; border: none; }}
+QLabel#startBrandMark {{
+    color: {c['on_primary']}; background: {c['primary']};
+    border: none; border-radius: 9px; font-size: 17px; font-weight: 700;
+}}
+QLabel#startBrandTitle {{ color: {c['text_strong']}; font-size: 25px; font-weight: 600; }}
+QLabel#startHeadline {{ color: {c['text_strong']}; font-size: 40px; font-weight: 500; }}
+QLabel#startDescription {{ color: {c['text_secondary']}; font-size: 14px; }}
+QLabel#startArtCaption {{ color: {c['text_muted']}; font-size: 12px; }}
+QPushButton#startPrimary {{
+    background: {c['primary']}; color: {c['on_primary']}; border: 1px solid {c['primary']};
+    border-radius: 6px; padding: 8px 18px; min-height: 30px; font-size: 14px; font-weight: 500;
+}}
+QPushButton#startPrimary:hover {{ background: {c['primary_hover']}; }}
+QPushButton#startPrimary:pressed {{ background: {c['primary_pressed']}; }}
+QPushButton#startPrimary:focus {{ border: 2px solid {c['focus']}; padding: 7px 17px; }}
+QPushButton#startOpen {{
+    background: {c['surface']}; color: {c['text_strong']}; border: 1px solid {c['border_strong']};
+    border-radius: 6px; padding: 8px 18px; min-height: 30px; font-size: 14px; font-weight: 500;
+}}
+QPushButton#startOpen:hover {{ background: {c['primary_soft']}; border-color: {c['primary']}; }}
+QPushButton#startOpen:pressed {{ background: {c['primary_tint']}; }}
+QPushButton#startOpen:focus {{ border: 2px solid {c['focus']}; padding: 7px 17px; }}
+QPushButton#startSecondary, QPushButton#startQuiet, QPushButton#startMotion {{
+    background: transparent; color: {c['text_secondary']}; border: 1px solid transparent;
+    border-radius: 6px; padding: 6px 8px; min-height: 20px; font-size: 12px;
+}}
+QPushButton#startSecondary:hover, QPushButton#startQuiet:hover, QPushButton#startMotion:hover {{
+    color: {c['primary']}; background: {c['primary_soft']};
+}}
+QPushButton#startSecondary:focus, QPushButton#startQuiet:focus, QPushButton#startMotion:focus {{
+    border-color: {c['focus']};
+}}
+QPushButton#startSecondary:pressed, QPushButton#startQuiet:pressed, QPushButton#startMotion:pressed {{
+    background: {c['primary_tint']};
+}}
 """
 
 
-class BeamWorkflowPreview(QWidget):
-    """Small code-drawn product visual; no rendering backend is required."""
-
-    def __init__(self, parent=None, *, theme_id=None):
-        super().__init__(parent)
-        self._theme_id = resolve_theme(theme_id or current_theme_id()).identifier
-        self._hero_pixmap = QPixmap(str(START_CENTER_HERO_PATH))
-        self.setObjectName("startPreview")
-        self.setMinimumSize(430, 390)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setAccessibleName("结构建模、测点配置、求解与结果可视化流程示意")
-        self.setToolTip("从梁模型和测点布置进入逆有限元重构结果")
-
-    @property
-    def has_hero_image(self):
-        return not self._hero_pixmap.isNull()
-
-    def set_theme(self, theme_id):
-        self._theme_id = resolve_theme(theme_id).identifier
-        self.update()
-
-    def _color(self, role):
-        return QColor(resolve_theme(self._theme_id).color(role))
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        bounds = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
-
-        background = QLinearGradient(bounds.topLeft(), bounds.bottomRight())
-        background.setColorAt(0.0, self._color("surface"))
-        background.setColorAt(1.0, self._color("primary_soft"))
-        painter.setPen(QPen(self._color("border"), 1.0))
-        painter.setBrush(QBrush(background))
-        painter.drawRoundedRect(bounds, 14.0, 14.0)
-
-        content = bounds.adjusted(30.0, 26.0, -30.0, -24.0)
-        if self.has_hero_image:
-            self._draw_hero_image(painter, content)
-        else:
-            self._draw_grid(painter, content)
-            self._draw_structure(painter, content)
-        self._draw_header(painter, content)
-        self._draw_flow(painter, content)
-
-    def _draw_hero_image(self, painter, content):
-        target = QRectF(
-            content.left() - 5.0,
-            content.top() + 42.0,
-            content.width() + 10.0,
-            content.height() - 93.0,
-        )
-        target_size = target.size().toSize()
-        scaled = self._hero_pixmap.scaled(
-            target_size,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        source = QRectF(
-            max(0.0, (scaled.width() - target.width()) / 2.0),
-            max(0.0, (scaled.height() - target.height()) / 2.0),
-            target.width(),
-            target.height(),
-        )
-        clip = QPainterPath()
-        clip.addRoundedRect(target, 10.0, 10.0)
-        painter.save()
-        painter.setClipPath(clip)
-        painter.drawPixmap(target, scaled, source)
-
-        veil = QLinearGradient(target.topLeft(), target.bottomLeft())
-        top = self._color("surface")
-        top.setAlpha(105)
-        clear = self._color("surface")
-        clear.setAlpha(0)
-        bottom = self._color("surface")
-        bottom.setAlpha(75)
-        veil.setColorAt(0.0, top)
-        veil.setColorAt(0.20, clear)
-        veil.setColorAt(0.78, clear)
-        veil.setColorAt(1.0, bottom)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(veil))
-        painter.drawRect(target)
-        painter.restore()
-
-    def _draw_header(self, painter, content):
-        painter.setPen(self._color("text_strong"))
-        painter.setFont(QFont("Avenir Next", 13, QFont.Weight.DemiBold))
-        painter.drawText(
-            QRectF(content.left(), content.top(), content.width(), 24.0),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            "结构场",
-        )
-
-    def _draw_grid(self, painter, content):
-        grid_top = content.top() + 48.0
-        grid_bottom = content.bottom() - 62.0
-        grid_color = self._color("grid")
-        grid_color.setAlpha(150)
-        painter.setPen(QPen(grid_color, 1.0, Qt.PenStyle.DotLine))
-        for index in range(1, 6):
-            x = content.left() + content.width() * index / 6.0
-            painter.drawLine(QPointF(x, grid_top), QPointF(x, grid_bottom))
-        for index in range(1, 4):
-            y = grid_top + (grid_bottom - grid_top) * index / 4.0
-            painter.drawLine(QPointF(content.left(), y), QPointF(content.right(), y))
-
-    def _draw_structure(self, painter, content):
-        left = content.left() + 20.0
-        right = content.right() - 18.0
-        baseline_y = content.top() + content.height() * 0.62
-        curve = QPainterPath(QPointF(left, baseline_y + 20.0))
-        curve.cubicTo(
-            QPointF(left + (right - left) * 0.25, baseline_y + 18.0),
-            QPointF(left + (right - left) * 0.34, baseline_y - 110.0),
-            QPointF(left + (right - left) * 0.56, baseline_y - 80.0),
-        )
-        curve.cubicTo(
-            QPointF(left + (right - left) * 0.75, baseline_y - 54.0),
-            QPointF(left + (right - left) * 0.82, baseline_y + 2.0),
-            QPointF(right, baseline_y + 6.0),
-        )
-
-        glow = self._color("primary")
-        glow.setAlpha(24)
-        painter.setPen(
-            QPen(
-                glow,
-                34.0,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
-                Qt.PenJoinStyle.RoundJoin,
-            )
-        )
-        painter.drawPath(curve)
-
-        painter.setPen(
-            QPen(
-                self._color("beam_fill"),
-                20.0,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
-                Qt.PenJoinStyle.RoundJoin,
-            )
-        )
-        painter.drawPath(curve)
-
-        field_gradient = QLinearGradient(left, baseline_y, right, baseline_y)
-        field_gradient.setColorAt(0.0, self._color("primary"))
-        field_gradient.setColorAt(0.46, self._color("focus"))
-        field_gradient.setColorAt(0.72, QColor("#C48A58"))
-        field_gradient.setColorAt(1.0, self._color("sensor"))
-        painter.setPen(
-            QPen(
-                QBrush(field_gradient),
-                9.0,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
-                Qt.PenJoinStyle.RoundJoin,
-            )
-        )
-        painter.drawPath(curve)
-
-        percentages = (0.0, 0.26, 0.52, 0.76, 1.0)
-        for percentage in percentages:
-            point = curve.pointAtPercent(percentage)
-            painter.setPen(QPen(self._color("primary"), 2.0))
-            painter.setBrush(self._color("surface"))
-            painter.drawEllipse(point, 5.5, 5.5)
-
-        for percentage in (0.15, 0.38, 0.63, 0.86):
-            point = curve.pointAtPercent(percentage)
-            painter.save()
-            painter.translate(point)
-            painter.rotate(-curve.angleAtPercent(percentage))
-            painter.setPen(QPen(self._color("sensor_dark"), 1.0))
-            painter.setBrush(self._color("sensor"))
-            painter.drawRoundedRect(QRectF(-10.0, -14.0, 20.0, 8.0), 3.0, 3.0)
-            painter.restore()
-
-        reference = self._color("node")
-        reference.setAlpha(160)
-        painter.setPen(QPen(reference, 1.1, Qt.PenStyle.DashLine))
-        painter.drawLine(
-            QPointF(left, baseline_y + 50.0),
-            QPointF(right, baseline_y + 50.0),
-        )
-
-    def _draw_flow(self, painter, content):
-        labels = ("建模", "测点", "求解", "结果")
-        y = content.bottom() - 31.0
-        segment_width = content.width() / len(labels)
-        first_x = content.left() + segment_width * 0.5
-        last_x = content.right() - segment_width * 0.5
-        painter.setPen(QPen(self._color("divider"), 1.5))
-        painter.drawLine(QPointF(first_x, y), QPointF(last_x, y))
-        for index, label in enumerate(labels):
-            center_x = content.left() + segment_width * (index + 0.5)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(self._color("primary"))
-            painter.drawEllipse(QPointF(center_x, y), 3.5, 3.5)
-            painter.setPen(self._color("text_secondary"))
-            painter.setFont(QFont("Avenir Next", 8, QFont.Weight.DemiBold))
-            painter.drawText(
-                QRectF(
-                    content.left() + segment_width * index,
-                    y + 8.0,
-                    segment_width,
-                    18.0,
-                ),
-                Qt.AlignmentFlag.AlignCenter,
-                label,
-            )
-
-
 class StartCenterDialog(QDialog):
-    """Project entry point displayed before constructing the main window."""
+    """A project entry point with a lightweight, pausable method demonstration."""
 
     def __init__(self, parent=None, *, theme_id=None, project_library=None):
         super().__init__(parent)
@@ -393,89 +102,98 @@ class StartCenterDialog(QDialog):
         self.setObjectName("startCenter")
         self.setWindowTitle("iFEM")
         self.setModal(True)
-        self.resize(1040, 620)
+        self.resize(1080, 640)
         self.setMinimumSize(900, 590)
-        self.setStyleSheet(compose_stylesheet(START_CENTER_STYLESHEET, self.theme_id))
+        self.setStyleSheet(_start_stylesheet(self.theme_id))
         self._build_ui()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(0)
-
-        shell = QFrame()
-        shell.setObjectName("startShell")
-        shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(26, 22, 26, 24)
-        shell_layout.setSpacing(18)
-        self.shell_shadow = QGraphicsDropShadowEffect(shell)
-        self.shell_shadow.setBlurRadius(28)
-        self.shell_shadow.setOffset(0, 7)
-        shell.setGraphicsEffect(self.shell_shadow)
-        self._update_shadow()
-        root.addWidget(shell)
+        root.setContentsMargins(48, 32, 40, 28)
+        root.setSpacing(20)
 
         header = QHBoxLayout()
-        header.setSpacing(12)
+        header.setSpacing(11)
         brand_mark = QLabel("iF")
         brand_mark.setObjectName("startBrandMark")
         brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        brand_mark.setFixedSize(42, 42)
+        brand_mark.setFixedSize(32, 32)
         header.addWidget(brand_mark)
-
         self.brand_title = QLabel("iFEM")
         self.brand_title.setObjectName("startBrandTitle")
-        self.brand_title.setWordWrap(False)
         header.addWidget(self.brand_title)
         header.addStretch(1)
-        self.theme_picker = ThemePicker(
-            self.theme_id,
-            compact=True,
-            show_swatches=False,
-            label_text="外观",
-        )
-        self.theme_picker.theme_changed.connect(self._theme_changed)
-        header.addWidget(self.theme_picker, 0, Qt.AlignmentFlag.AlignVCenter)
-        shell_layout.addLayout(header)
-
-        divider = QFrame()
-        divider.setObjectName("startDivider")
-        divider.setFrameShape(QFrame.Shape.HLine)
-        divider.setFixedHeight(1)
-        shell_layout.addWidget(divider)
+        root.addLayout(header)
 
         body = QHBoxLayout()
-        body.setSpacing(24)
+        body.setSpacing(28)
+        body.addWidget(self._build_actions())
         self.preview = BeamWorkflowPreview(theme_id=self.theme_id)
-        body.addWidget(self.preview, 7)
-        body.addWidget(self._build_actions(), 4)
-        shell_layout.addLayout(body, 1)
+        self.preview.setMinimumSize(430, 390)
+        self.preview.setAccessibleName("从离散应变观测到连续位移形态的动态方法示意")
+        self.preview.setToolTip(
+            "橙色贴片表示应变测点，网格展示重构形态。\n"
+            "演示仅表达逆有限元流程，变形已放大，不是真实计算结果。"
+        )
+        art = QVBoxLayout()
+        art.setSpacing(0)
+        art.addWidget(self.preview, 1)
+        art_footer = QHBoxLayout()
+        art_footer.setContentsMargins(20, 0, 4, 0)
+        caption = QLabel("方法演示，非计算结果")
+        caption.setObjectName("startArtCaption")
+        art_footer.addWidget(caption)
+        art_footer.addStretch(1)
+        self.motion_button = QPushButton()
+        self.motion_button.setObjectName("startMotion")
+        self.motion_button.setAutoDefault(True)
+        self.motion_button.setCheckable(True)
+        self.motion_button.setToolTip("暂停或播放形态演示，不影响项目数据")
+        settings = QSettings("iFEM", "iFEM Reconstruction")
+        saved_paused = settings.value("appearance/startAnimationPaused", False, type=bool)
+        if saved_paused:
+            self.preview.set_paused(True)
+        self.motion_button.setChecked(self.preview.is_paused)
+        self._update_motion_label()
+        self.motion_button.toggled.connect(self._toggle_motion)
+        art_footer.addWidget(self.motion_button)
+        art.addLayout(art_footer)
+        body.addLayout(art, 1)
+        root.addLayout(body, 1)
+
+        footer = QHBoxLayout()
+        self.exit_button = QPushButton("退出")
+        self.exit_button.setObjectName("startQuiet")
+        self.exit_button.setAutoDefault(True)
+        self.exit_button.setToolTip("关闭启动中心并退出软件（Esc）")
+        self.exit_button.clicked.connect(self.reject)
+        footer.addWidget(self.exit_button)
+        footer.addStretch(1)
+        root.addLayout(footer)
+
+        self.setTabOrder(self.new_button, self.open_button)
+        self.setTabOrder(self.open_button, self.sample_button)
+        self.setTabOrder(self.sample_button, self.workspace_button)
+        self.setTabOrder(self.workspace_button, self.motion_button)
+        self.setTabOrder(self.motion_button, self.exit_button)
+        self.new_button.setFocus()
 
     def _build_actions(self):
         panel = QFrame()
         panel.setObjectName("startActions")
-        panel.setMinimumWidth(292)
-        panel.setMaximumWidth(330)
+        panel.setMinimumWidth(256)
+        panel.setMaximumWidth(280)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(24, 28, 24, 22)
-        layout.setSpacing(9)
-
-        accent = QFrame()
-        accent.setObjectName("startActionAccent")
-        accent.setFixedSize(34, 3)
-        layout.addWidget(accent)
-        layout.addSpacing(7)
-
-        self.headline = QLabel("开始工作")
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(12)
+        layout.addStretch(1)
+        self.headline = QLabel("从应变\n重构形态")
         self.headline.setObjectName("startHeadline")
-        self.headline.setWordWrap(False)
         layout.addWidget(self.headline)
-
-        self.action_description = QLabel("选择项目入口")
+        self.action_description = QLabel("逆有限元结构重构工作台")
         self.action_description.setObjectName("startDescription")
-        self.action_description.setWordWrap(False)
         layout.addWidget(self.action_description)
-        layout.addSpacing(15)
+        layout.addSpacing(20)
 
         self.new_button = QPushButton("新建项目")
         self.new_button.setObjectName("startPrimary")
@@ -484,73 +202,72 @@ class StartCenterDialog(QDialog):
         self.new_button.setToolTip("打开交互建模器，从二维或三维梁模型开始")
         self.new_button.clicked.connect(lambda: self._select(START_NEW))
         layout.addWidget(self.new_button)
-
         self.open_button = QPushButton("打开项目")
+        self.open_button.setObjectName("startOpen")
+        self.open_button.setAutoDefault(True)
         self.open_button.setShortcut("Ctrl+O")
         self.open_button.setToolTip("从 iFEM 项目库选择已保存项目")
         self.open_button.clicked.connect(self._choose_project)
         layout.addWidget(self.open_button)
-        layout.addSpacing(3)
 
         secondary = QHBoxLayout()
-        secondary.setSpacing(8)
+        secondary.setSpacing(12)
         self.sample_button = QPushButton("示例工程")
+        self.sample_button.setObjectName("startSecondary")
+        self.sample_button.setAutoDefault(True)
         self.sample_button.setToolTip("载入内置二维梁案例，快速查看完整流程")
         self.sample_button.clicked.connect(lambda: self._select(START_SAMPLE))
         self.workspace_button = QPushButton("空白工作台")
+        self.workspace_button.setObjectName("startSecondary")
+        self.workspace_button.setAutoDefault(True)
         self.workspace_button.setToolTip("进入无测点的空白工作台，稍后再配置模型")
         self.workspace_button.clicked.connect(lambda: self._select(START_WORKSPACE))
         secondary.addWidget(self.sample_button)
         secondary.addWidget(self.workspace_button)
         layout.addLayout(secondary)
         layout.addStretch(1)
-
-        file_hint = QLabel("项目文件 · .ifemproj")
-        file_hint.setObjectName("startFileHint")
-        file_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(file_hint)
-
-        self.exit_button = QPushButton("退出")
-        self.exit_button.setObjectName("startQuiet")
-        self.exit_button.setToolTip("关闭启动中心并退出软件（Esc）")
-        self.exit_button.clicked.connect(self.reject)
-        layout.addWidget(self.exit_button)
         return panel
 
-    def _theme_changed(self, theme_id):
-        self.theme_id = apply_application_theme(theme_id, persist=True)
-        self.setStyleSheet(compose_stylesheet(START_CENTER_STYLESHEET, self.theme_id))
-        self.preview.set_theme(self.theme_id)
-        self._update_shadow()
+    def _update_motion_label(self):
+        if self.preview.reduced_motion:
+            self.motion_button.setText("已减少动态")
+            self.motion_button.setEnabled(False)
+            self.motion_button.setToolTip("已遵循减少动态偏好，以静态形态展示方法")
+        else:
+            self.motion_button.setText("播放演示" if self.preview.is_paused else "暂停演示")
+        self.motion_button.setAccessibleName(self.motion_button.text())
 
-    def _update_shadow(self):
-        shadow = QColor(resolve_theme(self.theme_id).color("primary"))
-        shadow.setAlpha(34)
-        self.shell_shadow.setColor(shadow)
+    def _toggle_motion(self, paused):
+        self.preview.set_paused(paused)
+        self._update_motion_label()
+        QSettings("iFEM", "iFEM Reconstruction").setValue(
+            "appearance/startAnimationPaused", bool(paused),
+        )
 
     def _select(self, action):
         self.request = StartupRequest(action)
         self.accept()
 
     def _choose_project(self):
-        path = ProjectLibraryDialog.choose_project(
-            self,
-            library=self.project_library,
-            theme_id=self.theme_id,
-        )
+        paused = self.preview.is_paused
+        self.preview.set_paused(True)
+        try:
+            path = ProjectLibraryDialog.choose_project(
+                self, library=self.project_library, theme_id=self.theme_id,
+            )
+        finally:
+            self.preview.set_paused(paused)
         if not path:
             return
         self.request = StartupRequest(START_OPEN, Path(path))
         self.accept()
 
+    def done(self, result):
+        self.preview.shutdown()
+        super().done(result)
+
 
 __all__ = [
-    "BeamWorkflowPreview",
-    "START_NEW",
-    "START_OPEN",
-    "START_SAMPLE",
-    "START_WORKSPACE",
-    "START_CENTER_HERO_PATH",
-    "StartCenterDialog",
-    "StartupRequest",
+    "BeamWorkflowPreview", "START_NEW", "START_OPEN", "START_SAMPLE",
+    "START_WORKSPACE", "START_CENTER_HERO_PATH", "StartCenterDialog", "StartupRequest",
 ]

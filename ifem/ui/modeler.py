@@ -11,6 +11,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPolygonF,
+    QShortcut,
     QUndoCommand,
     QUndoStack,
 )
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
 )
 
 from ifem.application import get_default_analysis_service, match_project_algorithms
+from ifem.ui.studio import ModelOutline, line_icon
 from ifem.domain import (
     parametric_point_and_derivative,
     parametric_recommended_sample_count,
@@ -1831,6 +1833,9 @@ class BeamModelerDialog(QDialog):
         self.resize(1280, 820)
         self.setMinimumSize(1040, 680)
         self._project = project
+        # Saving a file is distinct from applying the model back to the workspace.
+        self._workspace_baseline = project.to_dict()
+        self._workspace_baseline.pop("revision", None)
         self._project_path = None
         self._project_library = ProjectLibrary()
         self._saved_revision = None
@@ -1875,13 +1880,13 @@ class BeamModelerDialog(QDialog):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 12)
+        root.setContentsMargins(12, 12, 12, 10)
         root.setSpacing(9)
 
         header = QFrame()
         header.setObjectName("modelerHeader")
         heading = QHBoxLayout(header)
-        heading.setContentsMargins(4, 0, 0, 9)
+        heading.setContentsMargins(16, 12, 12, 12)
         heading.setSpacing(8)
         title = QLabel("结构建模")
         title.setObjectName("modelerTitle")
@@ -1910,6 +1915,8 @@ class BeamModelerDialog(QDialog):
         )
         self.save_project_button.setShortcut(QKeySequence.StandardKey.Save)
         self.save_project_button.clicked.connect(self._save_project)
+        open_button.setIcon(line_icon("open", resolve_theme(self._theme_id).color("viewport_text"), 16))
+        self.save_project_button.setIcon(line_icon("save", resolve_theme(self._theme_id).color("viewport_text"), 16))
         heading.addWidget(self.save_project_button)
         root.addWidget(header)
 
@@ -2101,6 +2108,8 @@ class BeamModelerDialog(QDialog):
         self.undo_button.setEnabled(False)
         self.redo_button.setEnabled(False)
         self.delete_button.setEnabled(False)
+        self.outline_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        self.outline_shortcut.activated.connect(self._focus_outline)
 
     def _build_generator(self, root):
         generator = QFrame()
@@ -2563,8 +2572,22 @@ class BeamModelerDialog(QDialog):
         section_scroll.setWidget(primary_group)
         self.inspector_tabs.addTab(section_scroll, "截面与材料")
         self.inspector_tabs.addTab(property_scroll, "对象属性")
+        self.model_outline = ModelOutline()
+        self.model_outline.entity_selected.connect(self._select_from_outline)
+        self.model_outline.entity_activated.connect(self._selection_changed)
+        self.inspector_tabs.addTab(self.model_outline, "对象列表")
+        self.inspector_tabs.setTabToolTip(2, "按名称或 ID 搜索节点、梁段与测点（Ctrl+F）")
         layout.addWidget(self.inspector_tabs, 1)
         return panel
+
+    def _focus_outline(self):
+        self.inspector_tabs.setCurrentIndex(2)
+        self.model_outline.search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.model_outline.search.selectAll()
+
+    def _select_from_outline(self, kind, identifier):
+        self._selection_changed(kind, identifier)
+        self.inspector_tabs.setCurrentIndex(2)
 
     def _set_mode(self, mode: str):
         is_3d_mode = mode in {
@@ -2901,6 +2924,7 @@ class BeamModelerDialog(QDialog):
         )
         self._update_sensor_action_state()
         self._refresh_property_panel()
+        self.model_outline.set_project(project, self.selected_id)
 
     def _commit_project(self, before, after, description):
         self.undo_stack.push(ProjectSnapshotCommand(self, before, after, description))
@@ -3045,6 +3069,7 @@ class BeamModelerDialog(QDialog):
             self._refresh_property_panel()
             if kind and identifier:
                 self.inspector_tabs.setCurrentIndex(1)
+            self.model_outline.set_selected(identifier)
         finally:
             self._syncing_selection = False
 
@@ -3534,10 +3559,51 @@ class BeamModelerDialog(QDialog):
         if hasattr(self, "geometry_3d_view"):
             self.geometry_3d_view.shutdown()
 
-    def done(self, result):
+    def _confirm_discard_unapplied_changes(self):
+        current = self._project.to_dict()
+        current.pop("revision", None)
+        if current == self._workspace_baseline:
+            return True
+        storage_message = (
+            "当前模型已保存到项目库；退出不会删除或回退该文件。"
+            if self.project_is_saved
+            else "本次尚未保存的建模更改将丢失。"
+        )
+        answer = QMessageBox.question(
+            self,
+            "放弃未应用的建模更改？",
+            "当前更改尚未应用到工作台。\n"
+            "放弃并退出后，工作台仍保留进入建模器时的模型。\n\n"
+            f"{storage_message}\n\n"
+            "选择“取消”可继续编辑，再点击“应用到工作台”。",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Discard
+
+    def _finish_dialog(self, result):
+        if (
+            result != QDialog.DialogCode.Accepted
+            and not self._confirm_discard_unapplied_changes()
+        ):
+            return False
         self.shutdown()
         super().done(result)
+        return True
+
+    def done(self, result):
+        self._finish_dialog(result)
+
+    def accept(self):
+        self.done(QDialog.DialogCode.Accepted)
+
+    def reject(self):
+        self.done(QDialog.DialogCode.Rejected)
 
     def closeEvent(self, event):
-        self.shutdown()
-        super().closeEvent(event)
+        # QDialog's default close handler calls reject; finish once so a window
+        # close and Esc/Cancel share the same guard without prompting twice.
+        if self._finish_dialog(QDialog.DialogCode.Rejected):
+            event.accept()
+        else:
+            event.ignore()
