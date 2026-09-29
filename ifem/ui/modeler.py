@@ -67,7 +67,11 @@ from ifem.modeling.section_geometry import (
 )
 from ifem.ui.modeler_3d import BeamGeometry3DView
 from ifem.ui.project_library import ProjectLibraryDialog, ProjectNameDialog
+from ifem.ui.property_drafts import PropertyDrafts
+from ifem.ui.property_values import GLOBAL_KEY
 from ifem.ui.theme import compose_stylesheet, current_theme_id, resolve_theme
+from ifem.ui.workspace_preferences import WorkspacePreferencesStore
+from ifem.ui.workspace_view import WorkspaceLayoutController, apply_reading_metrics
 
 
 MODELER_STYLESHEET = """
@@ -1824,11 +1828,18 @@ class SpatialCurveDialog(QDialog):
 
 
 class BeamModelerDialog(QDialog):
-    def __init__(self, project: ProjectDocument, parent=None, *, theme_id=None):
+    def __init__(self, project: ProjectDocument, parent=None, *, theme_id=None, preferences_store=None):
         super().__init__(parent)
+        self.preferences_store = preferences_store if preferences_store is not None else getattr(parent, "preferences_store", None)
+        if self.preferences_store is None:
+            self.preferences_store = WorkspacePreferencesStore()
+        self.reading_preferences = getattr(parent, "reading_preferences", None) or self.preferences_store.load_reading()
+        self._is_shut_down = False
+        self._finished = False
         self.setObjectName("modelerDialog")
         self._theme_id = resolve_theme(theme_id or current_theme_id()).identifier
-        self.setStyleSheet(compose_stylesheet(MODELER_STYLESHEET, self._theme_id))
+        self.setStyleSheet(compose_stylesheet(MODELER_STYLESHEET, self._theme_id,
+                                             preferences=self.reading_preferences))
         self.setWindowTitle("iFEM | 结构建模")
         self.resize(1280, 820)
         self.setMinimumSize(1040, 680)
@@ -1839,13 +1850,20 @@ class BeamModelerDialog(QDialog):
         self._project_path = None
         self._project_library = ProjectLibrary()
         self._saved_revision = None
+        self._saved_content = None
         self.selected_kind = ""
         self.selected_id = ""
         self._syncing_selection = False
         self._loading_section = False
         self.undo_stack = QUndoStack(self)
         self._build_ui()
+        self._build_draft_tracking()
         self._apply_project(project, seed_generator=True)
+        apply_reading_metrics(self, self.reading_preferences)
+        self.layout_preferences = WorkspaceLayoutController(
+            self, self.preferences_store, "modeler",
+            {"main": self.workspace_splitter}, {"main": [900, 330]},
+        )
 
     @property
     def project(self) -> ProjectDocument:
@@ -1857,10 +1875,13 @@ class BeamModelerDialog(QDialog):
 
     @property
     def project_is_saved(self):
+        current = self._project.to_dict()
+        current.pop("revision", None)
         return bool(
             self._project_path is not None
             and Path(self._project_path).exists()
-            and self._saved_revision == self._project.revision
+            and self._saved_content == current
+            and not self.property_drafts.pending
         )
 
     def set_project_storage(
@@ -1877,6 +1898,9 @@ class BeamModelerDialog(QDialog):
             else None
         )
         self._saved_revision = self._project.revision if project_is_saved else None
+        self._saved_content = self._project.to_dict() if project_is_saved else None
+        if self._saved_content is not None:
+            self._saved_content.pop("revision", None)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -1918,6 +1942,11 @@ class BeamModelerDialog(QDialog):
         open_button.setIcon(line_icon("open", resolve_theme(self._theme_id).color("viewport_text"), 16))
         self.save_project_button.setIcon(line_icon("save", resolve_theme(self._theme_id).color("viewport_text"), 16))
         heading.addWidget(self.save_project_button)
+        self.reset_layout_button = QPushButton("恢复布局")
+        self.reset_layout_button.setObjectName("modelerFileButton")
+        self.reset_layout_button.setToolTip("恢复视口与属性栏的默认比例；不修改模型、草稿或阅读设置")
+        self.reset_layout_button.clicked.connect(self.reset_workspace_layout)
+        heading.addWidget(self.reset_layout_button)
         root.addWidget(header)
 
         toolbar = QFrame()
@@ -1982,6 +2011,7 @@ class BeamModelerDialog(QDialog):
         self._build_generator(root)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter = splitter
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(8)
         viewport = QWidget()
@@ -2274,9 +2304,27 @@ class BeamModelerDialog(QDialog):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(6)
-        inspector_title = QLabel("属性")
-        inspector_title.setObjectName("inspectorTitle")
-        layout.addWidget(inspector_title)
+        context_actions = QHBoxLayout()
+        context_actions.setSpacing(3)
+        self.context_label = ElidedLabel("尚未选择对象")
+        self.context_label.setObjectName("inspectorTitle")
+        self.context_label.setMinimumWidth(0)
+        self.context_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.context_label.setAccessibleName("当前选中的模型对象")
+        context_actions.addWidget(self.context_label, 1)
+        self.context_edit_button = QPushButton("编辑")
+        self.context_outline_button = QPushButton("列表")
+        self.context_edit_button.setAccessibleName("编辑当前对象")
+        self.context_outline_button.setAccessibleName("返回对象列表")
+        self.context_edit_button.setObjectName("panelToggle")
+        self.context_outline_button.setObjectName("panelToggle")
+        self.context_edit_button.setToolTip("回到当前对象属性，保留尚未应用的输入")
+        self.context_outline_button.setToolTip("返回对象列表，保留搜索词和当前选择")
+        self.context_edit_button.clicked.connect(lambda: self.inspector_tabs.setCurrentIndex(1))
+        self.context_outline_button.clicked.connect(self._return_to_outline)
+        context_actions.addWidget(self.context_edit_button)
+        context_actions.addWidget(self.context_outline_button)
+        layout.addLayout(context_actions)
         self.inspector_tabs = QTabWidget()
         self.inspector_tabs.setObjectName("inspectorTabs")
         self.property_stack = QStackedWidget()
@@ -2318,7 +2366,10 @@ class BeamModelerDialog(QDialog):
         node_apply = QPushButton("更新节点坐标")
         node_apply.setObjectName("smallPrimaryButton")
         node_apply.clicked.connect(self._update_node_property)
-        node_layout.addWidget(node_apply)
+        self.property_apply_buttons = {"node": node_apply}
+        self.property_reset_buttons = {}
+        self.property_feedback = {}
+        self._add_property_actions(node_layout, "node", node_apply)
         node_layout.addStretch(1)
         self.property_stack.addWidget(node_page)
 
@@ -2371,7 +2422,8 @@ class BeamModelerDialog(QDialog):
         element_apply = QPushButton("更新梁实体")
         element_apply.setObjectName("smallPrimaryButton")
         element_apply.clicked.connect(self._update_element_property)
-        element_layout.addWidget(element_apply)
+        self.property_apply_buttons["element"] = element_apply
+        self._add_property_actions(element_layout, "element", element_apply)
         element_layout.addStretch(1)
         self.property_stack.addWidget(element_page)
 
@@ -2410,6 +2462,8 @@ class BeamModelerDialog(QDialog):
                 | Qt.TextInteractionFlag.TextSelectableByKeyboard
             )
         self.sensor_strain_edit = QLineEdit()
+        self.sensor_strain_edit.setPlaceholderText("未录入")
+        self.sensor_strain_edit.setToolTip("留空表示缺测；输入 0 表示真实的零应变。")
         self.sensor_weight_edit = QLineEdit()
         self.sensor_zone_a_edit = QLineEdit()
         self.sensor_zone_b_edit = QLineEdit()
@@ -2509,11 +2563,12 @@ class BeamModelerDialog(QDialog):
             self.sensor_array_button,
         ):
             button.setEnabled(False)
+        sensor_layout.addWidget(self.sensor_config_tabs)
+        self.property_apply_buttons["sensor"] = sensor_apply
+        self._add_property_actions(sensor_layout, "sensor", sensor_apply)
         sensor_layout.addWidget(quick_label)
         sensor_layout.addLayout(sensor_action_top)
         sensor_layout.addLayout(sensor_action_bottom)
-        sensor_layout.addWidget(self.sensor_config_tabs)
-        sensor_layout.addWidget(sensor_apply)
         sensor_layout.addStretch(1)
         self.property_stack.addWidget(sensor_page)
         self.property_stack.removeWidget(element_page)
@@ -2524,6 +2579,9 @@ class BeamModelerDialog(QDialog):
         property_scroll.setFrameShape(QFrame.Shape.NoFrame)
         property_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.property_stack.setObjectName("inspectorPage")
+        self.property_stack.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         property_scroll.setWidget(self.property_stack)
 
         primary_group = QWidget()
@@ -2561,7 +2619,10 @@ class BeamModelerDialog(QDialog):
         primary_apply = QPushButton("应用全局属性")
         primary_apply.setObjectName("smallPrimaryButton")
         primary_apply.clicked.connect(self._update_primary_properties)
-        primary_layout.addRow(primary_apply)
+        self.property_apply_buttons["primary"] = primary_apply
+        primary_actions = QVBoxLayout()
+        self._add_property_actions(primary_actions, "primary", primary_apply)
+        primary_layout.addRow(primary_actions)
         section_scroll = QScrollArea()
         section_scroll.setObjectName("inspectorScroll")
         section_scroll.setWidgetResizable(True)
@@ -2578,12 +2639,116 @@ class BeamModelerDialog(QDialog):
         self.inspector_tabs.addTab(self.model_outline, "对象列表")
         self.inspector_tabs.setTabToolTip(2, "按名称或 ID 搜索节点、梁段与测点（Ctrl+F）")
         layout.addWidget(self.inspector_tabs, 1)
+        self.draft_summary = QLabel("属性输入已同步")
+        self.draft_summary.setObjectName("modelerStatus")
+        self.draft_summary.setWordWrap(True)
+        self.draft_summary.setToolTip("草稿仅保留在本次建模会话中；保存或应用到工作台时统一校验。")
+        layout.addWidget(self.draft_summary)
+        self.draft_selector = QComboBox()
+        self.draft_selector.setAccessibleName("定位待应用的属性草稿")
+        self.draft_selector.setToolTip("选择一组草稿，返回对应属性继续编辑")
+        self.draft_selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.draft_selector.setMinimumContentsLength(8)
+        draft_navigation = QHBoxLayout()
+        draft_navigation.addWidget(self.draft_selector, 1)
+        self.draft_discard_selected = QPushButton("放弃此项")
+        self.draft_discard_selected.setToolTip("仅放弃列表当前这一组草稿；不会删除模型对象")
+        draft_navigation.addWidget(self.draft_discard_selected)
+        layout.addLayout(draft_navigation)
+        draft_actions = QHBoxLayout()
+        self.draft_apply_all = QPushButton("应用全部")
+        self.draft_discard_all = QPushButton("放弃全部")
+        self.draft_apply_all.setToolTip("统一校验全部草稿；通过后一次性应用，可一次撤销")
+        self.draft_discard_all.setToolTip("还原所有未应用输入，不改变模型；需要确认")
+        draft_actions.addWidget(self.draft_apply_all)
+        draft_actions.addWidget(self.draft_discard_all)
+        layout.addLayout(draft_actions)
+        # Enter in an editor must not accidentally open a file dialog or close
+        # the modeler. Buttons remain explicitly keyboard-activatable.
+        for button in panel.findChildren(QPushButton):
+            button.setAutoDefault(False)
         return panel
+
+    def _add_property_actions(self, layout, kind, apply_button):
+        feedback = QLabel("与当前模型一致")
+        feedback.setObjectName("modelerStatus")
+        feedback.setWordWrap(True)
+        feedback.setAccessibleName("属性编辑状态")
+        self.property_feedback[kind] = feedback
+        layout.addWidget(feedback)
+        actions = QHBoxLayout()
+        reset_button = QPushButton("还原输入")
+        reset_button.setToolTip("仅还原当前这组未应用的输入，不改变模型")
+        reset_button.clicked.connect(lambda _checked=False, group=kind: self.property_drafts.reset(group))
+        self.property_reset_buttons[kind] = reset_button
+        actions.addWidget(apply_button, 1)
+        actions.addWidget(reset_button)
+        layout.addLayout(actions)
+
+    def _build_draft_tracking(self):
+        forms = {
+            "node": {"x": self.node_x_edit, "y": self.node_y_edit, "z": self.node_z_edit},
+            "element": {
+                "family": self.element_family_combo, "section": self.element_section_combo,
+                "material": self.element_material_combo, "radius": self.arc_radius_edit,
+                "sweep": self.arc_sweep_edit, "plane": self.arc_plane_combo,
+            },
+            "sensor": {
+                "label": self.sensor_label_edit, "element": self.sensor_element_combo,
+                "xi": self.sensor_xi_edit, "surface": self.sensor_surface_combo,
+                "surface_angle": self.sensor_surface_angle_edit,
+                "orientation_angle": self.sensor_orientation_angle_edit,
+                "strain": self.sensor_strain_edit, "weight": self.sensor_weight_edit,
+                "zone_a": self.sensor_zone_a_edit, "zone_b": self.sensor_zone_b_edit,
+            },
+            "primary": {
+                "shape": self.section_shape_combo, "modulus": self.material_e_edit,
+                **{f"parameter_{index}": edit for index, edit in enumerate(self.section_parameter_edits)},
+            },
+        }
+        self.property_drafts = PropertyDrafts(
+            self, forms, self.property_feedback,
+            self.property_apply_buttons, self.property_reset_buttons,
+        )
+        for fields in forms.values():
+            for widget in fields.values():
+                if isinstance(widget, QComboBox):
+                    widget.setSizeAdjustPolicy(
+                        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+                    )
+                    widget.setMinimumContentsLength(8)
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
 
     def _focus_outline(self):
         self.inspector_tabs.setCurrentIndex(2)
         self.model_outline.search.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.model_outline.search.selectAll()
+
+    def _return_to_outline(self):
+        self.inspector_tabs.setCurrentIndex(2)
+        self.model_outline.set_selected(self.selected_id)
+        item = self.model_outline.tree.currentItem()
+        if item is not None and not item.isHidden():
+            self.model_outline.tree.scrollToItem(item)
+        self.model_outline.tree.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _update_context_header(self):
+        kinds = {"node": ("节点", self._project.nodes), "element": ("梁段", self._project.elements),
+                 "sensor": ("测点", self._project.sensors)}
+        title, entities = kinds.get(self.selected_kind, ("", ()))
+        match = next(((index, item) for index, item in enumerate(entities, 1)
+                      if item.identifier == self.selected_id), None)
+        self.context_edit_button.setEnabled(match is not None)
+        if match is None:
+            text = "尚未选择对象 · 可从画布或列表选择"
+        else:
+            index, item = match
+            label = getattr(item, "label", "")
+            name = f"{title} · {label}" if label else f"{title} {index}"
+            text = f"{name} · {item.identifier[-8:]}"
+        self.context_label.setText(text)
+        self.context_label.setAccessibleDescription(text)
 
     def _select_from_outline(self, kind, identifier):
         self._selection_changed(kind, identifier)
@@ -2740,7 +2905,10 @@ class BeamModelerDialog(QDialog):
             return
         shape = self.section_shape_combo.currentData()
         if shape:
-            self._configure_section_fields(shape)
+            if hasattr(self, "property_drafts"):
+                self.property_drafts.switch_section_shape(shape)
+            else:
+                self._configure_section_fields(shape)
             self._refresh_section_preview_from_form()
 
     @staticmethod
@@ -2784,6 +2952,18 @@ class BeamModelerDialog(QDialog):
         self.footer_hint.style().polish(self.footer_hint)
 
     def _apply_project(
+        self,
+        project: ProjectDocument,
+        *,
+        seed_generator: bool = False,
+    ):
+        self.property_drafts.capture()
+        with self.property_drafts.loading():
+            self._apply_project_contents(project, seed_generator=seed_generator)
+        self.property_drafts.restore(GLOBAL_KEY)
+        self.property_drafts.restore_selected()
+
+    def _apply_project_contents(
         self,
         project: ProjectDocument,
         *,
@@ -3058,6 +3238,7 @@ class BeamModelerDialog(QDialog):
     def _selection_changed(self, kind: str, identifier: str):
         if self._syncing_selection:
             return
+        self.property_drafts.capture()
         self._syncing_selection = True
         try:
             self.selected_kind = kind
@@ -3098,6 +3279,13 @@ class BeamModelerDialog(QDialog):
             button.setEnabled(selected)
 
     def _refresh_property_panel(self):
+        self.property_drafts.capture()
+        with self.property_drafts.loading():
+            self._populate_property_panel()
+        self.property_drafts.restore_selected()
+        self._update_context_header()
+
+    def _populate_property_panel(self):
         self._update_sensor_action_state()
         self._fill_entity_combos()
         if self.selected_kind == "node":
@@ -3228,7 +3416,9 @@ class BeamModelerDialog(QDialog):
                 self.sensor_direction_label.setText(
                     f"({direction[0]:.6g}, {direction[1]:.6g}, {direction[2]:.6g})"
                 )
-                self.sensor_strain_edit.setText(f"{float(sensor.measured_value or 0.0):.12g}")
+                self.sensor_strain_edit.setText(
+                    "" if sensor.measured_value is None else f"{sensor.measured_value:.12g}"
+                )
                 self.sensor_weight_edit.setText(f"{sensor.weight:.12g}")
                 bounds = sensor.attachment.integration_bounds
                 self.sensor_zone_a_edit.setText(f"{bounds[0]:.12g}")
@@ -3238,101 +3428,16 @@ class BeamModelerDialog(QDialog):
         self.delete_button.setEnabled(False)
 
     def _update_node_property(self):
-        try:
-            before = self._project
-            after = PathBeamEditor.move_node(
-                before,
-                self.selected_id,
-                (
-                    float(self.node_x_edit.text()),
-                    float(self.node_y_edit.text()),
-                    float(self.node_z_edit.text()),
-                ),
-            )
-            self._commit_project(before, after, "编辑节点三维坐标")
-        except (KeyError, TypeError, ValueError) as exc:
-            QMessageBox.warning(self, "节点属性", str(exc))
+        return self.property_drafts.apply_keys([("node", self.selected_id)])
 
     def _update_element_property(self):
-        try:
-            before = self._project
-            element = next(
-                item for item in before.elements if item.identifier == self.selected_id
-            )
-            after = PathBeamEditor.update_element(
-                before,
-                self.selected_id,
-                family=self.element_family_combo.currentData(),
-                section_id=self.element_section_combo.currentData(),
-                material_id=self.element_material_combo.currentData(),
-            )
-            description = "编辑梁实体属性"
-            if element.geometry.kind == "circular_arc":
-                after = PathBeamEditor.update_circular_arc(
-                    after,
-                    self.selected_id,
-                    radius=float(self.arc_radius_edit.text()),
-                    sweep_degrees=float(self.arc_sweep_edit.text()),
-                    plane=self.arc_plane_combo.currentData(),
-                )
-                description = "编辑参数化圆弧"
-            self._commit_project(before, after, description)
-        except (KeyError, StopIteration, TypeError, ValueError) as exc:
-            QMessageBox.warning(self, "梁段属性", str(exc))
+        return self.property_drafts.apply_keys([("element", self.selected_id)])
 
     def _update_sensor_property(self):
-        try:
-            before = self._project
-            sensor = next(
-                item for item in before.sensors if item.identifier == self.selected_id
-            )
-            surface_angle = float(self.sensor_surface_angle_edit.text()) % 360.0
-            surface_side = (
-                "top" if surface_angle < 90.0 or surface_angle >= 270.0 else "bottom"
-            )
-            after = PathBeamEditor.update_sensor(
-                before,
-                self.selected_id,
-                element_id=self.sensor_element_combo.currentData(),
-                local_coordinate=float(self.sensor_xi_edit.text()),
-                surface_side=surface_side,
-                direction=sensor.attachment.direction,
-                measured_value=float(self.sensor_strain_edit.text()),
-                weight=float(self.sensor_weight_edit.text()),
-                zone_a=float(self.sensor_zone_a_edit.text()),
-                zone_b=float(self.sensor_zone_b_edit.text()),
-                label=self.sensor_label_edit.text(),
-                surface_angle_degrees=surface_angle,
-                orientation_angle_degrees=float(
-                    self.sensor_orientation_angle_edit.text()
-                ),
-            )
-            self._commit_project(before, after, "编辑测点属性")
-        except (KeyError, StopIteration, TypeError, ValueError) as exc:
-            QMessageBox.warning(self, "测点属性", str(exc))
+        return self.property_drafts.apply_keys([("sensor", self.selected_id)])
 
     def _update_primary_properties(self):
-        try:
-            shape = self.section_shape_combo.currentData()
-            specs = SECTION_PARAMETER_SPECS[shape]
-            parameters = {
-                spec.key: float(self.section_parameter_edits[index].text())
-                for index, spec in enumerate(specs)
-            }
-            thickness, width = self._section_overall_dimensions(shape, parameters)
-            modulus_text = self.material_e_edit.text().strip()
-            before = self._project
-            after = PathBeamEditor.update_primary_properties(
-                before,
-                thickness=thickness,
-                width=width,
-                elastic_modulus=None if not modulus_text else float(modulus_text) * 1.0e9,
-                section_shape=shape,
-                section_parameters=parameters,
-            )
-            self._commit_project(before, after, "编辑统一截面与材料")
-        except (KeyError, TypeError, ValueError) as exc:
-            QMessageBox.warning(self, "截面与材料", str(exc))
+        return self.property_drafts.apply_keys([GLOBAL_KEY])
 
     def _delete_selected(self):
         if not self.selected_id:
@@ -3494,15 +3599,60 @@ class BeamModelerDialog(QDialog):
         try:
             project = load_project(path)
             PathBeamEditor.ordered_path(project)
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "打开项目失败", str(exc))
+            return
+        if not self._confirm_open_replacement():
+            return
+        # Saving during the confirmation may have overwritten the selected file.
+        # Re-read before switching so opening the same path cannot restore the
+        # stale snapshot loaded before Save.
+        try:
+            project = load_project(path)
+            PathBeamEditor.ordered_path(project)
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "打开项目失败", str(exc))
+            return
+        # Clear only after a valid target and explicit permission. IDs can be
+        # reused by another project; drafts must not leak across documents.
+        with self.property_drafts.loading():
+            self.property_drafts.clear()
             self._project_path = Path(path)
             self._saved_revision = project.revision
+            self._saved_content = project.to_dict()
+            self._saved_content.pop("revision", None)
             self.undo_stack.clear()
             self._selection_changed("", "")
             self._apply_project(project, seed_generator=True)
-        except (OSError, TypeError, ValueError) as exc:
-            QMessageBox.critical(self, "打开项目失败", str(exc))
+        self.property_drafts.update_ui()
+        self._set_status("项目已打开 · 应用到工作台后生效", "ready")
+
+    def _has_unapplied_changes(self):
+        self.property_drafts.capture()
+        current = self._project.to_dict()
+        current.pop("revision", None)
+        return bool(self.property_drafts.pending) or current != self._workspace_baseline
+
+    def _confirm_open_replacement(self):
+        if not self._has_unapplied_changes():
+            return True
+        answer = QMessageBox.question(
+            self, "打开其他项目？",
+            "当前模型或属性草稿尚未应用到工作台。\n"
+            "保存：校验全部草稿并保存当前项目，再打开所选项目。\n"
+            "放弃：打开所选项目，清除当前草稿与撤销历史；已保存文件不变。\n"
+            "取消：保留当前模型和输入，继续编辑。",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            return self._save_project()
+        return answer == QMessageBox.StandardButton.Discard
 
     def _save_project(self):
+        if not self.property_drafts.apply_all():
+            return False
+        project_to_save = self._project
         path = self._project_path
         if not path:
             selection = ProjectNameDialog.choose_project_name(
@@ -3514,19 +3664,25 @@ class BeamModelerDialog(QDialog):
                 theme_id=self._theme_id,
             )
             if selection is None:
-                return
+                return False
             project_name, path = selection
             if self._project.name != project_name:
-                self._project = self._project.revised(name=project_name)
+                project_to_save = self._project.revised(name=project_name)
         if not path:
-            return
+            return False
         try:
-            destination = save_project(path, self._project)
+            destination = save_project(path, project_to_save)
+            self._project = project_to_save
             self._project_path = destination
             self._saved_revision = self._project.revision
-            self._set_status("项目已保存", "ready")
+            self._saved_content = self._project.to_dict()
+            self._saved_content.pop("revision", None)
+            self.property_drafts.update_ui()
+            self._set_status("项目已保存 · 应用到工作台后生效", "ready")
+            return True
         except (OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(self, "保存项目失败", str(exc))
+            return False
 
     def _show_nonblocking_error(self, message: str):
         QToolTip.showText(self.mapToGlobal(self.rect().center()), str(message), self)
@@ -3547,7 +3703,8 @@ class BeamModelerDialog(QDialog):
 
     def apply_theme(self, theme_id):
         self._theme_id = resolve_theme(theme_id).identifier
-        self.setStyleSheet(compose_stylesheet(MODELER_STYLESHEET, self._theme_id))
+        self.setStyleSheet(compose_stylesheet(MODELER_STYLESHEET, self._theme_id,
+                                             preferences=self.reading_preferences))
         if hasattr(self, "canvas"):
             self.canvas.set_theme(self._theme_id)
         if hasattr(self, "section_preview"):
@@ -3555,14 +3712,30 @@ class BeamModelerDialog(QDialog):
         if hasattr(self, "geometry_3d_view"):
             self.geometry_3d_view.apply_theme(self._theme_id)
 
+    def set_reading_preferences(self, preferences):
+        if self._is_shut_down:
+            return
+        self.layout_preferences.capture()
+        self.reading_preferences = preferences
+        self.setStyleSheet(compose_stylesheet(MODELER_STYLESHEET, self._theme_id, preferences=preferences))
+        apply_reading_metrics(self, preferences)
+        self.layout_preferences.restore_later()
+
+    def reset_workspace_layout(self):
+        self.layout_preferences.reset()
+        self._set_status("已恢复默认布局 · 模型与属性草稿未改变", "ready")
+
     def shutdown(self):
+        if self._is_shut_down:
+            return
+        self._is_shut_down = True
+        if hasattr(self, "layout_preferences"):
+            self.layout_preferences.stop()
         if hasattr(self, "geometry_3d_view"):
             self.geometry_3d_view.shutdown()
 
     def _confirm_discard_unapplied_changes(self):
-        current = self._project.to_dict()
-        current.pop("revision", None)
-        if current == self._workspace_baseline:
+        if not self._has_unapplied_changes():
             return True
         storage_message = (
             "当前模型已保存到项目库；退出不会删除或回退该文件。"
@@ -3574,6 +3747,7 @@ class BeamModelerDialog(QDialog):
             "放弃未应用的建模更改？",
             "当前更改尚未应用到工作台。\n"
             "放弃并退出后，工作台仍保留进入建模器时的模型。\n\n"
+            f"尚有 {len(self.property_drafts.pending)} 组属性草稿未应用。\n"
             f"{storage_message}\n\n"
             "选择“取消”可继续编辑，再点击“应用到工作台”。",
             QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
@@ -3582,11 +3756,17 @@ class BeamModelerDialog(QDialog):
         return answer == QMessageBox.StandardButton.Discard
 
     def _finish_dialog(self, result):
+        if self._finished:
+            return True
+        if result == QDialog.DialogCode.Accepted and not self.property_drafts.apply_all():
+            return False
         if (
             result != QDialog.DialogCode.Accepted
             and not self._confirm_discard_unapplied_changes()
         ):
             return False
+        self.layout_preferences.save()
+        self._finished = True
         self.shutdown()
         super().done(result)
         return True

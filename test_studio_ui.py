@@ -13,8 +13,10 @@ from config_adapter import get_sample_config
 from ifem.infrastructure import project_from_legacy_config
 from ifem.ui.modeler import BeamModelerDialog
 from ifem.ui.studio import CommandPalette, StudioCommand
+from test_ui_support import isolated_workspace_settings
 
 
+@isolated_workspace_settings
 class StudioInteractionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

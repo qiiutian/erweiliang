@@ -29,9 +29,11 @@ from ifem.ui.modeler import (
     SpatialCurveDialog,
 )
 from ifem.ui.modeler_3d import BeamGeometry3DView
+from test_ui_support import isolated_workspace_settings
 from visualization_3d import Structure3DView
 
 
+@isolated_workspace_settings
 class ModelerUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -457,21 +459,23 @@ class ModelerUiTests(unittest.TestCase):
         self.assertEqual(window.thickness_edit.toolTip(), base_tooltip)
         window.close()
 
-    def test_measurement_parse_error_is_reported_on_sensor_tab(self):
+    def test_measurement_parse_error_keeps_original_table_and_form_input(self):
         window = gui_qt.ReconstructionMainWindow()
         window.show()
         editor = window.measurement_editor
+        original_rows = editor.get_rows()
+        original_project = window.current_project_document
+        window.left_tabs.setCurrentIndex(1)
         editor.table.selectRow(0)
         editor.inputs["strain"].setText("invalid")
-        editor.update_selected()
+        self.assertFalse(editor.update_selected())
         self.app.processEvents()
 
-        self.assertEqual(editor.count_label.property("state"), "error")
-        self.assertIn("测量数据", editor.count_label.toolTip())
-        self.assertIn("·", window.left_tabs.tabText(1))
-        self.assertFalse(window.run_button.isEnabled())
-        window.input_status_label.click()
-        self.app.processEvents()
+        self.assertEqual(editor.get_rows(), original_rows)
+        self.assertIs(window.current_project_document, original_project)
+        self.assertEqual(window.table_undo_stack.count(), 0)
+        self.assertIn("测量数据", editor.status_label.text())
+        self.assertTrue(window.run_button.isEnabled())
         self.assertEqual(window.left_tabs.currentIndex(), 1)
         self.assertTrue(editor.inputs["strain"].hasFocus())
         self.assertEqual(editor.inputs["strain"].selectedText(), "invalid")

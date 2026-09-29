@@ -15,8 +15,10 @@ from ifem.infrastructure import project_from_legacy_config, save_project
 from ifem.modeling import BeamProjectEditor
 from ifem.ui.modeler import BeamModelCanvas, BeamModelerDialog
 from ifem.ui.modeler_3d import BeamGeometry3DView
+from test_ui_support import isolated_workspace_settings
 
 
+@isolated_workspace_settings
 class ModelerExitSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

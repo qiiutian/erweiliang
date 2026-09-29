@@ -25,8 +25,10 @@ from ifem.infrastructure.project_library import (
 )
 from ifem.ui.project_library import ProjectLibraryDialog, ProjectNameDialog
 from ifem.ui.modeler import BeamModelerDialog
+from test_ui_support import isolated_workspace_settings
 
 
+@isolated_workspace_settings
 class ProjectLibraryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

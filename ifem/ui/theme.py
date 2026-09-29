@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
+import re
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
+
+if TYPE_CHECKING:
+    from ifem.ui.workspace_preferences import ReadingPreferences
 
 
 DEFAULT_THEME_ID = "graphite"
@@ -129,7 +135,7 @@ QWidget {{
 }}
 QMainWindow, QWidget#appRoot, QDialog#modelerDialog,
 QDialog#startCenter,
-QDialog#projectLibraryDialog, QDialog#projectNameDialog {{
+QDialog#projectLibraryDialog, QDialog#projectNameDialog, QDialog#readingPreferencesDialog {{
     background: {c['background']};
 }}
 QFrame#topBar, QFrame#startShell, QFrame#startActions, QFrame#modelerToolBar,
@@ -589,6 +595,20 @@ QToolButton#railButton:checked {{ background: {c['primary']}; color: {c['on_prim
 QToolButton#railButton:focus {{ border-color: {c['viewport_text']}; }}
 QToolButton#railButton:pressed {{ background: {c['primary_hover']}; }}
 QToolButton#railButton[hasIssue="true"] {{ border-bottom: 2px solid {c['sensor']}; }}
+QToolButton#tableEditToolButton {{ color: {c['text_secondary']}; background: {c['surface_subtle']};
+    border: 1px solid {c['border']}; border-radius: 5px; padding: 4px 6px;
+    min-height: 18px; font-size: 12px; font-weight: 500; }}
+QToolButton#tableEditToolButton:hover, QToolButton#tableEditToolButton:focus {{
+    color: {c['primary']}; background: {c['primary_soft']}; border-color: {c['focus']}; }}
+QToolButton#tableEditToolButton:pressed {{ background: {c['primary_tint']}; }}
+QToolButton#tableEditToolButton:disabled {{ color: {c['text_muted']};
+    background: {c['surface']}; border-color: {c['divider']}; }}
+QToolButton#tableEditToolButton::menu-indicator {{ image: url("{down}");
+    subcontrol-origin: padding; subcontrol-position: bottom right; width: 9px; height: 9px; }}
+QLabel#tableEditStatus {{ color: {c['text_muted']}; font-size: 11px; background: transparent;
+    padding: 3px 5px; border-left: 2px solid transparent; }}
+QLabel#tableEditStatus[validationState="error"] {{ color: {c['danger']};
+    background: {c['danger_soft']}; border-left-color: {c['danger']}; }}
 QFrame#inputInspector {{ background: {c['surface']}; border: 1px solid {c['border']}; border-radius: 10px; }}
 QLabel#sectionTitle {{ font-size: 17px; font-weight: 700; }}
 QLabel#sectionHint {{ font-size: 11px; color: {c['text_muted']}; }}
@@ -665,8 +685,128 @@ QTreeWidget#modelOutline::item:hover {{ background: {c['surface_muted']}; }}
 """
 
 
-def compose_stylesheet(base_stylesheet: str, theme_id: str | None) -> str:
-    return f"{base_stylesheet}\n{application_stylesheet(theme_id)}"
+_FONT_SIZE_RE = re.compile(
+    r"(?P<comment>/\*.*?\*/)"
+    r"|(?P<prefix>(?<![\w-])font-size\s*:\s*)"
+    r"(?P<size>\d+(?:\.\d+)?)(?P<unit>px|pt)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_QSS_RULE_RE = re.compile(r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]*)\}")
+_QSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_SELECTOR_QUALIFIER = r'(?:#[\w-]+|\[[^\]]+\]|:(?!:)[!\w-]+)*'
+_DENSITY_TARGET_RE = re.compile(
+    r"(?:^|[\s>+~])(?:"
+    r"(?:QLineEdit|QComboBox|QSpinBox|QDoubleSpinBox|QPlainTextEdit|QTextEdit|"
+    r"QPushButton|QToolButton)" + _SELECTOR_QUALIFIER
+    + r"|QHeaderView" + _SELECTOR_QUALIFIER + r"::section" + _SELECTOR_QUALIFIER
+    + r"|QTabBar" + _SELECTOR_QUALIFIER + r"::tab" + _SELECTOR_QUALIFIER
+    + r")\s*$"
+)
+_PADDING_RE = re.compile(
+    r"(?P<comment>/\*.*?\*/)"
+    r"|(?P<prefix>(?<![\w-])padding(?P<side>-(?:top|bottom))?\s*:\s*)"
+    r"(?P<values>[^;{}]+)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PIXEL_PADDING_RE = re.compile(r"(?:\d+(?:\.\d+)?px|0)", re.IGNORECASE)
+_COMFORTABLE_PADDING_FALLBACK = """
+/* Reading density: only vertical control spacing; original widths stay intact. */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit,
+QPushButton, QToolButton, QHeaderView::section, QTabBar::tab {
+    padding-top: 2px; padding-bottom: 2px;
+}
+"""
+
+
+def _qss_number(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _comfortable_padding(match: re.Match[str]) -> str:
+    if match.group("comment") is not None:
+        return match.group(0)
+    values = match.group("values").split()
+    if not 1 <= len(values) <= 4 or any(
+        _PIXEL_PADDING_RE.fullmatch(value) is None for value in values
+    ):
+        return match.group(0)
+
+    def increased(value: str) -> str:
+        return f"{_qss_number(Decimal(value.lower().removesuffix('px')) + 2)}px"
+
+    if match.group("side"):
+        if len(values) != 1:
+            return match.group(0)
+        values[0] = increased(values[0])
+    else:
+        # A one-value shorthand applies to both axes. Expand it so the
+        # horizontal spacing remains exactly the original value.
+        if len(values) == 1:
+            values.append(values[0])
+        values[0] = increased(values[0])
+        if len(values) >= 3:
+            values[2] = increased(values[2])
+    return match.group("prefix") + " ".join(values)
+
+
+def _comfortable_rule(match: re.Match[str]) -> str:
+    selectors = match.group("selectors")
+    body = match.group("body")
+    selector_parts = selectors.split(",")
+    targets = [bool(_DENSITY_TARGET_RE.search(_QSS_COMMENT_RE.sub("", selector)))
+               for selector in selector_parts]
+    if not any(targets):
+        return match.group(0)
+    adjusted_body = _PADDING_RE.sub(_comfortable_padding, body)
+    if adjusted_body == body:
+        return match.group(0)
+    if all(targets):
+        return selectors + "{" + adjusted_body + "}"
+    # Shared label/button rules must not increase spacing on ordinary labels.
+    unchanged = ",".join(selector for selector, target in zip(selector_parts, targets) if not target)
+    adjusted = ",".join(selector for selector, target in zip(selector_parts, targets) if target)
+    return unchanged + "{" + body + "}\n" + adjusted + "{" + adjusted_body + "}"
+
+
+def apply_reading_preferences(
+    stylesheet: str, preferences: ReadingPreferences | None = None
+) -> str:
+    """Derive a local reading style from an unmodified source stylesheet.
+
+    Call this with the baseline, never with a widget's already-adjusted QSS.
+    No application font, theme, settings, data or plotting state is changed.
+    Qt rounds fractional pixel font sizes when resolving the widget's font;
+    point sizes retain their precision. Density adds two pixels per vertical
+    side and leaves horizontal spacing and geometry constraints unchanged.
+    """
+    if preferences is None:
+        return stylesheet
+    font_scale = preferences.font_scale
+    if font_scale not in (100, 110, 120):
+        font_scale = 100
+    if font_scale != 100:
+        def scaled_font(match: re.Match[str]) -> str:
+            if match.group("comment") is not None:
+                return match.group(0)
+            size = Decimal(match.group("size")) * Decimal(font_scale) / 100
+            return match.group("prefix") + _qss_number(size) + match.group("unit")
+
+        stylesheet = _FONT_SIZE_RE.sub(scaled_font, stylesheet)
+    if preferences.density == "comfortable":
+        stylesheet = _COMFORTABLE_PADDING_FALLBACK + _QSS_RULE_RE.sub(
+            _comfortable_rule, stylesheet
+        )
+    return stylesheet
+
+
+def compose_stylesheet(
+    base_stylesheet: str,
+    theme_id: str | None,
+    *,
+    preferences: ReadingPreferences | None = None,
+) -> str:
+    stylesheet = f"{base_stylesheet}\n{application_stylesheet(theme_id)}"
+    return apply_reading_preferences(stylesheet, preferences)
 
 
 def apply_application_theme(
@@ -699,6 +839,7 @@ __all__ = [
     "ThemeSpec",
     "application_stylesheet",
     "apply_application_theme",
+    "apply_reading_preferences",
     "compose_stylesheet",
     "current_theme_id",
     "load_theme_id",

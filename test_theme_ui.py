@@ -27,6 +27,7 @@ from ifem.ui.theme import (
     resolve_theme,
     save_theme_id,
 )
+from test_ui_support import isolated_workspace_settings
 
 
 def _contrast(foreground, background):
@@ -63,6 +64,7 @@ class _ApplicationThemeState:
         self.stylesheet_calls += 1
 
 
+@isolated_workspace_settings
 class ThemeUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

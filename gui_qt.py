@@ -11,7 +11,7 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from PySide6.QtCore import QTimer, Qt, Signal, QSize
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut, QUndoStack
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -71,6 +71,11 @@ from ifem.infrastructure.legacy_project import (
 )
 from ifem.modeling.path_editor import PathBeamEditor
 from ifem.ui.modeler import BeamModelerDialog
+from ifem.ui.editable_table import EditableTable
+from ifem.ui.workspace_preferences import WorkspacePreferencesStore
+from ifem.ui.workspace_view import (
+    ReadingPreferencesDialog, WorkspaceLayoutController, apply_reading_metrics,
+)
 from ifem.ui.project_library import ProjectLibraryDialog, ProjectNameDialog
 from ifem.ui.start_center import (
     START_NEW,
@@ -1171,466 +1176,6 @@ class NoWheelComboBox(QComboBox):
         event.ignore()
 
 
-class EditableTable(QWidget):
-    ENTITY_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 1
-
-    def __init__(
-        self,
-        title,
-        field_specs,
-        parent=None,
-        on_change=None,
-        description="",
-        form_columns=2,
-        stretch_columns=True,
-        table_columns=None,
-        form_sections=None,
-        table_min_height=210,
-        record_noun="条记录",
-        header_action=None,
-    ):
-        super().__init__(parent)
-        self.title = title
-        self.field_specs = field_specs
-        self.inputs = {}
-        self.on_change = on_change
-        self.form_columns = max(1, int(form_columns))
-        self.record_noun = record_noun
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        group = QGroupBox(title)
-        layout.addWidget(group)
-
-        group_layout = QVBoxLayout(group)
-        group_layout.setContentsMargins(12, 14, 12, 12)
-        group_layout.setSpacing(10)
-
-        meta_bar = QHBoxLayout()
-        if description:
-            description_label = QLabel(description)
-            description_label.setObjectName("hintLabel")
-            description_label.setWordWrap(True)
-            meta_bar.addWidget(description_label, 1)
-        else:
-            meta_bar.addStretch(1)
-        self.count_label = QLabel("0 条记录")
-        self.count_label.setObjectName("recordBadge")
-        meta_bar.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignTop)
-        if header_action:
-            action_text, action_callback = header_action
-            self.header_action_button = QPushButton(action_text)
-            self.header_action_button.setObjectName("modelerButton")
-            self.header_action_button.setToolTip("进入交互建模器，在梁模型表面布置和调整测点")
-            self.header_action_button.clicked.connect(action_callback)
-            meta_bar.addWidget(self.header_action_button, 0, Qt.AlignmentFlag.AlignTop)
-        group_layout.addLayout(meta_bar)
-
-        self.table = QTableWidget(0, len(field_specs))
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setAlternatingRowColors(True)
-        self.table.setShowGrid(False)
-        self.table.setWordWrap(False)
-        self.table.itemSelectionChanged.connect(self.on_selection_changed)
-        self.table.setMinimumHeight(table_min_height)
-
-        headers = [spec.get("table_label", spec["label"]) for spec in field_specs]
-        self.table.setHorizontalHeaderLabels(headers)
-        header = self.table.horizontalHeader()
-        header.setMinimumSectionSize(58)
-        visible_keys = set(
-            table_columns or [spec["key"] for spec in self.field_specs]
-        )
-        visible_columns = []
-        for column, spec in enumerate(self.field_specs):
-            visible = spec["key"] in visible_keys
-            self.table.setColumnHidden(column, not visible)
-            if visible:
-                visible_columns.append(column)
-        if table_columns:
-            self.table.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-            )
-        if stretch_columns:
-            for column in visible_columns:
-                header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
-        else:
-            for column in visible_columns:
-                header.setSectionResizeMode(
-                    column,
-                    QHeaderView.ResizeMode.ResizeToContents,
-                )
-            if visible_columns:
-                header.setSectionResizeMode(
-                    visible_columns[-1],
-                    QHeaderView.ResizeMode.Stretch,
-                )
-            header.setStretchLastSection(False)
-        group_layout.addWidget(self.table)
-
-        if form_sections:
-            self.editor_tabs = QTabWidget()
-            self.editor_tabs.setObjectName("editorTabs")
-            specs_by_key = {spec["key"]: spec for spec in self.field_specs}
-            for section_title, section_keys in form_sections:
-                section_specs = [specs_by_key[key] for key in section_keys]
-                self.editor_tabs.addTab(
-                    self._build_form(section_specs),
-                    section_title,
-                )
-            group_layout.addWidget(self.editor_tabs)
-        else:
-            group_layout.addWidget(self._build_form(self.field_specs))
-
-        button_bar = QHBoxLayout()
-        self.add_button = QPushButton("新增")
-        self.update_button = QPushButton("更新选中")
-        self.delete_button = QPushButton("删除选中")
-        self.clear_button = QPushButton("清空全部")
-        self.add_button.setObjectName("smallPrimaryButton")
-        self.delete_button.setObjectName("dangerButton")
-        self.clear_button.setObjectName("dangerGhostButton")
-        self.add_button.setToolTip("将填写的数据加入表格")
-        self.update_button.setToolTip("用当前数据覆盖选中记录")
-        self.delete_button.setToolTip("删除当前选中的记录")
-        self.clear_button.setToolTip("清空当前表格的全部记录")
-        self.add_button.clicked.connect(self.add_row)
-        self.update_button.clicked.connect(self.update_selected)
-        self.delete_button.clicked.connect(self.delete_selected)
-        self.clear_button.clicked.connect(self.confirm_clear_rows)
-
-        button_bar.addWidget(self.add_button)
-        button_bar.addWidget(self.update_button)
-        button_bar.addWidget(self.delete_button)
-        button_bar.addWidget(self.clear_button)
-        button_bar.addStretch(1)
-        group_layout.addLayout(button_bar)
-        self._update_count()
-
-    def _build_form(self, specs):
-        form = QWidget()
-        form.setObjectName("editorForm")
-        form_layout = QGridLayout(form)
-        form_layout.setContentsMargins(8, 8, 8, 8)
-        form_layout.setHorizontalSpacing(10)
-        form_layout.setVerticalSpacing(8)
-        for index, spec in enumerate(specs):
-            row = index // self.form_columns
-            col = (index % self.form_columns) * 2
-            label = QLabel(spec["label"])
-            label.setObjectName("fieldLabel")
-            form_layout.addWidget(label, row, col)
-            widget = self._create_input(spec)
-            self.inputs[spec["key"]] = widget
-            form_layout.addWidget(widget, row, col + 1)
-            form_layout.setColumnStretch(col + 1, 1)
-        return form
-
-    def _create_input(self, spec):
-        choices = spec.get("choices")
-        if choices:
-            widget = QComboBox()
-            widget.addItems(choices)
-            widget.setEditable(False)
-            if spec.get("tooltip"):
-                widget.setToolTip(spec["tooltip"])
-            return widget
-        widget = QLineEdit()
-        widget.setClearButtonEnabled(True)
-        widget.setPlaceholderText(spec.get("placeholder", ""))
-        if spec.get("tooltip"):
-            widget.setToolTip(spec["tooltip"])
-        return widget
-
-    def _get_widget_value(self, widget):
-        if isinstance(widget, QComboBox):
-            return widget.currentText().strip()
-        return widget.text().strip()
-
-    def _table_item(self, spec, value):
-        raw_value = "" if value is None else str(value)
-        display_map = spec.get("table_display", {})
-        item = QTableWidgetItem(display_map.get(raw_value, raw_value))
-        item.setData(Qt.ItemDataRole.UserRole, raw_value)
-        alignment = spec.get("table_align")
-        if alignment == "right":
-            item.setTextAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-            )
-        elif alignment == "center":
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        return item
-
-    def _row_entity_id(self, row):
-        item = self.table.item(row, 0)
-        if item is None:
-            return ""
-        return str(item.data(self.ENTITY_ID_ROLE) or "")
-
-    def _set_row_entity_id(self, row, entity_id):
-        item = self.table.item(row, 0)
-        if item is not None:
-            item.setData(
-                self.ENTITY_ID_ROLE,
-                str(entity_id) if entity_id else None,
-            )
-
-    def set_row_entity_ids(self, entity_ids):
-        if len(entity_ids) != self.table.rowCount():
-            raise ValueError(f"{self.title}行数与实体 ID 数量不一致。")
-        for row, entity_id in enumerate(entity_ids):
-            self._set_row_entity_id(row, entity_id)
-
-    @staticmethod
-    def _table_item_value(item):
-        if item is None:
-            return ""
-        raw_value = item.data(Qt.ItemDataRole.UserRole)
-        return item.text() if raw_value is None else str(raw_value)
-
-    def _set_widget_value(self, widget, value):
-        text = "" if value is None else str(value)
-        if isinstance(widget, QComboBox):
-            index = widget.findText(text)
-            if index >= 0:
-                widget.setCurrentIndex(index)
-            else:
-                widget.setCurrentText(text)
-        else:
-            widget.setText(text)
-
-    def get_form_values(self):
-        return {spec["key"]: self._get_widget_value(self.inputs[spec["key"]]) for spec in self.field_specs}
-
-    def set_form_values(self, values):
-        for spec in self.field_specs:
-            self._set_widget_value(self.inputs[spec["key"]], values.get(spec["key"], ""))
-
-    def clear_form(self):
-        for spec in self.field_specs:
-            self._set_widget_value(self.inputs[spec["key"]], "")
-
-    def add_row(self):
-        values = self.get_form_values()
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        for col, spec in enumerate(self.field_specs):
-            self.table.setItem(
-                row,
-                col,
-                self._table_item(spec, values[spec["key"]]),
-            )
-        self.clear_form()
-        self._update_count()
-        self._emit_change()
-
-    def update_selected(self):
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        entity_id = self._row_entity_id(row)
-        values = self.get_form_values()
-        for col, spec in enumerate(self.field_specs):
-            self.table.setItem(
-                row,
-                col,
-                self._table_item(spec, values[spec["key"]]),
-            )
-        self._set_row_entity_id(row, entity_id)
-        self._emit_change()
-
-    def delete_selected(self):
-        row = self.table.currentRow()
-        if row >= 0:
-            self.table.removeRow(row)
-            self._update_count()
-            self._emit_change()
-
-    def clear_rows(self):
-        self.table.setRowCount(0)
-        self.clear_form()
-        self._update_count()
-        self._emit_change()
-
-    def confirm_clear_rows(self):
-        if self.table.rowCount() == 0:
-            return
-        answer = QMessageBox.question(
-            self,
-            f"清空{self.title}",
-            "确定清空全部记录吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self.clear_rows()
-
-    def on_selection_changed(self):
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        values = {}
-        for col, spec in enumerate(self.field_specs):
-            item = self.table.item(row, col)
-            values[spec["key"]] = self._table_item_value(item)
-        self.set_form_values(values)
-
-    def get_rows(self):
-        rows = []
-        for row in range(self.table.rowCount()):
-            payload = {}
-            for col, spec in enumerate(self.field_specs):
-                item = self.table.item(row, col)
-                payload[spec["key"]] = self._table_item_value(item)
-            entity_id = self._row_entity_id(row)
-            if entity_id:
-                payload["_entity_id"] = entity_id
-            rows.append(payload)
-        return rows
-
-    def set_rows(self, rows):
-        self.table.setRowCount(0)
-        for payload in rows:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            for col, spec in enumerate(self.field_specs):
-                self.table.setItem(
-                    row,
-                    col,
-                    self._table_item(spec, payload.get(spec["key"], "")),
-                )
-            self._set_row_entity_id(row, payload.get("_entity_id", ""))
-        self.clear_form()
-        self._update_count()
-        self._emit_change()
-
-    def _update_count(self):
-        self.count_label.setText(f"{self.table.rowCount()} {self.record_noun}")
-
-    def set_validation_state(self, state="", message=""):
-        self.count_label.setProperty("state", state)
-        self.count_label.setToolTip(message or f"{self.title}状态")
-        style = self.count_label.style()
-        style.unpolish(self.count_label)
-        style.polish(self.count_label)
-        self.count_label.update()
-
-    def focus_validation_issue(self, message="", *, field_path=None):
-        """Reveal the exact row/field when a stable path is available."""
-        text = str(message or "")
-        field_path = str(field_path or "")
-        path_parts = [part for part in field_path.strip("/").split("/") if part]
-        row = -1
-        field_key = None
-        if len(path_parts) >= 2:
-            row_token = path_parts[1].replace("~1", "/").replace("~0", "~")
-            if row_token.isdigit():
-                row = int(row_token)
-            else:
-                for candidate, payload in enumerate(self.get_rows()):
-                    if str(payload.get("_entity_id", "")) == row_token:
-                        row = candidate
-                        break
-            tail = path_parts[2:]
-            field_key = self._field_key_from_path(tail)
-
-        if row < 0:
-            row_match = re.search(r"第\s*(\d+)\s*(?:条|个)", text)
-            row = (
-                int(row_match.group(1)) - 1
-                if row_match
-                else self.table.currentRow()
-            )
-        if not 0 <= row < self.table.rowCount():
-            row = 0 if self.table.rowCount() else -1
-        if row >= 0:
-            self.table.selectRow(row)
-            self.on_selection_changed()
-
-        if field_key not in self.inputs:
-            field_terms = (
-                ("局部积分起点", "zone_a"),
-                ("局部积分终点", "zone_b"),
-                ("量长起点", "zone_a"),
-                ("量长终点", "zone_b"),
-                ("单元号", "element"),
-                ("节点号", "node"),
-                ("自由度", "dof"),
-                ("约束值", "value"),
-                ("截面 y", "y"),
-                ("surface", "surface"),
-                ("应变", "strain"),
-                ("权重", "weight"),
-                ("的 u", "u"),
-                ("的 v", "v"),
-                ("的 x", "x"),
-            )
-            field_key = next(
-                (
-                    key
-                    for term, key in field_terms
-                    if term in text and key in self.inputs
-                ),
-                None,
-            )
-        if field_key is None:
-            field_key = next(iter(self.inputs), None)
-        target = self.inputs.get(field_key)
-        if target is None:
-            self.table.setFocus(Qt.FocusReason.OtherFocusReason)
-            return
-        if hasattr(self, "editor_tabs"):
-            form_page = target.parentWidget()
-            tab_index = self.editor_tabs.indexOf(form_page)
-            if tab_index >= 0:
-                self.editor_tabs.setCurrentIndex(tab_index)
-        target.setFocus(Qt.FocusReason.OtherFocusReason)
-        if isinstance(target, QLineEdit):
-            target.selectAll()
-
-    def _field_key_from_path(self, tail):
-        if not tail:
-            return None
-        key = tail[0].replace("~1", "/").replace("~0", "~")
-        direct = {
-            "element": "element",
-            "x": "x",
-            "surface": "surface",
-            "y": "y",
-            "strain": "strain",
-            "measured_value": "strain",
-            "weight": "weight",
-            "zone_a": "zone_a",
-            "zone_b": "zone_b",
-            "node": "node",
-            "node_id": "node",
-            "dof": "dof",
-            "value": "value",
-            "label": "label",
-            "u": "u",
-            "v": "v",
-        }
-        if key in direct:
-            return direct[key]
-        if key != "attachment" or len(tail) < 2:
-            return None
-        attachment_key = tail[1]
-        if attachment_key == "local_coordinates":
-            return "x"
-        if attachment_key in {"surface_side", "surface_angle_degrees"}:
-            return "surface"
-        if attachment_key == "integration_bounds":
-            return "zone_b" if len(tail) >= 3 and tail[2] == "1" else "zone_a"
-        return None
-
-    def _emit_change(self):
-        if callable(self.on_change):
-            self.on_change()
 
 
 class ReadOnlyTable(QWidget):
@@ -3167,8 +2712,11 @@ class ReconstructionMainWindow(QMainWindow):
         *,
         theme_id=None,
         project_library=None,
+        preferences_store=None,
     ):
         super().__init__()
+        self.preferences_store = preferences_store if preferences_store is not None else WorkspacePreferencesStore()
+        self.reading_preferences = self.preferences_store.load_reading()
         self.project_library = project_library or ProjectLibrary()
         self.current_theme_id = apply_application_theme(
             theme_id or current_theme_id(),
@@ -3178,7 +2726,8 @@ class ReconstructionMainWindow(QMainWindow):
         self.resize(1640, 960)
         self.setMinimumSize(1180, 760)
         self.setStyleSheet(
-            compose_stylesheet(APP_STYLESHEET + STUDIO_THEME, self.current_theme_id)
+            compose_stylesheet(APP_STYLESHEET + STUDIO_THEME, self.current_theme_id,
+                               preferences=self.reading_preferences)
         )
 
         self.current_model = None
@@ -3202,9 +2751,20 @@ class ReconstructionMainWindow(QMainWindow):
         self._readiness_issues = []
         self._is_shut_down = False
         self.analysis_service = analysis_service or get_default_analysis_service()
+        self.table_undo_stack = QUndoStack(self)
+        self.table_undo_stack.setUndoLimit(100)
+        self._table_sensor_templates = {}
+        self._table_boundary_templates = {}
 
         self._build_ui()
         self.load_sample_data(initial=True)
+        apply_reading_metrics(self, self.reading_preferences)
+        self.layout_preferences = WorkspaceLayoutController(
+            self, self.preferences_store, "workbench",
+            {"main": self.main_split, "input": self.left_split, "result": self.right_split},
+            {"main": [430, 1100], "input": [550, 170], "result": [700, 155]},
+            {"preview": self.preview_toggle, "results": self.result_toggle},
+        )
 
     def _build_ui(self):
         central = QWidget()
@@ -3280,6 +2840,8 @@ class ReconstructionMainWindow(QMainWindow):
         sample_action = more_menu.addAction("载入示例")
         sample_action.triggered.connect(self.load_sample_data)
         more_menu.addSeparator()
+        self.reading_preferences_action = more_menu.addAction("阅读与布局…")
+        self.reading_preferences_action.triggered.connect(self.show_reading_preferences)
         reset_layout_action = more_menu.addAction("重置工作区布局")
         reset_layout_action.triggered.connect(self.reset_workspace_layout)
         more_menu.addSeparator()
@@ -3291,7 +2853,7 @@ class ReconstructionMainWindow(QMainWindow):
         import_json_action.triggered.connect(self.import_json_to_form)
         self.more_button = QPushButton("更多")
         self.more_button.setObjectName("topBarButton")
-        self.more_button.setToolTip("另存项目、恢复工作区布局或进行 JSON 数据交换")
+        self.more_button.setToolTip("另存项目、调整阅读偏好、恢复布局或进行 JSON 数据交换")
         self.more_button.setMenu(more_menu)
         command_layout.addWidget(self.more_button)
         self.save_as_action = QAction("另存项目", self)
@@ -3777,21 +3339,47 @@ class ReconstructionMainWindow(QMainWindow):
         self.input_heading_hint.setText(f"{index + 1:02d} / 准备分析")
 
     def _toggle_preview(self, visible):
+        controller = getattr(self, "layout_preferences", None)
+        if controller is not None:
+            controller.capture()
         self.preview_group.setVisible(visible)
         self.preview_toggle.setText("收起测点布置" if visible else "展开测点布置")
+        if controller is not None and visible:
+            controller.restore_ratios()
 
     def _toggle_results(self, visible):
+        controller = getattr(self, "layout_preferences", None)
+        if controller is not None:
+            controller.capture()
         if hasattr(self, "result_group"):
             self.result_group.setVisible(visible and not self.focus_mode_button.isChecked())
+        if controller is not None and visible:
+            controller.restore_ratios()
 
     def reset_workspace_layout(self):
         self.focus_mode_button.setChecked(False)
-        self.preview_toggle.setChecked(True)
-        self.result_toggle.setChecked(True)
-        self.main_split.setSizes([430, max(640, self.width() - 540)])
-        self.left_split.setSizes([550, 160])
-        self.right_split.setSizes([650, 155])
+        self.layout_preferences.reset()
         self.statusBar().showMessage("已恢复默认工作区布局", 4000)
+
+    def show_reading_preferences(self):
+        dialog = ReadingPreferencesDialog(self.reading_preferences, self, theme_id=self.current_theme_id)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.set_reading_preferences(dialog.preferences, persist=True)
+        dialog.deleteLater()
+
+    def set_reading_preferences(self, preferences, *, persist=False):
+        self.layout_preferences.capture()
+        if persist:
+            preferences = self.preferences_store.save_reading(preferences)
+        self.reading_preferences = preferences
+        self.setStyleSheet(compose_stylesheet(
+            APP_STYLESHEET + STUDIO_THEME, self.current_theme_id, preferences=preferences,
+        ))
+        apply_reading_metrics(self, preferences)
+        for dialog in self.findChildren(BeamModelerDialog):
+            dialog.set_reading_preferences(preferences)
+        self.layout_preferences.restore_later()
+        self.statusBar().showMessage("阅读设置已应用，仅影响本机界面", 4000)
 
     def show_command_palette(self):
         commands = [
@@ -3807,6 +3395,7 @@ class ReconstructionMainWindow(QMainWindow):
             StudioCommand("切换专注模式", "隐藏输入和表格，扩大视口", self.focus_mode_button.toggle),
             StudioCommand("显示或收起结果表格", "Ctrl+J · 精确结果数据", self.result_toggle.toggle),
             StudioCommand("显示或收起测点布置", "为输入表单提供更多空间", self.preview_toggle.toggle),
+            StudioCommand("阅读与布局", "字号、舒适/紧凑密度 · 仅本机", self.show_reading_preferences, keywords="font density preferences"),
             StudioCommand("重置工作区布局", "恢复默认分区和面板", self.reset_workspace_layout),
         ])
         for mode, title in (("shape", "形态"), ("strain", "应变"), ("stress", "应力")):
@@ -4119,6 +3708,10 @@ class ReconstructionMainWindow(QMainWindow):
             table_min_height=176,
             record_noun="个测点",
             header_action=("模型布点", self.open_interactive_modeler),
+            undo_stack=self.table_undo_stack,
+            validate_rows=lambda rows: self._validate_table_rows("measurements", rows),
+            can_mutate=lambda: self._can_edit_input_tables("measurements"),
+            entity_prefix="sensor",
         )
         self.measurement_editor.setObjectName("sensorEditor")
         self.measurement_editor.add_button.setText("新增测点")
@@ -4140,6 +3733,10 @@ class ReconstructionMainWindow(QMainWindow):
             on_change=self._mark_results_stale,
             description="按节点设置 u、v 或 phi；程序会自动换算为全局自由度编号。",
             form_columns=2,
+            undo_stack=self.table_undo_stack,
+            validate_rows=lambda rows: self._validate_table_rows("boundary_conditions", rows),
+            can_mutate=lambda: self._can_edit_input_tables("boundary_conditions"),
+            entity_prefix="bc",
         )
         layout.addWidget(self.boundary_editor)
 
@@ -4157,6 +3754,9 @@ class ReconstructionMainWindow(QMainWindow):
             on_change=self._mark_results_stale,
             description="可选：输入已知位移，用于计算重构值与实测值的差异。",
             form_columns=2,
+            undo_stack=self.table_undo_stack,
+            validate_rows=lambda rows: self._validate_table_rows("true_points", rows),
+            can_mutate=lambda: self._can_edit_input_tables("true_points"),
         )
         layout.addWidget(self.true_point_editor)
 
@@ -4197,8 +3797,61 @@ class ReconstructionMainWindow(QMainWindow):
             checkbox.toggled.connect(self._on_plot_settings_changed)
 
     def _on_node_x_changed(self, *_args):
+        if not self._loading_form:
+            # Index-based table coordinates must not be replayed onto a changed
+            # geometry. Geometry/modeler history remains a separate transaction.
+            self.table_undo_stack.clear()
         self.refresh_measurement_preview()
         self._mark_results_stale()
+
+    def _can_edit_input_tables(self, kind):
+        if self._analysis_busy:
+            return False
+        if kind == "true_points" and self.analysis_setup.should_preserve_saved_case:
+            return False
+        project = self.current_project_document
+        if project is not None:
+            try:
+                return PathBeamEditor.capability(project).legacy_solver_compatible
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _validate_table_rows(self, kind, rows):
+        if not self._can_edit_input_tables(kind):
+            raise InputValidationError(
+                "当前表格不可编辑；空间/曲线模型请使用交互建模器，计算中请稍候。",
+                field=f"/{kind}",
+            )
+        ids = [row.get("_entity_id") for row in rows if row.get("_entity_id")]
+        if len(ids) != len(set(ids)):
+            raise InputValidationError("表格包含重复对象 ID，不能覆盖不同实体。", field=f"/{kind}")
+        # Reuse the input contract, not solver readiness. A user must be able
+        # to delete the last observation/constraint or repair this table even
+        # while a different table or an algorithm parameter is incomplete.
+        build_config_from_form_data(
+            node_x_text=self.node_x_edit.text(),
+            thickness_text=self.thickness_edit.text(),
+            gauss_n_text="3", points_per_element_text="120", query_xs_text="",
+            measurement_rows=rows if kind == "measurements" else [],
+            boundary_rows=rows if kind == "boundary_conditions" else [],
+            true_point_rows=rows if kind == "true_points" else [],
+            plot_options={}, elastic_modulus_gpa_text="", require_measurements=False,
+        )
+
+    def _remember_table_entities(self, project, *, reset=False):
+        if reset:
+            self.table_undo_stack.clear()
+            self._table_sensor_templates.clear()
+            self._table_boundary_templates.clear()
+        self._table_sensor_templates.update({sensor.identifier: sensor for sensor in project.sensors})
+        self._table_boundary_templates.update({item.identifier: item for item in project.boundary_conditions})
+
+    def _refresh_table_editability(self):
+        for name in ("measurement_editor", "boundary_editor", "true_point_editor"):
+            editor = getattr(self, name, None)
+            if editor is not None:
+                editor.refresh_actions()
 
     def _on_measurements_changed(self):
         self.refresh_measurement_preview()
@@ -4232,6 +3885,7 @@ class ReconstructionMainWindow(QMainWindow):
         for widget in (self.query_xs_edit, self.true_point_editor):
             widget.setEnabled(not blocked)
             widget.setToolTip(message if blocked else "")
+        self._refresh_table_editability()
 
     def _on_plot_settings_changed(self, *_args):
         if self._loading_form:
@@ -4663,6 +4317,7 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _set_analysis_busy(self, busy):
         self._analysis_busy = bool(busy)
+        self._refresh_table_editability()
         self.run_button.setText("计算中…" if busy else "运行重构")
         self.run_button.setAccessibleName(self.run_button.text())
         self.run_button.setEnabled(False if busy else not self._readiness_issues)
@@ -5155,6 +4810,7 @@ class ReconstructionMainWindow(QMainWindow):
             destination = save_project(path, project)
             self.current_project_document = project
             self.current_project_path = destination
+            self._remember_table_entities(project)
             self._sync_editor_entity_ids(project)
             self._set_project_dirty(False)
             self._write_message(f"项目已保存：\n{destination}")
@@ -5349,7 +5005,7 @@ class ReconstructionMainWindow(QMainWindow):
             for rows in sensor_rows_by_element
             for row in rows
         ]
-        old_sensor_by_id = {sensor.identifier: sensor for sensor in old_sensors}
+        old_sensor_by_id = {**self._table_sensor_templates, **{sensor.identifier: sensor for sensor in old_sensors}}
         used_sensor_ids = set()
         sensors = []
         for index, generated_sensor in enumerate(generated_sensors):
@@ -5369,7 +5025,11 @@ class ReconstructionMainWindow(QMainWindow):
             ):
                 old_sensor = old_sensors[index]
             if old_sensor is None:
-                sensors.append(replace(generated_sensor, attachment=attachment))
+                sensors.append(replace(
+                    generated_sensor,
+                    identifier=requested_id or generated_sensor.identifier,
+                    attachment=attachment,
+                ))
             else:
                 used_sensor_ids.add(old_sensor.identifier)
                 sensors.append(
@@ -5386,9 +5046,9 @@ class ReconstructionMainWindow(QMainWindow):
             (boundary.node_id, boundary.dof): boundary
             for boundary in current.boundary_conditions
         }
-        old_boundary_by_id = {
+        old_boundary_by_id = {**self._table_boundary_templates, **{
             boundary.identifier: boundary for boundary in current.boundary_conditions
-        }
+        }}
         boundary_row_ids = [
             str(row.get("_entity_id", ""))
             for row in self.boundary_editor.get_rows()
@@ -5406,7 +5066,7 @@ class ReconstructionMainWindow(QMainWindow):
                 else ""
             )
             old_boundary = old_boundary_by_id.get(requested_id)
-            if old_boundary is None:
+            if old_boundary is None and not requested_id:
                 old_boundary = old_boundaries.get((node_id, generated_boundary.dof))
             boundaries.append(
                 replace(
@@ -5414,7 +5074,7 @@ class ReconstructionMainWindow(QMainWindow):
                     identifier=(
                         old_boundary.identifier
                         if old_boundary is not None
-                        else generated_boundary.identifier
+                        else requested_id or generated_boundary.identifier
                     ),
                     node_id=node_id,
                 )
@@ -5449,12 +5109,40 @@ class ReconstructionMainWindow(QMainWindow):
                 not self.analysis_setup.should_preserve_saved_case
             ),
         )
-        if self._model_config_projection(existing_config) == self._model_config_projection(config):
+        if (
+            self._model_config_projection(existing_config) == self._model_config_projection(config)
+            and self._table_identities_match(current)
+        ):
             project = current
         else:
             project = self._merge_legacy_form_into_project(current, config)
         project = self._apply_analysis_setup_to_project(project, config=config)
         return self._apply_view_state_to_project(project, config["plot_options"])
+
+    def _table_identities_match(self, project):
+        """Equal numbers do not imply equal entities after delete + recreate."""
+        nodes = sorted(project.nodes, key=lambda node: node.coordinates[0])
+        element_by_pair = {frozenset(element.node_ids): element for element in project.elements}
+        elements = [
+            element_by_pair[frozenset((left.identifier, right.identifier))]
+            for left, right in zip(nodes, nodes[1:])
+        ]
+        rows = self.measurement_editor.get_rows()
+        if rows and all(row.get("_entity_id") for row in rows):
+            actual = [row["_entity_id"] for row in sorted(rows, key=lambda row: int(row["element"]))]
+            expected = [sensor.identifier for element in elements for sensor in project.sensors if sensor.attachment.entity_id == element.identifier]
+            if actual != expected:
+                return False
+        node_index = {node.identifier: index for index, node in enumerate(nodes)}
+        expected_boundaries = {
+            (node_index[boundary.node_id], boundary.dof): boundary.identifier
+            for boundary in project.boundary_conditions
+        }
+        for row in self.boundary_editor.get_rows():
+            key = (int(row["node"]), row["dof"].strip().lower())
+            if row.get("_entity_id") and row["_entity_id"] != expected_boundaries.get(key):
+                return False
+        return True
 
     def _apply_project_document(self, project, *, dirty, status_text):
         capability = PathBeamEditor.capability(project)
@@ -5477,6 +5165,7 @@ class ReconstructionMainWindow(QMainWindow):
             raise
 
         self.current_project_document = project
+        self._remember_table_entities(project, reset=True)
         self._sync_analysis_parameter_controls()
         self.current_model = None
         self.current_config = None
@@ -5662,6 +5351,7 @@ class ReconstructionMainWindow(QMainWindow):
             if dialog_path is not None:
                 self.current_project_path = Path(dialog_path)
             self.current_project_document = project
+            self._remember_table_entities(project, reset=True)
             self.analysis_setup.set_project(project)
             self._sync_analysis_parameter_controls()
             self._set_project_dirty(
@@ -5692,6 +5382,18 @@ class ReconstructionMainWindow(QMainWindow):
                 self._update_project_summary(project)
                 self.run_button.setEnabled(False)
                 self._set_run_status("模型已保存 · 算法待接入", "stale")
+                self._loading_form = True
+                try:
+                    self.node_x_edit.clear()
+                    self.thickness_edit.clear()
+                    self.elastic_modulus_edit.clear()
+                    self.measurement_editor.set_rows([])
+                    self.boundary_editor.set_rows([])
+                    self.true_point_editor.set_rows([])
+                finally:
+                    self._loading_form = False
+                self.refresh_measurement_preview()
+                self.json_text.clear()
                 detail = f"{capability.reason}，当前求解按钮已停用。"
             self._write_message(
                 f"交互模型已保存：{capability.kind}，弧长 {capability.total_length:.6g} m，"
@@ -5826,7 +5528,7 @@ class ReconstructionMainWindow(QMainWindow):
         }
         self.boundary_editor.set_row_entity_ids(
             [
-                boundary_ids[(int(row["node"]), row["dof"])]
+                boundary_ids[(int(row["node"]), row["dof"].strip().lower())]
                 for row in self.boundary_editor.get_rows()
             ]
         )
@@ -6039,6 +5741,9 @@ class ReconstructionMainWindow(QMainWindow):
             self._render_3d_view(thickness_scale)
 
     def _toggle_focus_mode(self, enabled):
+        controller = getattr(self, "layout_preferences", None)
+        if controller is not None:
+            controller.capture()
         self.left_panel.setVisible(not enabled)
         self.result_group.setVisible(not enabled and self.result_toggle.isChecked())
         self.focus_mode_button.setText("退出专注" if enabled else "专注")
@@ -6047,6 +5752,8 @@ class ReconstructionMainWindow(QMainWindow):
             if enabled
             else "隐藏输入区和结果表格，仅保留可视化视口；再次点击恢复"
         )
+        if controller is not None and not enabled:
+            controller.restore_ratios()
 
     def _switch_scale_mode(self, mode):
         if mode not in self.scale_buttons:
@@ -6579,7 +6286,8 @@ class ReconstructionMainWindow(QMainWindow):
             update_stylesheet=persist,
         )
         self.setStyleSheet(
-            compose_stylesheet(APP_STYLESHEET + STUDIO_THEME, self.current_theme_id)
+            compose_stylesheet(APP_STYLESHEET + STUDIO_THEME, self.current_theme_id,
+                               preferences=self.reading_preferences)
         )
         self._update_theme_shadow()
         if hasattr(self, "workspace_rail"):
@@ -6616,6 +6324,7 @@ class ReconstructionMainWindow(QMainWindow):
         if not self._confirm_save_before_action():
             event.ignore()
             return
+        self.layout_preferences.save()
         self.shutdown()
         event.accept()
 
@@ -6623,6 +6332,7 @@ class ReconstructionMainWindow(QMainWindow):
         if self._is_shut_down:
             return
         self._is_shut_down = True
+        self.layout_preferences.stop()
         for dialog in self.findChildren(BeamModelerDialog):
             dialog.shutdown()
         if hasattr(self, "structure_3d_view"):
