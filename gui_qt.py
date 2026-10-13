@@ -10,7 +10,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
-from PySide6.QtCore import QTimer, Qt, Signal, QSize
+from matplotlib.ticker import MaxNLocator
+from PySide6.QtCore import QTimer, Qt, Signal, QSize, QSignalBlocker
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut, QUndoStack
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -73,6 +74,7 @@ from ifem.modeling.path_editor import PathBeamEditor
 from ifem.ui.modeler import BeamModelerDialog
 from ifem.ui.editable_table import EditableTable
 from ifem.ui.workspace_preferences import WorkspacePreferencesStore
+from ifem.ui.result_probe import ResultProbeBar, ResultLinkController
 from ifem.ui.workspace_view import (
     ReadingPreferencesDialog, WorkspaceLayoutController, apply_reading_metrics,
 )
@@ -1241,16 +1243,19 @@ class ReadOnlyTable(QWidget):
         return True
 
     def set_rows(self, rows):
-        self.table.setRowCount(0)
-        for payload in rows:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            for col, column in enumerate(self.columns):
-                item = QTableWidgetItem(str(payload.get(column, "")))
-                alignment = Qt.AlignmentFlag.AlignLeft if column == "标签" else Qt.AlignmentFlag.AlignRight
-                item.setTextAlignment(alignment | Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(row, col, item)
-            self.table.setRowHeight(row, 30)
+        # Filling data is not user selection, and must not emit transient rows.
+        with QSignalBlocker(self.table):
+            self.table.setRowCount(0)
+            for payload in rows:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                for col, column in enumerate(self.columns):
+                    item = QTableWidgetItem(str(payload.get(column, "")))
+                    item.setData(Qt.ItemDataRole.UserRole, payload.get("_result_index", row))
+                    alignment = Qt.AlignmentFlag.AlignLeft if column == "标签" else Qt.AlignmentFlag.AlignRight
+                    item.setTextAlignment(alignment | Qt.AlignmentFlag.AlignVCenter)
+                    self.table.setItem(row, col, item)
+                self.table.setRowHeight(row, self.table.verticalHeader().defaultSectionSize())
 
 
 class AnalysisEmptyState(QFrame):
@@ -2738,6 +2743,7 @@ class ReconstructionMainWindow(QMainWindow):
         self.current_recovered_field = None
         self.current_visual_model = None
         self.current_result_frame = None
+        self.current_analysis_result = None
         self.current_project_document = None
         self.current_project_path = None
         self.project_dirty = False
@@ -2757,8 +2763,10 @@ class ReconstructionMainWindow(QMainWindow):
         self._table_boundary_templates = {}
 
         self._build_ui()
+        self.result_link = ResultLinkController(self)
         self.load_sample_data(initial=True)
         apply_reading_metrics(self, self.reading_preferences)
+        self._update_result_minimum_height()
         self.layout_preferences = WorkspaceLayoutController(
             self, self.preferences_store, "workbench",
             {"main": self.main_split, "input": self.left_split, "result": self.right_split},
@@ -3243,6 +3251,8 @@ class ReconstructionMainWindow(QMainWindow):
         self.plot_content_stack.addWidget(self.analysis_empty_state)
         self.plot_content_stack.addWidget(self.visualization_stack)
         plot_group_layout.addWidget(self.plot_content_stack, 1)
+        self.probe_bar = ResultProbeBar()
+        plot_group_layout.addWidget(self.probe_bar)
 
         result_group = QGroupBox("结果数据")
         self.result_group = result_group
@@ -3262,12 +3272,12 @@ class ReconstructionMainWindow(QMainWindow):
 
         self.node_result_table = ReadOnlyTable(
             columns=["节点", "x坐标", "u位移", "v位移", "转角phi"],
-            headings=["节点", "x坐标", "u位移", "v位移", "转角phi"],
+            headings=["节点", "x坐标 m", "u位移 m", "v位移 m", "转角φ rad"],
             accessible_name="节点重构结果表",
         )
         self.query_result_table = ReadOnlyTable(
             columns=["序号", "x", "u", "v"],
-            headings=["序号", "x坐标", "u位移", "v位移"],
+            headings=["序号", "x坐标 m", "u位移 m", "v位移 m"],
             accessible_name="查询点位移结果表",
         )
         self.compare_result_table = ReadOnlyTable(
@@ -3277,8 +3287,8 @@ class ReconstructionMainWindow(QMainWindow):
             accessible_name="实测与重构对比表",
         )
         self.field_result_table = ReadOnlyTable(
-            columns=["序号", "x", "上表面应变", "下表面应变", "上表面应力", "下表面应力"],
-            headings=["序号", "x坐标", "上表面应变 με", "下表面应变 με", "上表面应力 MPa", "下表面应力 MPa"],
+            columns=["序号", "单元", "x", "上表面应变", "下表面应变", "上表面应力", "下表面应力"],
+            headings=["序号", "单元", "x坐标 m", "上表面应变 με", "下表面应变 με", "上表面应力 MPa", "下表面应力 MPa"],
             stretch_columns=False,
             accessible_name="截面应变应力场结果表",
         )
@@ -3376,6 +3386,7 @@ class ReconstructionMainWindow(QMainWindow):
             APP_STYLESHEET + STUDIO_THEME, self.current_theme_id, preferences=preferences,
         ))
         apply_reading_metrics(self, preferences)
+        self._update_result_minimum_height()
         for dialog in self.findChildren(BeamModelerDialog):
             dialog.set_reading_preferences(preferences)
         self.layout_preferences.restore_later()
@@ -4343,10 +4354,14 @@ class ReconstructionMainWindow(QMainWindow):
                 "输入已修改；当前仍显示上一次结果，请重新运行。",
                 6000,
             )
+        if hasattr(self, "result_link"):
+            self.result_link.refresh()
 
     def _capture_analysis_result_state(self):
         return {
             "current_model": self.current_model,
+            "current_analysis_result": self.current_analysis_result,
+            "probe_selection": self.result_link.selected,
             "current_config": self.current_config,
             "current_inputs": self.current_inputs,
             "current_field": self.current_field,
@@ -4368,10 +4383,14 @@ class ReconstructionMainWindow(QMainWindow):
     def _restore_analysis_result_state(self, snapshot):
         previous_model = snapshot["current_model"]
         if previous_model is None:
+            self.current_model = None
+            self.current_config = snapshot["current_config"]
+            self.result_sequence = snapshot["result_sequence"]
             self._clear_result_views()
         else:
             for key in (
                 "current_model",
+                "current_analysis_result",
                 "current_config",
                 "current_inputs",
                 "current_field",
@@ -4391,6 +4410,9 @@ class ReconstructionMainWindow(QMainWindow):
             )
             self.result_tabs.setCurrentIndex(snapshot["result_tab_index"])
             self._set_result_freshness(True)
+            selected = snapshot["probe_selection"]
+            if selected is not None:
+                self.result_link.select(selected.kind, selected.index, force=True)
         self.json_text.setPlainText(snapshot["json_text"])
         for key, text in snapshot["metrics"].items():
             self.analysis_metric_labels[key].setText(text)
@@ -4529,12 +4551,15 @@ class ReconstructionMainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _clear_result_views(self):
+        self.current_analysis_result = None
         self.current_inputs = None
         self.current_field = None
         self.current_raw_field = None
         self.current_recovered_field = None
         self.current_visual_model = None
         self.current_result_frame = None
+        if hasattr(self, "result_link"):
+            self.result_link.clear()
         self._set_result_freshness(False)
         self.current_view = "stress"
         if hasattr(self, "view_buttons"):
@@ -5583,18 +5608,29 @@ class ReconstructionMainWindow(QMainWindow):
         QApplication.processEvents()
         try:
             config = self._build_form_config()
+            # The project snapshot supplies stable entities; analysis-only
+            # inputs still come from the current form, never default silently.
+            parameters = {
+                name: config[name]
+                for name in ("query_xs", "true_points", "gauss_n", "points_per_element")
+                if name in config
+            }
+            parameters.update(self.analysis_setup.parameter_values())
             result = self.analysis_service.run(
                 config,
                 algorithm_id=self.analysis_setup.active_algorithm_id,
-                parameters=self.analysis_setup.parameter_values(),
+                parameters=parameters,
+                project=self._project_for_save(),
             )
             model = result.native_model
             inputs = dict(result.inputs)
             self.current_model = model
+            self.current_analysis_result = result
             self.current_config = config
             self.json_text.setPlainText(config_to_json(config))
             self._render_plot(model, inputs)
             self._fill_result_tables(model, inputs)
+            self.result_link.update()
             self._update_analysis_summary(config=config, model=model)
             self._set_result_freshness(False)
             result_tab_index = 0 if self.current_view == "shape" else self.field_result_tab_index
@@ -5810,6 +5846,8 @@ class ReconstructionMainWindow(QMainWindow):
         else:
             self._render_field_view("stress", thickness_scale)
         self._render_3d_view(thickness_scale)
+        if hasattr(self, "result_link"):
+            self.result_link.update()
 
     def _render_3d_view(self, thickness_scale):
         if (
@@ -6125,7 +6163,19 @@ class ReconstructionMainWindow(QMainWindow):
             else:
                 self._set_view_meta("节点平均连续化（后处理） · 原始场可在左侧切换")
 
-        self.figure.tight_layout(pad=1.0)
+        if self.canvas.height() < 220:
+            # The surrounding context bar already names this field. Reclaim
+            # its duplicate title in short split views, not the numeric axes.
+            self.axes.set_title("")
+            self.axes.set_xlabel("变形后 x / m", fontsize=8, labelpad=2)
+            self.axes.set_ylabel("y / m", fontsize=8, labelpad=2)
+            self.axes.tick_params(labelsize=8, pad=2)
+            self.axes.yaxis.set_major_locator(MaxNLocator(nbins=3))
+            self._field_colorbar.locator = MaxNLocator(nbins=3)
+            self._field_colorbar.update_ticks()
+            self.figure.tight_layout(pad=0.5)
+        else:
+            self.figure.tight_layout(pad=1.0)
         self.canvas.draw_idle()
 
     def _render_stress_unavailable(self):
@@ -6192,6 +6242,18 @@ class ReconstructionMainWindow(QMainWindow):
             columnspacing=1.3,
         )
 
+    def _update_result_minimum_height(self):
+        """Reserve a complete result row even at the largest reading scale."""
+        table = self.field_result_table.table
+        minimum = (
+            20 + 6 + 8 + 6  # group, table layout and frame margins
+            + self.result_tabs.tabBar().sizeHint().height()
+            + table.horizontalHeader().sizeHint().height()
+            + table.verticalHeader().defaultSectionSize()
+            + table.horizontalScrollBar().sizeHint().height()
+        )
+        self.result_group.setMinimumHeight(max(145, minimum))
+
     def _fill_result_tables(self, model, inputs):
         node_rows = []
         for row in model.nodal_results_table():
@@ -6249,15 +6311,17 @@ class ReconstructionMainWindow(QMainWindow):
 
         self._fill_field_result_table()
 
-    def _fill_field_result_table(self):
+    def _fill_field_result_table(self, *, include_sample=None):
         field_rows = []
         if self.current_field is not None:
-            for row in section_field_rows(self.current_field):
+            for row in section_field_rows(self.current_field, include_index=include_sample):
                 stress_top = row["stress_top"]
                 stress_bottom = row["stress_bottom"]
                 field_rows.append(
                     {
-                        "序号": row["sequence"],
+                        "序号": row["sample_index"] + 1,
+                        "_result_index": row["sample_index"],
+                        "单元": row["element_index"],
                         "x": f"{row['x']:.6f}",
                         "上表面应变": f"{row['strain_top'] * 1.0e6:.6e}",
                         "下表面应变": f"{row['strain_bottom'] * 1.0e6:.6e}",
@@ -6274,6 +6338,10 @@ class ReconstructionMainWindow(QMainWindow):
             else:
                 tab_text = f"截面场 · 连续化 · {len(field_rows)}"
             self.result_tabs.setTabText(self.field_result_tab_index, tab_text)
+            self.field_result_table.table.setToolTip(
+                "截面表最多展示 240 条均匀抽样记录；拾取未列出的采样点会补入准确数据行。\n"
+                "序号为当前场的采样编号，同坐标处的原始单元左右值保持独立。"
+            )
 
     def _write_message(self, message):
         self.message_text.setPlainText(message)
@@ -6332,6 +6400,7 @@ class ReconstructionMainWindow(QMainWindow):
         if self._is_shut_down:
             return
         self._is_shut_down = True
+        self.result_link.shutdown()
         self.layout_preferences.stop()
         for dialog in self.findChildren(BeamModelerDialog):
             dialog.shutdown()

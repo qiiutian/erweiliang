@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ifem.visualization.result_link import visible_sample_indices
+
 
 @dataclass(frozen=True)
 class BeamSectionField:
@@ -284,18 +286,19 @@ def resolve_thickness_scale(field, setting="auto"):
     return scale
 
 
-def section_field_rows(field, max_rows=240):
+def section_field_rows(field, max_rows=240, *, include_index=None):
     point_count = len(field.x_reference)
     if point_count == 0:
         return []
 
-    row_count = min(int(max_rows), point_count)
-    indices = np.unique(np.linspace(0, point_count - 1, row_count, dtype=int))
+    indices = visible_sample_indices(point_count, max_rows=max_rows, include_index=include_index)
     rows = []
     for sequence, index in enumerate(indices, start=1):
         rows.append(
             {
                 "sequence": sequence,
+                "sample_index": int(index),
+                "element_index": int(field.element_index[index]),
                 "x": float(field.x_reference[index]),
                 "strain_top": float(field.top_strain[index]),
                 "strain_bottom": float(field.bottom_strain[index]),

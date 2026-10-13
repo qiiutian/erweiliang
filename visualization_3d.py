@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -23,6 +23,7 @@ from ifem.ui.vtk_lifecycle import (
     shutdown_interactor,
 )
 from ifem.ui.theme import current_theme_id, resolve_theme
+from ifem.ui.studio import ElidingLabel
 
 
 os.environ["QT_API"] = "pyside6"
@@ -48,6 +49,10 @@ except Exception as exc:  # pragma: no cover - depends on optional native packag
 class Structure3DView(QWidget):
     backend_available = PYVISTA_AVAILABLE
     view_changed = Signal(str)
+    result_picked = Signal(str, int)
+
+    _SAMPLE_ID = "ifem_result_sample_index"
+    _NODE_ID = "ifem_result_node_index"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -58,7 +63,13 @@ class Structure3DView(QWidget):
         self.thickness_scale = 1.0
         self._surface_meshes = []
         self._surface_actors = []
+        self._surface_blocks = []
         self._node_mesh = None
+        self._node_actor = None
+        self._result_selection = None
+        self._probe_position = None
+        self._selection_actor_names = []
+        self._pick_press_position = None
         self._render_key = None
         self._camera_initialized = False
         self._is_shut_down = False
@@ -80,13 +91,18 @@ class Structure3DView(QWidget):
         title.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         toolbar_layout.addWidget(title)
 
-        self.interaction_hint = QLabel("仅显示结构与结果场 · 测点布置请在建模视图查看")
+        self.interaction_hint = ElidingLabel("Ctrl+单击选取 · 测点布置请在建模视图查看")
         self.interaction_hint.setObjectName("viewportHint")
+        self.interaction_hint.setToolTip(
+            "Ctrl+左键单击选取当前结果的节点或截面采样；普通左键拖拽旋转。\n"
+            "仅显示结构与结果场；测点布置请在建模视图查看。"
+        )
+        self.interaction_hint.setMinimumWidth(0)
         self.interaction_hint.setSizePolicy(
-            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Preferred,
         )
-        toolbar_layout.addWidget(self.interaction_hint)
+        toolbar_layout.addWidget(self.interaction_hint, 1)
 
         option_group = QFrame()
         option_group.setObjectName("viewportOptions")
@@ -152,8 +168,9 @@ class Structure3DView(QWidget):
         # queues threaded renders which can outlive the native Qt window.
         self.plotter = QtInteractor(self, auto_update=False)
         self.plotter.interactor.setToolTip(
-            "左键拖拽旋转 · 滚轮缩放 · 右键拖拽平移 · 工具栏切换标准视角"
+            "左键拖拽旋转 · 滚轮缩放 · 右键拖拽平移 · Ctrl+左键单击选取结果"
         )
+        self.plotter.interactor.installEventFilter(self)
         self.plotter.set_background(
             self._color("viewport_end"),
             top=self._color("viewport_start"),
@@ -173,7 +190,13 @@ class Structure3DView(QWidget):
         self.frame = None
         self._surface_meshes = []
         self._surface_actors = []
+        self._surface_blocks = []
         self._node_mesh = None
+        self._node_actor = None
+        self._result_selection = None
+        self._probe_position = None
+        self._selection_actor_names = []
+        self._pick_press_position = None
         self._render_key = None
         self._camera_initialized = False
         self.status_label.setText("等待结构结果")
@@ -183,6 +206,11 @@ class Structure3DView(QWidget):
             render_interactor_now(self.plotter)
 
     def set_frame(self, model_data, frame, *, mode="shape", thickness_scale=1.0):
+        if self._is_shut_down:
+            return
+        if self.frame is None or self.frame.sequence != frame.sequence:
+            self._result_selection = None
+            self._probe_position = None
         self.model_data = model_data
         self.frame = frame
         self.mode = mode
@@ -190,6 +218,125 @@ class Structure3DView(QWidget):
         if not self._can_render():
             return
         self._render_scene()
+
+    def set_result_selection(self, kind=None, index=None):
+        """Highlight an exact result identity; never infer identities from coordinates."""
+        if self._is_shut_down:
+            return
+        self._probe_position = None
+        self._result_selection = None
+        if self.frame is not None and kind in {"node", "sample"}:
+            count = (
+                len(self.frame.deformed_nodes)
+                if kind == "node"
+                else len(self.frame.section.x_reference)
+            )
+            if isinstance(index, (int, np.integer)) and not isinstance(index, (bool, np.bool_)):
+                if 0 <= index < count:
+                    self._result_selection = (kind, int(index))
+        self._refresh_result_highlight()
+
+    def set_probe_position(self, position=None):
+        """Show an interpolated/query point without pretending it is a mesh sample."""
+        if self._is_shut_down:
+            return
+        self._result_selection = None
+        self._probe_position = None
+        if self.frame is not None and position is not None:
+            try:
+                point = np.asarray(position, dtype=float)
+                if point.shape == (3,) and np.all(np.isfinite(point)):
+                    self._probe_position = tuple(float(value) for value in point)
+            except (TypeError, ValueError):
+                pass
+        self._refresh_result_highlight()
+
+    def eventFilter(self, watched, event):
+        """Keep VTK's ordinary navigation; consume only an explicit pick gesture."""
+        if hasattr(self, "plotter") and watched is self.plotter.interactor:
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseButtonPress:
+                if (
+                    event.button() == Qt.MouseButton.LeftButton
+                    and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                    and self._can_render()
+                    and self.frame is not None
+                ):
+                    self._pick_press_position = event.position()
+                    return True
+            elif event_type == QEvent.Type.MouseMove and self._pick_press_position is not None:
+                return True
+            elif event_type == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton and self._pick_press_position is not None:
+                    origin = self._pick_press_position
+                    self._pick_press_position = None
+                    if (event.position() - origin).manhattanLength() <= 4:
+                        self._pick_at_position(event.position())
+                    return True
+            elif event_type in {QEvent.Type.Hide, QEvent.Type.FocusOut}:
+                self._pick_press_position = None
+        return super().eventFilter(watched, event)
+
+    def _pick_at_position(self, position):
+        if not self._can_render() or self.frame is None:
+            return
+        # Match the bundled QVTKRenderWindowInteractor's physical-pixel mapping.
+        widget = self.plotter.interactor
+        scale = widget._getPixelRatio()
+        x = int(round(position.x() * scale))
+        y = int(round((widget.height() - position.y() - 1) * scale))
+        from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkPointPicker
+
+        if self._node_actor is not None:
+            picker = vtkPointPicker()
+            picker.SetTolerance(0.006)
+            picker.PickFromListOn()
+            picker.AddPickList(self._node_actor)
+            if picker.Pick(x, y, 0, self.plotter.renderer):
+                if self._accept_result_pick(picker):
+                    return
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.006)
+        picker.PickFromListOn()
+        for actor in self._surface_actors:
+            picker.AddPickList(actor)
+        if picker.Pick(x, y, 0, self.plotter.renderer):
+            self._accept_result_pick(picker)
+
+    def _accept_result_pick(self, picker):
+        if not self._can_render() or self.frame is None:
+            return False
+        actor = picker.GetActor()
+        if actor is None:
+            return False
+        if actor is self._node_actor or actor == self._node_actor:
+            kind, key = "node", self._NODE_ID
+        elif any(actor is item or actor == item for item in self._surface_actors):
+            kind, key = "sample", self._SAMPLE_ID
+        else:
+            return False
+        data = picker.GetDataSet()
+        if data is None:
+            return False
+        data = pv.wrap(data)
+        if key not in data.point_data:
+            return False
+        point_id = int(picker.GetPointId())
+        if not 0 <= point_id < data.n_points:
+            cell_id = int(picker.GetCellId()) if hasattr(picker, "GetCellId") else -1
+            if not 0 <= cell_id < data.n_cells:
+                return False
+            candidates = np.asarray(data.get_cell(cell_id).point_ids, dtype=int)
+            if not len(candidates):
+                return False
+            picked = np.asarray(picker.GetPickPosition(), dtype=float)
+            point_id = int(candidates[np.argmin(np.linalg.norm(data.points[candidates] - picked, axis=1))])
+        index = int(data.point_data[key][point_id])
+        self.set_result_selection(kind, index)
+        if self._result_selection != (kind, index):
+            return False
+        self.result_picked.emit(kind, index)
+        return True
 
     def _rebuild_scene(self, *_args):
         self._render_key = None
@@ -252,15 +399,74 @@ class Structure3DView(QWidget):
         grid.set_active_scalars(field_name)
         return grid
 
+    def _block_sample_indices(self, block):
+        # SurfaceBlock's first axis is the original section sample axis for both
+        # swept real profiles and the rectangular volume grid.  Do not collapse
+        # coincident raw element boundaries: their field values can differ.
+        if block.element_index is None:
+            indices = np.arange(len(self.frame.section.x_reference), dtype=int)
+        else:
+            indices = np.flatnonzero(self.frame.section.element_index == block.element_index)
+        if len(indices) != block.points.shape[0]:
+            raise ValueError("结果曲面采样索引与网格点不一致。")
+        return indices
+
+    def _refresh_result_highlight(self, *, render=True):
+        if not self._can_render():
+            return
+        for name in self._selection_actor_names:
+            self.plotter.remove_actor(name, render=False, reset_camera=False)
+        self._selection_actor_names = []
+        point = self._probe_position
+        if self.frame is not None and self._result_selection is not None:
+            kind, index = self._result_selection
+            if kind == "node" and index < len(self.frame.deformed_nodes):
+                point = self.frame.deformed_nodes[index]
+            elif kind == "sample" and index < len(self.frame.section.x_reference):
+                point = self.frame.section.centerline_deformed[index]
+                for block_index, block in enumerate(self._surface_blocks):
+                    matches = np.flatnonzero(self._block_sample_indices(block) == index)
+                    if not len(matches):
+                        continue
+                    station = block.points[int(matches[0])]
+                    if station.ndim == 3:
+                        # Perimeter of a (through-thickness, width, xyz) station.
+                        station = np.concatenate((
+                            station[:, 0], station[-1, 1:],
+                            station[-2::-1, -1], station[0, -2::-1],
+                        ))
+                        station = np.vstack((station, station[0]))
+                    line = pv.PolyData(station)
+                    line.lines = np.hstack(([len(station)], np.arange(len(station))))
+                    name = f"result-selection-station-{block_index}"
+                    self.plotter.add_mesh(
+                        line, color=self._color("viewport_text"), line_width=3.5,
+                        name=name, pickable=False, render=False, reset_camera=False,
+                    )
+                    self._selection_actor_names.append(name)
+        if point is not None:
+            name = "result-selection-point"
+            self.plotter.add_mesh(
+                pv.PolyData(np.asarray(point, dtype=float).reshape(1, 3)),
+                color=self._color("viewport_text"), point_size=16,
+                render_points_as_spheres=True, name=name, pickable=False,
+                render=False, reset_camera=False,
+            )
+            self._selection_actor_names.append(name)
+        if render:
+            render_interactor_now(self.plotter)
+
     def _render_scene(self):
         if not self._can_render():
             return
         blocks = build_surface_blocks(self.model_data, self.frame, self.thickness_scale)
+        self._surface_blocks = blocks
         field_values, field_name, cmap, symmetric = self._field_definition(blocks[0])
         render_key = (
             self.mode,
             self.frame.section.representation,
-            tuple(block.points.shape for block in blocks),
+            tuple((block.element_index, block.points.shape) for block in blocks),
+            len(self.frame.deformed_nodes),
             self.show_original_check.isChecked(),
         )
 
@@ -272,13 +478,15 @@ class Structure3DView(QWidget):
                 values, _name, _cmap, _symmetric = self._field_definition(block)
                 mesh.points = block.points.reshape(-1, 3, order="F")
                 mesh.point_data[field_name] = np.asarray(values).ravel(order="F")
+                self._attach_sample_indices(mesh, block)
             scalar_range = self._symmetric_range(blocks, self.mode)
             if scalar_range is not None:
                 for actor in self._surface_actors:
                     actor.mapper.scalar_range = scalar_range
             if self._node_mesh is not None:
                 self._node_mesh.points = self.frame.deformed_nodes
-            render_interactor_now(self.plotter)
+        self._refresh_result_highlight(render=False)
+        render_interactor_now(self.plotter)
 
         representation = (
             "原始单元场" if self.frame.section.representation == "raw" else "节点平均连续化"
@@ -303,11 +511,14 @@ class Structure3DView(QWidget):
         self._surface_meshes = []
         self._surface_actors = []
         self._node_mesh = None
+        self._node_actor = None
+        self._selection_actor_names = []
         scalar_range = self._symmetric_range(blocks, self.mode) if symmetric else None
 
         for block_index, block in enumerate(blocks):
             values, _field_name, _cmap, _symmetric = self._field_definition(block)
             mesh = self._structured_grid(block.points, field_name, values)
+            self._attach_sample_indices(mesh, block)
             actor = self.plotter.add_mesh(
                 mesh,
                 scalars=field_name,
@@ -346,13 +557,15 @@ class Structure3DView(QWidget):
                 opacity=0.75,
                 style="wireframe",
                 name="reference-centerline",
+                pickable=False,
                 render=False,
                 reset_camera=False,
             )
 
         deformed_nodes = pv.PolyData(self.frame.deformed_nodes)
+        deformed_nodes.point_data[self._NODE_ID] = np.arange(len(self.frame.deformed_nodes))
         self._node_mesh = deformed_nodes
-        self.plotter.add_mesh(
+        self._node_actor = self.plotter.add_mesh(
             deformed_nodes,
             color=self._color("viewport_text"),
             point_size=8,
@@ -369,7 +582,13 @@ class Structure3DView(QWidget):
             self.plotter.reset_camera(render=False)
             self.plotter.camera.zoom(1.3)
             self._camera_initialized = True
-        render_interactor_now(self.plotter)
+
+    def _attach_sample_indices(self, mesh, block):
+        indices = self._block_sample_indices(block)
+        sample_shape = (len(indices),) + (1,) * (block.points.ndim - 2)
+        mesh.point_data[self._SAMPLE_ID] = np.broadcast_to(
+            indices.reshape(sample_shape), block.points.shape[:-1]
+        ).ravel(order="F")
 
     def set_camera(self, camera):
         if not self._can_render() or self.frame is None:
@@ -389,7 +608,13 @@ class Structure3DView(QWidget):
         if self._is_shut_down:
             return
         self._is_shut_down = True
+        self._result_selection = None
+        self._probe_position = None
+        self._pick_press_position = None
+        self._selection_actor_names = []
+        self._surface_blocks = []
         if PYVISTA_AVAILABLE and hasattr(self, "plotter"):
+            self.plotter.interactor.removeEventFilter(self)
             shutdown_interactor(self.plotter)
 
     def closeEvent(self, event):
