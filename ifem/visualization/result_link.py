@@ -28,7 +28,7 @@ class ResultTarget:
     source_id: str = ""
 
     def __post_init__(self):
-        if self.kind not in {"node", "query", "compare", "sample"}:
+        if self.kind not in {"node", "query", "compare", "sample", "sensor"}:
             raise ValueError("未知结果联动目标类型。")
         if isinstance(self.index, bool) or not isinstance(self.index, Integral) or self.index < 0:
             raise ValueError("结果联动目标索引必须为非负整数。")

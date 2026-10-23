@@ -62,6 +62,7 @@ class ResultLinkController(QObject):
             "query": window.query_result_table,
             "compare": window.compare_result_table,
             "sample": window.field_result_table,
+            "sensor": window.sensor_result_table,
         }
         for kind, wrapper in self.tables.items():
             wrapper.table.currentCellChanged.connect(
@@ -103,6 +104,8 @@ class ResultLinkController(QObject):
             None if window.current_analysis_result is None else window.current_analysis_result.state,
             window.current_field, sequence,
         )
+        from ifem.visualization.sensor_residuals import sensor_residual_data
+        self.targets["sensor"] = sensor_residual_data(window.current_analysis_result, sequence)[1]
         self.sequence, self.representation = sequence, representation
         if new_snapshot or (changed_representation and previous and previous.kind == "sample"):
             self.selected = None
@@ -139,7 +142,7 @@ class ResultLinkController(QObject):
         self.refresh()
 
     def _table_selected(self, kind, row):
-        if self._syncing or self._stopped or row < 0:
+        if self._syncing or self._stopped or row < 0 or self.window._is_generic_result():
             return
         item = self.tables[kind].table.item(row, 0)
         if item is not None:
@@ -181,7 +184,9 @@ class ResultLinkController(QObject):
                     table.scrollToItem(table.item(row, 0))
                     break
             if reveal:
-                self.window.result_tabs.setCurrentWidget(wrapper)
+                self.window.result_tabs.setCurrentWidget(
+                    self.window.sensor_result_panel if target.kind == "sensor" else wrapper
+                )
         finally:
             self._syncing = False
 
@@ -265,7 +270,7 @@ class ResultLinkController(QObject):
             bar.title.setToolTip("")
             bar.detail.setText("单击结果图或选择数据行 · 三维视图 Ctrl+单击拾取" if self.targets else "运行重构后，可选择数据行或拾取结果模型。")
         else:
-            kind_name = {"node": "节点", "sample": "截面采样", "query": "查询点", "compare": "实测对比"}[target.kind]
+            kind_name = {"node": "节点", "sample": "截面采样", "query": "查询点", "compare": "实测对比", "sensor": "应变测点"}[target.kind]
             representation = {"raw": "原始单元场", "nodal_average": "节点平均连续化"}.get(target.representation, "")
             status = "已过期 · " if window.results_stale else ""
             suffix = f" · {representation}" if representation else ""
@@ -289,7 +294,34 @@ class ResultLinkController(QObject):
         elif target.kind in {"node", "sample"}:
             viewport.set_result_selection(target.kind, target.index)
         else:
-            viewport.set_probe_position(target.position)
+            viewport.set_probe_position(self._display_position(target))
+
+    def _display_position(self, target):
+        """Keep physical coordinates in the probe; apply exaggeration only to its marker."""
+        if target.kind != "sensor":
+            return target.position
+        from postprocessing import resolve_thickness_scale
+        window = self.window
+        model = window.current_model
+        x, y, _z = target.reference_position
+        element = min(model.n_elems - 1, max(0, int(np.searchsorted(model.node_x, x, side="right") - 1)))
+        state = window.current_analysis_result.state
+        if state is not None and target.element_id in state.element_ids:
+            connection = state.connectivity[state.element_ids.index(target.element_id)]
+            coordinates = dict(zip(state.node_ids, state.reference_coordinates))
+            start_x = min(coordinates[node][0] for node in connection)
+            element = int(np.argmin(np.abs(model.node_x[:-1] - start_x)))
+        length = model.node_x[element + 1] - model.node_x[element]
+        derivative = model.dshape_dx(x - model.node_x[element], length)
+        u = model.U[model.element_dofs(element)]
+        slope = sum(derivative[index] * u[index] for index in (1, 2, 4, 5))
+        axial_slope = derivative[0] * u[0] + derivative[3] * u[3]
+        angle = np.arctan2(slope, 1.0 + axial_slope)
+        scale = resolve_thickness_scale(window.current_field, window.current_inputs["plot_options"].get("thickness_scale", "auto"))
+        center_x = target.position[0] + y * slope
+        center_y = target.position[1] - y
+        return (float(center_x - y * scale * np.sin(angle)),
+                float(center_y + y * scale * np.cos(angle)), target.position[2])
 
     def _draw_marker(self):
         for artist in self._artists:
@@ -307,7 +339,8 @@ class ResultLinkController(QObject):
                 scale = resolve_thickness_scale(field, window.current_inputs["plot_options"].get("thickness_scale", "auto"))
                 gx, gy = field.display_grid(scale)
                 self._artists.append(Line2D(gx[[0, -1], target.index], gy[[0, -1], target.index], color=color, linewidth=1.6, linestyle="--", zorder=12))
-            self._artists.append(Line2D([target.position[0]], [target.position[1]], marker="o", markersize=9, markerfacecolor="none", markeredgecolor=color, markeredgewidth=2, linestyle="none", zorder=13))
+            marker_position = self._display_position(target)
+            self._artists.append(Line2D([marker_position[0]], [marker_position[1]], marker="o", markersize=9, markerfacecolor="none", markeredgecolor=color, markeredgewidth=2, linestyle="none", zorder=13))
             for artist in self._artists:
                 window.axes.add_artist(artist)
         window.canvas.draw_idle()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -38,7 +39,10 @@ class BeamSurfaceIntegralAlgorithm:
         model_dimensions=(1,),
         element_families=("beam2d_euler_bernoulli",),
         measurement_types=("surface_axial_strain",),
-        result_fields=("displacement", "rotation", "axial_strain", "axial_stress"),
+        result_fields=(
+            "displacement", "rotation", "axial_strain", "axial_stress",
+            "sensor_measured_strain", "sensor_reconstructed_strain", "sensor_strain_residual",
+        ),
         supports_transient=False,
         modeling_spaces=("2d",),
         geometry_kinds=("line",),
@@ -184,6 +188,12 @@ class BeamSurfaceIntegralAlgorithm:
         if context.project is not None:
             from ifem.infrastructure.legacy_project import legacy_config_from_project
 
+            for sensor in context.project.sensors:
+                if sensor.measured_value is None:
+                    raise InputValidationError(
+                        f"测点 {sensor.label} 缺少实测应变；请填写数值，零应变需明确填写 0。",
+                        field=f"/sensors/{sensor.identifier}/measured_value",
+                    )
             config = legacy_config_from_project(
                 context.project,
                 include_analysis_parameters=False,
@@ -198,11 +208,12 @@ class BeamSurfaceIntegralAlgorithm:
         return config
 
     @staticmethod
-    def _result_state(context: AnalysisContext, model) -> ReconstructionState:
+    def _result_state(context: AnalysisContext, model, *, snapshot_id=None) -> ReconstructionState:
         project = context.project
         if project is None:
-            node_ids = tuple(f"node-{index}" for index in range(model.n_nodes))
-            element_ids = tuple(f"element-{index}" for index in range(model.n_elems))
+            snapshot_id = snapshot_id or f"beam-snapshot:{uuid4().hex}"
+            node_ids = tuple(f"{snapshot_id}:node:{index}" for index in range(model.n_nodes))
+            element_ids = tuple(f"{snapshot_id}:element:{index}" for index in range(model.n_elems))
             connectivity = tuple(
                 (node_ids[index], node_ids[index + 1])
                 for index in range(model.n_elems)
@@ -259,6 +270,7 @@ class BeamSurfaceIntegralAlgorithm:
     ) -> AnalysisResult:
         # The adapter delegates to the existing solver without changing its formulas.
         from config_adapter import build_model_inputs
+        from ifem.algorithms.beam_result_fields import build_beam_result_fields
 
         config = self._legacy_config(context)
         inputs = build_model_inputs(config)
@@ -280,11 +292,20 @@ class BeamSurfaceIntegralAlgorithm:
         progress(0.9, "二维梁重构求解完成")
         cancellation.raise_if_cancelled()
 
+        snapshot_id = f"beam-snapshot:{uuid4().hex}"
+        state = self._result_state(context, model, snapshot_id=snapshot_id)
+        fields, locations = build_beam_result_fields(
+            model, inputs=inputs, state=state, project=context.project,
+            snapshot_id=snapshot_id,
+        )
+        cancellation.raise_if_cancelled()
         return AnalysisResult(
             algorithm_id=self.metadata.identifier,
             algorithm_version=self.metadata.version,
             native_model=model,
             inputs=inputs,
-            state=self._result_state(context, model),
-            diagnostics=("legacy_config_adapter",),
+            state=state,
+            fields=fields,
+            locations=locations,
+            diagnostics=("legacy_config_adapter", "sensor_residual:pointwise_reconstructed_minus_measured"),
         )

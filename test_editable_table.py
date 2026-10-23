@@ -368,12 +368,18 @@ class EditableTableTests(unittest.TestCase):
         self.assertEqual(editor.undo_action.shortcutContext(), Qt.ShortcutContext.WidgetShortcut)
         target = editor.inputs["x"]
         target.setFocus()
-        self.app.clipboard().setText("line edit clipboard")
-        QTest.keySequence(target, QKeySequence(QKeySequence.StandardKey.Paste))
-        self.assertEqual(target.text(), "line edit clipboard")
-        self.assertEqual(editor.get_rows(), [])
-        QTest.keySequence(target, QKeySequence(QKeySequence.StandardKey.Undo))
-        self.assertEqual(target.text(), "")
+        try:
+            self.app.clipboard().setText("line edit clipboard")
+            QTest.keySequence(target, QKeySequence(QKeySequence.StandardKey.Paste))
+            self.assertEqual(target.text(), "line edit clipboard")
+            self.assertEqual(editor.get_rows(), [])
+            QTest.keySequence(target, QKeySequence(QKeySequence.StandardKey.Undo))
+            self.assertEqual(target.text(), "")
+        finally:
+            # Offscreen macOS can retain the standard shortcut's modifier.
+            # Release before teardown destroys the target, including on failure.
+            QTest.keyRelease(target, Qt.Key.Key_Control)
+            QTest.keyRelease(target, Qt.Key.Key_Meta)
 
     def test_shared_stack_parent_destruction_does_not_raise_in_connected_slots(self):
         host = QWidget()

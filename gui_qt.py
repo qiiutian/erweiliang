@@ -11,7 +11,7 @@ from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
-from PySide6.QtCore import QTimer, Qt, Signal, QSize, QSignalBlocker
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal, QSize, QSignalBlocker
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut, QUndoStack
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -75,6 +76,11 @@ from ifem.ui.modeler import BeamModelerDialog
 from ifem.ui.editable_table import EditableTable
 from ifem.ui.workspace_preferences import WorkspacePreferencesStore
 from ifem.ui.result_probe import ResultProbeBar, ResultLinkController
+from ifem.ui.result_fields import ResultFieldsPanel
+from ifem.ui.generic_result_view import GenericResultView
+from ifem.ui.generic_workbench_results import GenericWorkbenchResults
+from ifem.ui.analysis_job import AnalysisJobController
+from ifem.visualization.sensor_residuals import sensor_residual_data
 from ifem.ui.workspace_view import (
     ReadingPreferencesDialog, WorkspaceLayoutController, apply_reading_metrics,
 )
@@ -104,6 +110,7 @@ from postprocessing import (
 )
 from visualization_3d import Structure3DView
 from visualization_data import result_frame_from_beam, structural_model_from_beam
+from reconstruction import IBeam3SurfaceIntegralReconstruction2D
 
 
 matplotlib.rcParams["font.sans-serif"] = [
@@ -2749,6 +2756,10 @@ class ReconstructionMainWindow(QMainWindow):
         self.project_dirty = False
         self.results_stale = False
         self._analysis_busy = False
+        self._analysis_generation = 0
+        self._active_analysis_job = None
+        self._pending_analysis_config = None
+        self._close_after_analysis = False
         self.result_sequence = 0
         self.current_view = "stress"
         self._field_colorbar = None
@@ -2763,7 +2774,15 @@ class ReconstructionMainWindow(QMainWindow):
         self._table_boundary_templates = {}
 
         self._build_ui()
+        self.analysis_jobs = AnalysisJobController(self)
+        self.analysis_jobs.progress.connect(self._analysis_progress)
+        self.analysis_jobs.succeeded.connect(self._analysis_succeeded)
+        self.analysis_jobs.failed.connect(self._analysis_failed)
+        self.analysis_jobs.cancelled.connect(self._analysis_cancelled)
+        self.analysis_jobs.finished.connect(self._analysis_finished)
+        QApplication.instance().installEventFilter(self)
         self.result_link = ResultLinkController(self)
+        self.generic_results = GenericWorkbenchResults(self)
         self.load_sample_data(initial=True)
         apply_reading_metrics(self, self.reading_preferences)
         self._update_result_minimum_height()
@@ -2894,14 +2913,33 @@ class ReconstructionMainWindow(QMainWindow):
         self.run_button.setAccessibleDescription(
             "校验模型、测点、约束和算法参数后运行当前重构方案。"
         )
-        self.run_button.clicked.connect(self.run_reconstruction)
+        self.run_button.clicked.connect(self.start_reconstruction)
         toolbar.addWidget(self.run_button)
         self.run_action = QAction("运行重构", self)
         self.run_action.setShortcut(QKeySequence("F5"))
         self.run_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        self.run_action.triggered.connect(self.run_reconstruction)
+        self.run_action.triggered.connect(self.start_reconstruction)
         self.addAction(self.run_action)
         root_layout.addWidget(top_bar)
+
+        self.analysis_progress_panel = QFrame()
+        self.analysis_progress_panel.setObjectName("plotMetaBar")
+        progress_layout = QHBoxLayout(self.analysis_progress_panel)
+        progress_layout.setContentsMargins(12, 4, 10, 4)
+        self.analysis_progress_label = QLabel("正在准备计算快照…")
+        self.analysis_progress_label.setObjectName("sectionHint")
+        self.analysis_progress_bar = QProgressBar()
+        self.analysis_progress_bar.setAccessibleName("重构计算进度")
+        self.analysis_progress_bar.setRange(0, 100)
+        self.analysis_progress_bar.setMaximumWidth(200)
+        self.analysis_cancel_button = QPushButton("取消计算")
+        self.analysis_cancel_button.setObjectName("panelToggle")
+        self.analysis_cancel_button.clicked.connect(self.cancel_reconstruction)
+        progress_layout.addWidget(self.analysis_progress_label, 1)
+        progress_layout.addWidget(self.analysis_progress_bar)
+        progress_layout.addWidget(self.analysis_cancel_button)
+        self.analysis_progress_panel.hide()
+        root_layout.addWidget(self.analysis_progress_panel)
 
         main_split = QSplitter(Qt.Orientation.Horizontal)
         self.main_split = main_split
@@ -3250,6 +3288,8 @@ class ReconstructionMainWindow(QMainWindow):
         )
         self.plot_content_stack.addWidget(self.analysis_empty_state)
         self.plot_content_stack.addWidget(self.visualization_stack)
+        self.generic_result_view = GenericResultView(theme_id=self.current_theme_id)
+        self.plot_content_stack.addWidget(self.generic_result_view)
         plot_group_layout.addWidget(self.plot_content_stack, 1)
         self.probe_bar = ResultProbeBar()
         plot_group_layout.addWidget(self.probe_bar)
@@ -3306,9 +3346,38 @@ class ReconstructionMainWindow(QMainWindow):
             self.compare_result_table, "实测对比"
         )
         self.field_result_tab_index = self.result_tabs.addTab(self.field_result_table, "截面场")
+        self.sensor_result_panel = QWidget()
+        sensor_layout = QVBoxLayout(self.sensor_result_panel)
+        sensor_layout.setContentsMargins(0, 0, 0, 0)
+        sensor_layout.setSpacing(4)
+        self.sensor_summary_label = QLabel("运行后查看测点拟合残差。")
+        self.sensor_summary_label.setObjectName("plotContext")
+        self.sensor_summary_label.setWordWrap(True)
+        sensor_layout.addWidget(self.sensor_summary_label)
+        self.sensor_explanation = QLabel("残差 = 重构应变 − 观测应变；原始解的测点点值，不是真实误差，也不是区间积分目标。")
+        self.sensor_explanation.setObjectName("sectionHint")
+        self.sensor_explanation.setWordWrap(True)
+        sensor_layout.addWidget(self.sensor_explanation)
+        self.sensor_result_table = ReadOnlyTable(
+            columns=["测点", "x", "观测", "重构", "残差"],
+            headings=["应变测点", "参考 x / m", "观测 / με", "重构 / με", "残差 / με"],
+            accessible_name="测点应变拟合残差表",
+        )
+        sensor_layout.addWidget(self.sensor_result_table, 1)
+        self.sensor_result_tab_index = self.result_tabs.addTab(self.sensor_result_panel, "测点残差")
+        self.result_fields_panel = ResultFieldsPanel()
+        self.generic_result_tab_index = self.result_tabs.addTab(self.result_fields_panel, "结果字段")
+        self.generic_state_table = ReadOnlyTable(
+            columns=["节点", "x", "y", "z", "ux", "uy", "uz", "转动"],
+            headings=["节点 ID", "参考 x / m", "参考 y / m", "参考 z / m", "ux / m", "uy / m", "uz / m", "转动（见提示）"],
+            stretch_columns=False, accessible_name="通用重构状态节点表",
+        )
+        self.generic_state_tab_index = self.result_tabs.addTab(self.generic_state_table, "重构状态")
+        self.result_tabs.setTabVisible(self.generic_state_tab_index, False)
         self.message_result_tab_index = self.result_tabs.addTab(
             self.message_text, "运行信息"
         )
+        self.result_tabs.currentChanged.connect(self._update_result_minimum_height)
 
         main_split.setSizes([430, 1100])
         main_split.setStretchFactor(0, 0)
@@ -3399,7 +3468,7 @@ class ReconstructionMainWindow(QMainWindow):
             for index, name in enumerate(self.left_tab_names)
         ]
         commands.extend([
-            StudioCommand("运行重构", "F5 · 校验并计算当前方法", self.run_reconstruction, self.run_button.isEnabled(), "run solve"),
+            StudioCommand("运行重构", "F5 · 后台校验并计算当前方法", self.start_reconstruction, self.run_button.isEnabled(), "run solve"),
             StudioCommand("交互建模", "Ctrl+M · 几何、截面与表面测点", self.open_interactive_modeler, not self._analysis_busy, "model"),
             StudioCommand("保存项目", "Ctrl+S · 保存当前项目", self.save_current_project, not self._analysis_busy, "save"),
             StudioCommand("打开项目", "Ctrl+O · 从项目库选择", self.open_project, not self._analysis_busy, "open"),
@@ -3888,11 +3957,13 @@ class ReconstructionMainWindow(QMainWindow):
         self._mark_results_stale()
 
     def _sync_analysis_parameter_controls(self):
-        blocked = self.analysis_setup.should_preserve_saved_case
+        blocked = self.analysis_setup.should_preserve_saved_case or not self._uses_legacy_solver_parameters()
         message = (
             "当前插件绑定尚未恢复；这些分析参数按原工况不透明保留，"
             "明确采用当前插件或替代算法后才可编辑。"
         )
+        if not self.analysis_setup.should_preserve_saved_case and not self._uses_legacy_solver_parameters():
+            message = "查询位置与实测位移对比仅用于原生二维梁后处理；当前方法的参数在重构方法区设置。"
         for widget in (self.query_xs_edit, self.true_point_editor):
             widget.setEnabled(not blocked)
             widget.setToolTip(message if blocked else "")
@@ -3913,7 +3984,7 @@ class ReconstructionMainWindow(QMainWindow):
                 plot_options,
             )
         self._sync_scale_buttons(plot_options)
-        if self.current_inputs is not None:
+        if self.current_inputs is not None and not self._is_generic_result():
             self.current_inputs["plot_options"] = plot_options
             if self.current_config is not None:
                 self.current_config["plot_options"] = dict(plot_options)
@@ -3925,8 +3996,9 @@ class ReconstructionMainWindow(QMainWindow):
     def _mark_results_stale(self, *_args):
         if self._loading_form or not hasattr(self, "run_status_label"):
             return
+        self._analysis_generation += 1
         self._set_project_dirty(True)
-        if self.current_model is None:
+        if not self._has_analysis_result():
             self._set_run_status("参数待运行", "idle")
             self._set_result_freshness(False)
         else:
@@ -4046,7 +4118,7 @@ class ReconstructionMainWindow(QMainWindow):
         if self._readiness_issues:
             self._focus_first_input_issue()
             return
-        self.run_reconstruction()
+        self.start_reconstruction()
 
     def _activate_empty_state_action(self):
         self._activate_input_status()
@@ -4087,6 +4159,8 @@ class ReconstructionMainWindow(QMainWindow):
     def _refresh_input_readiness(self):
         """Refresh non-modal validation and the single source of run-button state."""
         if not hasattr(self, "left_tabs") or not hasattr(self, "input_status_label"):
+            return False
+        if self._analysis_busy:
             return False
         for widget in (
             self.node_x_edit,
@@ -4172,7 +4246,7 @@ class ReconstructionMainWindow(QMainWindow):
         capability = None
         plot_options = None
         try:
-            plot_options = self._collect_plot_options()
+            plot_options = self._collect_plot_options() if self._uses_legacy_solver_parameters() else {}
         except (TypeError, ValueError) as exc:
             add_issue(exc)
 
@@ -4187,6 +4261,7 @@ class ReconstructionMainWindow(QMainWindow):
             if (
                 capability is not None
                 and capability.legacy_solver_compatible
+                and self._uses_legacy_solver_parameters()
                 and plot_options is not None
             ):
                 try:
@@ -4201,11 +4276,17 @@ class ReconstructionMainWindow(QMainWindow):
                             add_issue(validation_issue)
                 except (TypeError, ValueError) as exc:
                     add_issue(exc)
-            elif capability is not None:
-                add_issue(
-                    f"{capability.kind}：{capability.reason}。当前求解入口暂未接入。",
-                    field="/analysis/algorithm/id",
-                )
+            elif capability is not None and self.analysis_setup.is_compatible:
+                try:
+                    request = self._prepare_workbench_request()
+                    report = self.analysis_service.validate_project(
+                        request["project"], algorithm_id=self.analysis_setup.active_algorithm_id,
+                        parameters=request["parameters"],
+                    )
+                    for validation_issue in report.issues:
+                        add_issue(validation_issue)
+                except (KeyError, TypeError, ValueError) as exc:
+                    add_issue(exc)
 
         if not self.analysis_setup.is_compatible:
             feedback = self.analysis_setup.algorithm_feedback_label.text().strip()
@@ -4294,7 +4375,6 @@ class ReconstructionMainWindow(QMainWindow):
         can_run = (
             not issues
             and capability is not None
-            and capability.legacy_solver_compatible
             and not self._analysis_busy
         )
         self.run_button.setEnabled(bool(can_run))
@@ -4337,12 +4417,18 @@ class ReconstructionMainWindow(QMainWindow):
         if hasattr(self, "analysis_empty_state"):
             self.analysis_empty_state.action_button.setEnabled(not busy)
         if busy:
-            self.setCursor(Qt.CursorShape.WaitCursor)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.unsetCursor()
+        for widget in (self.left_panel, self.modeler_button, self.more_button,
+                       self.display_settings_panel, self.save_as_action,
+                       *self.project_action_buttons, *self.scale_buttons.values()):
+            widget.setEnabled(not busy)
+        if self._is_generic_result():
+            self.generic_results.set_active(True)
 
     def _set_result_freshness(self, stale):
-        self.results_stale = bool(stale and self.current_model is not None)
+        self.results_stale = bool(stale and self._has_analysis_result())
         if hasattr(self, "result_freshness_label"):
             self.result_freshness_label.setVisible(self.results_stale)
         if hasattr(self, "result_group"):
@@ -4356,12 +4442,15 @@ class ReconstructionMainWindow(QMainWindow):
             )
         if hasattr(self, "result_link"):
             self.result_link.refresh()
+        if self._is_generic_result() and hasattr(self, "generic_results"):
+            self.generic_results.refresh_context()
 
     def _capture_analysis_result_state(self):
         return {
             "current_model": self.current_model,
             "current_analysis_result": self.current_analysis_result,
             "probe_selection": self.result_link.selected,
+            "generic_view": self.generic_results.capture(),
             "current_config": self.current_config,
             "current_inputs": self.current_inputs,
             "current_field": self.current_field,
@@ -4382,7 +4471,8 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _restore_analysis_result_state(self, snapshot):
         previous_model = snapshot["current_model"]
-        if previous_model is None:
+        previous_result = snapshot["current_analysis_result"]
+        if previous_model is None and previous_result is None:
             self.current_model = None
             self.current_config = snapshot["current_config"]
             self.result_sequence = snapshot["result_sequence"]
@@ -4402,16 +4492,21 @@ class ReconstructionMainWindow(QMainWindow):
                 "result_sequence",
             ):
                 setattr(self, key, snapshot[key])
-            self.view_buttons[self.current_view].setChecked(True)
-            self._fill_result_tables(self.current_model, self.current_inputs)
-            self._render_current_view()
-            self.visualization_stack.setCurrentIndex(
-                snapshot["visualization_index"]
-            )
+            if previous_model is None:
+                self._fill_contract_result_tables()
+                self.generic_results.install(previous_result)
+                self.generic_results.restore(snapshot["generic_view"])
+            else:
+                self.generic_results.clear()
+                self.view_buttons[self.current_view].setChecked(True)
+                self._fill_result_tables(self.current_model, self.current_inputs)
+                self._fill_contract_result_tables()
+                self._render_current_view()
+                self.visualization_stack.setCurrentIndex(snapshot["visualization_index"])
             self.result_tabs.setCurrentIndex(snapshot["result_tab_index"])
             self._set_result_freshness(True)
             selected = snapshot["probe_selection"]
-            if selected is not None:
+            if previous_model is not None and selected is not None:
                 self.result_link.select(selected.kind, selected.index, force=True)
         self.json_text.setPlainText(snapshot["json_text"])
         for key, text in snapshot["metrics"].items():
@@ -4435,6 +4530,9 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _refresh_view_context(self):
         if not hasattr(self, "view_context_label"):
+            return
+        if self._is_generic_result() and hasattr(self, "generic_results"):
+            self.generic_results.refresh_context()
             return
         mode_text = {
             "shape": "重构形态",
@@ -4551,6 +4649,7 @@ class ReconstructionMainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def _clear_result_views(self):
+        self.current_model = None
         self.current_analysis_result = None
         self.current_inputs = None
         self.current_field = None
@@ -4560,6 +4659,8 @@ class ReconstructionMainWindow(QMainWindow):
         self.current_result_frame = None
         if hasattr(self, "result_link"):
             self.result_link.clear()
+        if hasattr(self, "generic_results"):
+            self.generic_results.clear()
         self._set_result_freshness(False)
         self.current_view = "stress"
         if hasattr(self, "view_buttons"):
@@ -4570,6 +4671,9 @@ class ReconstructionMainWindow(QMainWindow):
         self.query_result_table.set_rows([])
         self.compare_result_table.set_rows([])
         self.field_result_table.set_rows([])
+        self.sensor_result_table.set_rows([])
+        self.sensor_summary_label.setText("运行后查看测点拟合残差。")
+        self.result_fields_panel.set_result(None)
         if hasattr(self, "node_result_tab_index"):
             self.result_tabs.setTabText(self.node_result_tab_index, "节点结果")
             self.result_tabs.setTabText(self.query_result_tab_index, "查询结果")
@@ -4669,11 +4773,11 @@ class ReconstructionMainWindow(QMainWindow):
         # feed them through the legacy form adapter merely to save unrelated edits.
         analysis_parameters = (
             {}
-            if self.analysis_setup.should_preserve_saved_case
+            if self.analysis_setup.should_preserve_saved_case or not self._uses_legacy_solver_parameters()
             else self.analysis_setup.parameter_values()
         )
         if plot_options is None:
-            plot_options = self._collect_plot_options()
+            plot_options = self._collect_plot_options() if self._uses_legacy_solver_parameters() else {}
         return build_config_from_form_data(
             node_x_text=self.node_x_edit.text(),
             thickness_text=self.thickness_edit.text(),
@@ -4681,10 +4785,10 @@ class ReconstructionMainWindow(QMainWindow):
             points_per_element_text=str(
                 analysis_parameters.get("points_per_element", 120)
             ),
-            query_xs_text=self.query_xs_edit.text(),
+            query_xs_text=self.query_xs_edit.text() if self._uses_legacy_solver_parameters() else "",
             measurement_rows=self.measurement_editor.get_rows(),
             boundary_rows=self.boundary_editor.get_rows(),
-            true_point_rows=self.true_point_editor.get_rows(),
+            true_point_rows=self.true_point_editor.get_rows() if self._uses_legacy_solver_parameters() else [],
             plot_options=plot_options,
             elastic_modulus_gpa_text=self.elastic_modulus_edit.text(),
             require_measurements=require_measurements,
@@ -4714,6 +4818,9 @@ class ReconstructionMainWindow(QMainWindow):
         self.setWindowTitle(f"iFEM — {project_name}{dirty_mark}")
 
     def _confirm_save_before_action(self):
+        if self._analysis_busy:
+            self.statusBar().showMessage("计算期间暂不切换项目；请先取消或等待完成。", 6000)
+            return False
         if not self.project_dirty:
             return True
         answer = QMessageBox.question(
@@ -4795,11 +4902,17 @@ class ReconstructionMainWindow(QMainWindow):
             return False
 
     def save_current_project(self):
+        if self._analysis_busy:
+            self.statusBar().showMessage("计算期间暂不保存；请先取消或等待完成。", 6000)
+            return False
         if self.current_project_path is None:
             return self.save_project_as()
         return self._save_project_to(self.current_project_path)
 
     def save_project_as(self):
+        if self._analysis_busy:
+            self.statusBar().showMessage("计算期间暂不另存；请先取消或等待完成。", 6000)
+            return False
         project_name = (
             self.current_project_document.name
             if self.current_project_document is not None
@@ -4893,6 +5006,8 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _apply_view_state_to_project(self, project, plot_options=None):
         if plot_options is None:
+            if not self._uses_legacy_solver_parameters():
+                return project
             plot_options = self._collect_plot_options()
         plot_options = dict(plot_options)
         if dict(project.view_state) == plot_options:
@@ -5131,7 +5246,7 @@ class ReconstructionMainWindow(QMainWindow):
         existing_config = legacy_config_from_project(
             current,
             include_analysis_parameters=(
-                not self.analysis_setup.should_preserve_saved_case
+                not self.analysis_setup.should_preserve_saved_case and self._uses_legacy_solver_parameters()
             ),
         )
         if (
@@ -5142,7 +5257,8 @@ class ReconstructionMainWindow(QMainWindow):
         else:
             project = self._merge_legacy_form_into_project(current, config)
         project = self._apply_analysis_setup_to_project(project, config=config)
-        return self._apply_view_state_to_project(project, config["plot_options"])
+        return (self._apply_view_state_to_project(project, config["plot_options"])
+                if self._uses_legacy_solver_parameters() else project)
 
     def _table_identities_match(self, project):
         """Equal numbers do not imply equal entities after delete + recreate."""
@@ -5170,6 +5286,7 @@ class ReconstructionMainWindow(QMainWindow):
         return True
 
     def _apply_project_document(self, project, *, dirty, status_text):
+        self._analysis_generation += 1
         capability = PathBeamEditor.capability(project)
         config = None
         config_json = None
@@ -5177,7 +5294,7 @@ class ReconstructionMainWindow(QMainWindow):
             preserve_analysis = self.analysis_setup.project_requires_recovery(project)
             config = legacy_config_from_project(
                 project,
-                include_analysis_parameters=not preserve_analysis,
+                include_analysis_parameters=(not preserve_analysis and self._project_uses_legacy_parameters(project)),
             )
             config_json = config_to_json(config)
 
@@ -5222,7 +5339,8 @@ class ReconstructionMainWindow(QMainWindow):
             self.json_text.clear()
             self._update_project_summary(project)
             self.run_button.setEnabled(False)
-            self._set_run_status("项目已载入 · 算法待接入", "stale")
+            self._set_run_status("项目已载入 · 待运行" if self.analysis_setup.is_compatible
+                                 else "项目已载入 · 算法待接入", "idle" if self.analysis_setup.is_compatible else "stale")
             try:
                 self._loading_form = True
                 self._load_plot_options_to_form(dict(project.view_state))
@@ -5287,7 +5405,7 @@ class ReconstructionMainWindow(QMainWindow):
                 for name in self.analysis_setup.declared_parameter_names:
                     parameters.pop(name, None)
                 parameters.update(self.analysis_setup.parameter_values())
-            if config is not None:
+            if config is not None and self._uses_legacy_solver_parameters():
                 parameters["query_xs"] = list(config.get("query_xs", []))
                 parameters["true_points"] = list(config.get("true_points", []))
             return parameters
@@ -5326,7 +5444,10 @@ class ReconstructionMainWindow(QMainWindow):
                 analysis_case,
                 algorithm_id=self.analysis_setup.active_algorithm_id,
                 parameters=merged_parameters(
-                    analysis_case.parameters,
+                    analysis_case.parameters if (
+                        analysis_case.algorithm_id == self.analysis_setup.active_algorithm_id
+                        or self._uses_legacy_solver_parameters()
+                    ) else None,
                     include_setup=self.analysis_setup.configuration_modified,
                 ),
                 algorithm_version=(
@@ -5350,6 +5471,9 @@ class ReconstructionMainWindow(QMainWindow):
         )
 
     def open_interactive_modeler(self):
+        if self._analysis_busy:
+            self.statusBar().showMessage("计算期间暂不修改模型；请先取消或等待完成。", 6000)
+            return
         try:
             project = self._project_for_interactive_modeler()
         except Exception as exc:
@@ -5464,12 +5588,13 @@ class ReconstructionMainWindow(QMainWindow):
             self.elastic_modulus_edit.clear()
         else:
             self.elastic_modulus_edit.setText(f"{float(elastic_modulus) / 1.0e9:.12g}")
-        self.analysis_setup.set_parameter_values(
-            {
-                "gauss_n": config.get("gauss_n", 3),
-                "points_per_element": config.get("points_per_element", 120),
-            }
-        )
+        if self._uses_legacy_solver_parameters():
+            self.analysis_setup.set_parameter_values(
+                {
+                    "gauss_n": config.get("gauss_n", 3),
+                    "points_per_element": config.get("points_per_element", 120),
+                }
+            )
         self.query_xs_edit.setText(", ".join(f"{float(x):.12g}" for x in config.get("query_xs", [])))
         self._load_plot_options_to_form(config.get("plot_options", {}))
 
@@ -5564,7 +5689,125 @@ class ReconstructionMainWindow(QMainWindow):
         preview_data = build_measurement_preview(self.node_x_edit.text(), self.measurement_editor.get_rows())
         self.measurement_preview.set_preview_data(preview_data)
 
+    def _uses_legacy_solver_parameters(self, algorithm=None):
+        algorithm = algorithm or self.analysis_setup.active_algorithm
+        if algorithm is None:
+            return False
+        return (algorithm.metadata.identifier == "ifem.beam2d.surface_integral.v1"
+                or str(getattr(algorithm.metadata, "contract_version", "0")) == "0")
+
+    def _project_uses_legacy_parameters(self, project):
+        case = next((case for case in project.analysis_cases if case.identifier == project.active_analysis_id),
+                    project.analysis_cases[0] if project.analysis_cases else None)
+        if case is None:
+            return self._uses_legacy_solver_parameters()
+        if case.algorithm_id not in self.analysis_service.registry:
+            return False
+        return self._uses_legacy_solver_parameters(self.analysis_service.registry.get(case.algorithm_id))
+
+    def _has_analysis_result(self):
+        return self.current_analysis_result is not None or self.current_model is not None
+
+    def _is_generic_result(self):
+        return self.current_analysis_result is not None and self.current_model is None
+
+    def _prepare_workbench_request(self):
+        project_only = not self._uses_legacy_solver_parameters()
+        config = {} if project_only else self._build_form_config()
+        parameters = {} if project_only else {name: config[name] for name in
+                     ("query_xs", "true_points", "gauss_n", "points_per_element") if name in config}
+        parameters.update(self.analysis_setup.parameter_values())
+        return dict(config=config, parameters=parameters, project=self._project_for_save(), project_only=project_only)
+
+    def start_reconstruction(self):
+        """UI entry point: calculate an isolated snapshot without blocking Qt."""
+        if self._analysis_busy or self._is_shut_down:
+            return
+        # Readiness has already been refreshed when input changes. Full numerical
+        # validation is repeated by the service on the worker, not on this click.
+        if self._readiness_issues:
+            self._focus_first_input_issue()
+            return
+        try:
+            request = self._prepare_workbench_request()
+            self._pending_analysis_config = request["config"]
+            self._set_analysis_busy(True)
+            self.analysis_progress_label.setText("正在校验输入与可解性…")
+            self.analysis_progress_bar.setValue(0)
+            self.analysis_cancel_button.setEnabled(True)
+            self.analysis_cancel_button.setText("取消计算")
+            self.analysis_progress_panel.show()
+            self._set_run_status("后台计算中…", "running")
+            self._active_analysis_job = self.analysis_jobs.start(
+                self.analysis_service, algorithm_id=self.analysis_setup.active_algorithm_id,
+                snapshot_key=self._analysis_generation, **request,
+            )
+        except Exception as exc:
+            self._active_analysis_job = None
+            self._pending_analysis_config = None
+            self._set_analysis_busy(False)
+            self.analysis_progress_panel.hide()
+            self._refresh_input_readiness()
+            self._show_error(exc)
+
+    def cancel_reconstruction(self):
+        if self.analysis_jobs.cancel():
+            self.analysis_cancel_button.setEnabled(False)
+            self.analysis_cancel_button.setText("正在取消…")
+            self.analysis_progress_label.setText("正在取消，等待当前计算步骤结束；已有结果会保留。")
+            self._set_run_status("正在取消…", "running")
+
+    def _analysis_progress(self, job_id, generation, fraction, message):
+        if job_id != self._active_analysis_job or generation != self._analysis_generation:
+            return
+        self.analysis_progress_bar.setValue(round(100 * fraction))
+        self.analysis_progress_label.setText(message)
+
+    def _analysis_succeeded(self, job_id, generation, result):
+        if job_id != self._active_analysis_job or self._is_shut_down:
+            return
+        if generation != self._analysis_generation:
+            self._set_run_status("输入已变化 · 本次结果未应用", "stale")
+            self.statusBar().showMessage("计算快照已过期，结果未覆盖当前项目。", 7000)
+            return
+        snapshot = self._capture_analysis_result_state()
+        try:
+            self.analysis_progress_label.setText("计算完成，正在更新结果视图…")
+            self._apply_analysis_result(result, self._pending_analysis_config)
+        except Exception as exc:
+            try:
+                self._restore_analysis_result_state(snapshot)
+            except Exception:
+                self._clear_result_views()
+            self._show_error(exc)
+
+    def _analysis_failed(self, job_id, generation, error):
+        if job_id == self._active_analysis_job and not self._is_shut_down:
+            if generation == self._analysis_generation:
+                self._show_error(error)
+            else:
+                self._set_run_status("输入已变化 · 忽略旧任务错误", "stale")
+
+    def _analysis_cancelled(self, job_id, _generation):
+        if job_id == self._active_analysis_job and not self._is_shut_down:
+            self._set_run_status("计算已取消 · 保留已有结果", "idle")
+            self.statusBar().showMessage("计算已取消，已有结果和输入均保留。", 6000)
+
+    def _analysis_finished(self, job_id, _generation):
+        if job_id != self._active_analysis_job:
+            return
+        self._active_analysis_job = None
+        self._pending_analysis_config = None
+        self._set_analysis_busy(False)
+        self.analysis_progress_panel.hide()
+        if not self._is_shut_down:
+            self._refresh_input_readiness()
+        if self._close_after_analysis:
+            self._close_after_analysis = False
+            QTimer.singleShot(0, self.close)
+
     def run_reconstruction(self):
+        """Synchronous compatibility entry point for scripts and deterministic tests."""
         if self._analysis_busy:
             return
         if not self._refresh_input_readiness():
@@ -5607,84 +5850,18 @@ class ReconstructionMainWindow(QMainWindow):
         self._set_analysis_busy(True)
         QApplication.processEvents()
         try:
-            config = self._build_form_config()
-            # The project snapshot supplies stable entities; analysis-only
-            # inputs still come from the current form, never default silently.
-            parameters = {
-                name: config[name]
-                for name in ("query_xs", "true_points", "gauss_n", "points_per_element")
-                if name in config
-            }
-            parameters.update(self.analysis_setup.parameter_values())
-            result = self.analysis_service.run(
-                config,
-                algorithm_id=self.analysis_setup.active_algorithm_id,
-                parameters=parameters,
-                project=self._project_for_save(),
-            )
-            model = result.native_model
-            inputs = dict(result.inputs)
-            self.current_model = model
-            self.current_analysis_result = result
-            self.current_config = config
-            self.json_text.setPlainText(config_to_json(config))
-            self._render_plot(model, inputs)
-            self._fill_result_tables(model, inputs)
-            self.result_link.update()
-            self._update_analysis_summary(config=config, model=model)
-            self._set_result_freshness(False)
-            result_tab_index = 0 if self.current_view == "shape" else self.field_result_tab_index
-            self.result_tabs.setCurrentIndex(result_tab_index)
-            self._set_run_status(f"重构完成 · {model.n_nodes} 节点 / {model.n_elems} 单元", "success")
-            message_lines = [
-                "重构完成。",
-                f"重构方法: {self.analysis_setup.active_algorithm_display_name} "
-                f"v{result.algorithm_version}",
-                f"节点数: {model.n_nodes}",
-                f"单元数: {model.n_elems}",
-                f"高斯点数: {inputs['gauss_n']}",
-                f"每单元采样点数: {inputs['points_per_element']}",
-                f"真实梁厚度: {model.thickness:.6g}",
-            ]
-            boundary_jumps = element_boundary_jumps(self.current_raw_field)
-            strain_jumps = [
-                abs(value) * 1.0e6
-                for row in boundary_jumps
-                for value in (row["top_strain_jump"], row["bottom_strain_jump"])
-            ]
-            max_strain_jump = max(strain_jumps, default=0.0)
-            message_lines.append(f"原始场最大边界应变跳变: {max_strain_jump:.6g} με")
-            representation = inputs["plot_options"].get(
-                "field_representation", "nodal_average"
-            )
-            message_lines.append(
-                "场显示: 原始单元场"
-                if representation == "raw"
-                else "场显示: 节点平均连续化（仅后处理，不改变原始解）"
-            )
-            message_lines.append(
-                "三维视图: PyVistaQt / VTK 已启用"
-                if self.structure_3d_view.backend_available
-                else "三维视图: 当前环境使用二维兼容模式"
-            )
-            elastic_modulus = inputs.get("material", {}).get("elastic_modulus")
-            if elastic_modulus is None:
-                message_lines.append("应力后处理: 未设置弹性模量 E")
-            else:
-                max_stress_mpa = float(np.max(np.abs(self.current_raw_field.stress))) / 1.0e6
-                stress_jumps = [
-                    abs(value) / 1.0e6
-                    for row in boundary_jumps
-                    for value in (row["top_stress_jump"], row["bottom_stress_jump"])
-                    if value is not None
-                ]
-                message_lines.append(f"弹性模量 E: {elastic_modulus / 1.0e9:.6g} GPa")
-                message_lines.append(f"最大轴向应力绝对值: {max_stress_mpa:.6g} MPa")
-                message_lines.append(
-                    f"原始场最大边界应力跳变: {max(stress_jumps, default=0.0):.6g} MPa"
+            request = self._prepare_workbench_request()
+            if request["project_only"]:
+                result = self.analysis_service.run_project(
+                    request["project"], algorithm_id=self.analysis_setup.active_algorithm_id,
+                    parameters=request["parameters"],
                 )
-                message_lines.append("应力假设: 一维线弹性 σ=Eε")
-            self._write_message("\n".join(message_lines))
+            else:
+                result = self.analysis_service.run(
+                    request["config"], algorithm_id=self.analysis_setup.active_algorithm_id,
+                    parameters=request["parameters"], project=request["project"],
+                )
+            self._apply_analysis_result(result, request["config"])
         except Exception as exc:
             failure = exc
             try:
@@ -5696,6 +5873,97 @@ class ReconstructionMainWindow(QMainWindow):
             self._refresh_input_readiness()
         if failure is not None:
             self._show_error(failure)
+
+    def _apply_analysis_result(self, result, config):
+        if not isinstance(result.native_model, IBeam3SurfaceIntegralReconstruction2D):
+            if result.state is None:
+                raise ValueError("此方法未返回可显示的标准重构状态，也没有兼容的二维梁结果。")
+            self.current_model = None
+            self._clear_result_views()
+            self.current_analysis_result = result
+            self.current_config = None
+            self.current_inputs = dict(result.inputs)
+            self.result_sequence += 1
+            self._fill_contract_result_tables()
+            self.generic_results.install(result)
+            self._set_result_freshness(False)
+            self._set_run_status(f"重构完成 · {len(result.state.node_ids)} 节点 / {len(result.state.element_ids)} 单元", "success")
+            self._write_message("重构完成。\n通用状态与字段显示：分析节点连线及真实位置的离散字段点。\n不插值为连续场，不推测精确曲线或实体截面。\n" + "\n".join(str(item) for item in result.diagnostics))
+            return
+        self.generic_results.set_active(False)
+        self.generic_result_view.clear()
+        model = result.native_model
+        inputs = dict(result.inputs)
+        self.current_model = model
+        self.current_analysis_result = result
+        self.current_config = config
+        self.json_text.setPlainText(config_to_json(config))
+        self._render_plot(model, inputs)
+        self._fill_result_tables(model, inputs)
+        self._fill_contract_result_tables()
+        self.result_link.update()
+        self._update_analysis_summary(config=config, model=model)
+        self._set_result_freshness(False)
+        result_tab_index = 0 if self.current_view == "shape" else self.field_result_tab_index
+        self.result_tabs.setCurrentIndex(result_tab_index)
+        self._set_run_status(f"重构完成 · {model.n_nodes} 节点 / {model.n_elems} 单元", "success")
+        message_lines = [
+            "重构完成。",
+            f"重构方法: {self.analysis_setup.active_algorithm_display_name} "
+            f"v{result.algorithm_version}",
+            f"节点数: {model.n_nodes}",
+            f"单元数: {model.n_elems}",
+            f"高斯点数: {inputs['gauss_n']}",
+            f"每单元采样点数: {inputs['points_per_element']}",
+            f"真实梁厚度: {model.thickness:.6g}",
+        ]
+        boundary_jumps = element_boundary_jumps(self.current_raw_field)
+        strain_jumps = [
+            abs(value) * 1.0e6
+            for row in boundary_jumps
+            for value in (row["top_strain_jump"], row["bottom_strain_jump"])
+        ]
+        max_strain_jump = max(strain_jumps, default=0.0)
+        message_lines.append(f"原始场最大边界应变跳变: {max_strain_jump:.6g} με")
+        representation = inputs["plot_options"].get(
+            "field_representation", "nodal_average"
+        )
+        message_lines.append(
+            "场显示: 原始单元场"
+            if representation == "raw"
+            else "场显示: 节点平均连续化（仅后处理，不改变原始解）"
+        )
+        message_lines.append(
+            "三维视图: PyVistaQt / VTK 已启用"
+            if self.structure_3d_view.backend_available
+            else "三维视图: 当前环境使用二维兼容模式"
+        )
+        elastic_modulus = inputs.get("material", {}).get("elastic_modulus")
+        if elastic_modulus is None:
+            message_lines.append("应力后处理: 未设置弹性模量 E")
+        else:
+            max_stress_mpa = float(np.max(np.abs(self.current_raw_field.stress))) / 1.0e6
+            stress_jumps = [
+                abs(value) / 1.0e6
+                for row in boundary_jumps
+                for value in (row["top_stress_jump"], row["bottom_stress_jump"])
+                if value is not None
+            ]
+            message_lines.append(f"弹性模量 E: {elastic_modulus / 1.0e9:.6g} GPa")
+            message_lines.append(f"最大轴向应力绝对值: {max_stress_mpa:.6g} MPa")
+            message_lines.append(
+                f"原始场最大边界应力跳变: {max(stress_jumps, default=0.0):.6g} MPa"
+            )
+            message_lines.append("应力假设: 一维线弹性 σ=Eε")
+        self._write_message("\n".join(message_lines))
+
+    def _fill_contract_result_tables(self):
+        self.result_fields_panel.set_result(self.current_analysis_result)
+        rows, _targets, summary = sensor_residual_data(self.current_analysis_result, self.result_sequence)
+        display_rows = [dict(row, **{key: f"{row[key]:.6g}" for key in ("x", "观测", "重构", "残差")}) for row in rows]
+        self.sensor_result_table.set_rows(display_rows)
+        self.sensor_summary_label.setText(summary)
+        self.result_tabs.setTabText(self.sensor_result_tab_index, f"测点残差 · {len(rows)}" if rows else "测点残差")
 
     def _render_plot(self, model, inputs):
         elastic_modulus = inputs.get("material", {}).get("elastic_modulus")
@@ -5750,6 +6018,13 @@ class ReconstructionMainWindow(QMainWindow):
     def _switch_view(self, mode):
         if mode not in self.view_buttons:
             return
+        if self._is_generic_result():
+            identifier = None if mode == "shape" else f"axial_{mode}"
+            if self.generic_result_view.set_field(identifier):
+                self.current_view = mode
+                self.result_tabs.setCurrentWidget(self.generic_state_table if identifier is None else self.result_fields_panel)
+                self._render_current_view()
+            return
         self.current_view = mode
         self._refresh_view_context()
         result_tab_index = 0 if mode == "shape" else self.field_result_tab_index
@@ -5763,6 +6038,10 @@ class ReconstructionMainWindow(QMainWindow):
 
     def _switch_visualization_space(self, index):
         if not hasattr(self, "visualization_stack"):
+            return
+        if self._is_generic_result():
+            projection = self.generic_result_view.projection
+            self.generic_result_view.set_projection("3d" if index == 1 else "xy" if projection == "3d" else projection)
             return
         self.visualization_stack.setCurrentIndex(index)
         key = "3d" if index == 1 else "2d"
@@ -5792,7 +6071,7 @@ class ReconstructionMainWindow(QMainWindow):
             controller.restore_ratios()
 
     def _switch_scale_mode(self, mode):
-        if mode not in self.scale_buttons:
+        if mode not in self.scale_buttons or self._is_generic_result():
             return
         self._loading_form = True
         try:
@@ -5827,6 +6106,11 @@ class ReconstructionMainWindow(QMainWindow):
         self.scale_buttons["true" if is_true_scale else "fit"].setChecked(True)
 
     def _render_current_view(self):
+        if self._is_generic_result():
+            self.plot_content_stack.setCurrentWidget(self.generic_result_view)
+            self.generic_results.refresh_context()
+            self.generic_result_view.canvas.draw_idle()
+            return
         self._select_active_field()
         if self.current_model is None or self.current_field is None or self.current_inputs is None:
             self._render_empty_plot()
@@ -6163,7 +6447,25 @@ class ReconstructionMainWindow(QMainWindow):
             else:
                 self._set_view_meta("节点平均连续化（后处理） · 原始场可在左侧切换")
 
-        if self.canvas.height() < 220:
+        if self.canvas.height() < 100:
+            # At the minimum window + largest reading scale there is less
+            # room than tight_layout's label margins. Keep numeric ticks and
+            # the field itself visible instead of collapsing to a zero-height
+            # strip; units remain in the colorbar label and global SI status.
+            self.axes.set_title("")
+            self.axes.set_xlabel("")
+            self.axes.set_ylabel("")
+            self.axes.tick_params(labelsize=7, pad=1, length=2)
+            self.axes.xaxis.set_major_locator(MaxNLocator(nbins=5))
+            self.axes.yaxis.set_major_locator(MaxNLocator(nbins=2))
+            self.axes.set_position((0.08, 0.29, 0.79, 0.61))
+            self._field_colorbar.set_label("MPa" if field_kind == "stress" else "με", fontsize=7, rotation=0, labelpad=8)
+            self._field_colorbar.ax.set_box_aspect(None)
+            self._field_colorbar.ax.set_position((0.90, 0.29, 0.012, 0.61))
+            self._field_colorbar.ax.tick_params(labelsize=7, pad=1, length=2)
+            self._field_colorbar.locator = MaxNLocator(nbins=2)
+            self._field_colorbar.update_ticks()
+        elif self.canvas.height() < 220:
             # The surrounding context bar already names this field. Reclaim
             # its duplicate title in short split views, not the numeric axes.
             self.axes.set_title("")
@@ -6252,6 +6554,11 @@ class ReconstructionMainWindow(QMainWindow):
             + table.verticalHeader().defaultSectionSize()
             + table.horizontalScrollBar().sizeHint().height()
         )
+        current = self.result_tabs.currentWidget()
+        if current is self.sensor_result_panel:
+            minimum += self.sensor_summary_label.sizeHint().height() + self.sensor_explanation.sizeHint().height() + 8
+        elif current is self.result_fields_panel:
+            minimum += self.result_fields_panel.selector.sizeHint().height() + self.result_fields_panel.metadata.sizeHint().height() + 10
         self.result_group.setMinimumHeight(max(145, minimum))
 
     def _fill_result_tables(self, model, inputs):
@@ -6364,10 +6671,14 @@ class ReconstructionMainWindow(QMainWindow):
             self.measurement_preview.set_theme(self.current_theme_id)
         if hasattr(self, "structure_3d_view"):
             self.structure_3d_view.apply_theme(self.current_theme_id)
+        if hasattr(self, "generic_result_view"):
+            self.generic_result_view.apply_theme(self.current_theme_id)
         for dialog in self.findChildren(BeamModelerDialog):
             dialog.apply_theme(self.current_theme_id)
         if hasattr(self, "figure"):
-            if self.current_model is None or self.current_field is None:
+            if self._is_generic_result():
+                self._render_current_view()
+            elif self.current_model is None or self.current_field is None:
                 self._render_empty_plot()
             else:
                 self._render_current_view()
@@ -6388,7 +6699,29 @@ class ReconstructionMainWindow(QMainWindow):
         self._write_message(f"运行失败：\n{message}")
         QMessageBox.critical(self, "错误", message)
 
+    def eventFilter(self, watched, event):
+        # Application-level Quit (including the OS application menu) must not
+        # tear down the event loop while a native calculation is still running.
+        if (watched is QApplication.instance() and event.type() == QEvent.Type.Quit
+                and hasattr(self, "analysis_jobs") and self.analysis_jobs.is_running):
+            self.close()
+            return True
+        return super().eventFilter(watched, event)
+
     def closeEvent(self, event):
+        if self.analysis_jobs.is_running:
+            answer = QMessageBox.question(
+                self, "计算尚未结束", "是否取消计算并在当前步骤结束后关闭？已有输入仍会询问是否保存。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._close_after_analysis = True
+                self.cancel_reconstruction()
+            else:
+                self._close_after_analysis = False
+            event.ignore()
+            return
         if not self._confirm_save_before_action():
             event.ignore()
             return
@@ -6399,8 +6732,14 @@ class ReconstructionMainWindow(QMainWindow):
     def shutdown(self):
         if self._is_shut_down:
             return
+        if not self.analysis_jobs.shutdown():
+            self._close_after_analysis = True
+            self.cancel_reconstruction()
+            return
         self._is_shut_down = True
+        QApplication.instance().removeEventFilter(self)
         self.result_link.shutdown()
+        self.generic_result_view.shutdown()
         self.layout_preferences.stop()
         for dialog in self.findChildren(BeamModelerDialog):
             dialog.shutdown()

@@ -29,6 +29,7 @@ from ifem.domain.analysis import (
     ValidationReport,
 )
 from ifem.domain.project import AnalysisCase, ProjectDocument
+from ifem.domain.result_fields import validate_result_fields
 
 
 DEFAULT_ALGORITHM_ID = "ifem.beam2d.surface_integral.v1"
@@ -700,9 +701,14 @@ class AnalysisService:
                 raise RuntimeError(f"结果字段 {field_value.identifier} 引用了未知单元。")
             if (
                 field_value.association == "sensor"
+                and project is not None
                 and not set(field_value.entity_ids) <= sensor_ids
             ):
                 raise RuntimeError(f"结果字段 {field_value.identifier} 引用了未知测点。")
+        try:
+            validate_result_fields(result)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
 
 
 def create_default_analysis_service() -> AnalysisService:

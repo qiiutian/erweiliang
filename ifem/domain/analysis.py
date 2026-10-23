@@ -364,6 +364,8 @@ class ResultField:
             raise ValueError(f"未知结果字段关联：{association}")
         if not components or any(not value for value in components):
             raise ValueError("结果字段分量不能为空。")
+        if len(components) != len(set(components)):
+            raise ValueError("结果字段分量必须唯一。")
         if any(not value for value in entity_ids) or len(entity_ids) != len(set(entity_ids)):
             raise ValueError("结果字段实体 ID 必须非空且唯一。")
         values = _finite_rows(
@@ -384,6 +386,46 @@ class ResultField:
             "coordinate_system",
             str(self.coordinate_system).strip() or "global",
         )
+
+
+@dataclass(frozen=True)
+class ResultLocation:
+    """Explicit spatial identity for a result entity, in unexaggerated SI metres.
+
+    Sensor and sample positions cannot be inferred from row order or live project
+    data.  ``source_entity_id`` may identify a parent entity (for example the
+    element on whose left/right side a sample lies); it is not the sample ID.
+    """
+
+    association: str
+    entity_id: str
+    reference_position: tuple[float, float, float]
+    position: tuple[float, float, float]
+    source_entity_id: str | None = None
+    label: str = ""
+
+    def __post_init__(self):
+        association = str(self.association).strip().lower()
+        entity_id = str(self.entity_id).strip()
+        if association not in {"node", "element", "sensor", "sample", "global"}:
+            raise ValueError(f"未知结果位置关联：{association}")
+        if not entity_id:
+            raise ValueError("结果位置实体 ID 不能为空。")
+        reference, position = _finite_rows(
+            (self.reference_position, self.position), columns=3,
+            field_name="结果位置坐标",
+        )
+        source = self.source_entity_id
+        if source is not None:
+            source = str(source).strip()
+            if not source:
+                raise ValueError("结果位置来源实体 ID 不能为空字符串。")
+        object.__setattr__(self, "association", association)
+        object.__setattr__(self, "entity_id", entity_id)
+        object.__setattr__(self, "reference_position", reference)
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "source_entity_id", source)
+        object.__setattr__(self, "label", str(self.label).strip())
 
 
 @dataclass(frozen=True)
@@ -531,6 +573,7 @@ class AnalysisResult:
     fields: Mapping[str, Any] = field(default_factory=dict)
     diagnostics: tuple[str, ...] = ()
     state: ReconstructionState | None = None
+    locations: tuple[ResultLocation, ...] = ()
 
     def __post_init__(self):
         algorithm_id = str(self.algorithm_id).strip()
@@ -540,11 +583,18 @@ class AnalysisResult:
         if self.state is not None and not isinstance(self.state, ReconstructionState):
             raise TypeError("算法结果 state 必须是 ReconstructionState。")
         fields = dict(self.fields)
+        locations = tuple(self.locations)
+        if any(not isinstance(value, ResultLocation) for value in locations):
+            raise TypeError("算法结果 locations 必须由 ResultLocation 组成。")
+        location_keys = tuple((value.association, value.entity_id) for value in locations)
+        if len(location_keys) != len(set(location_keys)):
+            raise ValueError("结果位置的关联与实体 ID 组合必须唯一。")
         object.__setattr__(self, "algorithm_id", algorithm_id)
         object.__setattr__(self, "algorithm_version", algorithm_version)
         object.__setattr__(self, "inputs", dict(self.inputs))
         object.__setattr__(self, "fields", fields)
         object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+        object.__setattr__(self, "locations", locations)
 
 
 class AnalysisCancelled(RuntimeError):

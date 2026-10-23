@@ -1,8 +1,8 @@
 # iFEM 重构算法接入接口
 
 本文档说明如何在不增加算法专用服务分支、也不修改既有二维求解公式的前提下，实现并
-注册新的梁重构方法。Qt 的通用结果图层仍由 `ANA-003` 收口；本接口先保证新公式可以
-直接进入统一注册、匹配、校验和运行链路。
+注册新的梁重构方法。Qt 工作台已能直接消费标准重构状态与离散字段，新公式可以
+直接进入统一注册、匹配、校验、运行和基础结果显示链路；连续场插值仍由 `ANA-003` 继续完成。
 当前仓库只注册了二维小变形算法；二维大变形、三维小变形和三维大变形只定义接口与
 契约测试，不注册尚未实现的占位算法。
 
@@ -156,13 +156,45 @@ class Beam3DLargeDeformationAlgorithm(ProjectReconstructionAlgorithm):
 - `capabilities.result_fields` 表示插件可能返回的字段；只有列入
   `required_result_fields` 的字段才保证每次返回。位移、转角和变形坐标由
   `ReconstructionState` 保证，不依赖可选字段。
-- 应变/应力场应在后续字段模式中继续声明坐标系、应变/应力度量和采样位置；不要把
-  求解器私有对象作为新界面的数据协议。
+- `AnalysisResult.locations` 是可选的 `tuple[ResultLocation, ...]`，每条记录包含
+  `association、entity_id、reference_position、position、source_entity_id、label`。
+  位置统一为真实三分量坐标（m），不能包含视觉厚度放大；关联类型与 ID 的组合必须唯一。
+- `map_result_field(result, field_id)` 返回独立于 `native_model` 的不可变
+  `ResultFieldLayer`，包含字段标签、关联、分量、单位、坐标系及 `records`。
+  每条记录包含原值、实体 ID、参考/重构位置、来源 ID 和标签。节点按 `state.node_ids`
+  取位置而非字段行号；sensor/sample 必须提供显式位置，element/global 未提供位置时返回
+  `None`，不猜测单元中心或模型原点。同坐标的左右单元采样不合并。
+- `source_entity_id` 是来源元数据，不自动推断拓扑、插值或几何父子关系。未知字段保留插件
+  声明的名称、单位和分量，不冒用内置物理语义。旧版 contract-0 任意字段载荷不会强制迁移；
+  字段浏览器对不可解析载荷显示说明，不破坏旧二维原生结果视图。
+
+### 4.1 已注册字段（2026-10-13）
+
+| ID | 关联 | 分量 | 原始单位 |
+|---|---|---|---|
+| `displacement` | node / sample | x,y 或 x,y,z | m |
+| `rotation` | node / sample | x,y,z；w,x,y,z；行优先 9 分量矩阵 | rad；1；1 |
+| `axial_strain` | node / element / sample | axial 或 top,bottom | 1 |
+| `axial_stress` | node / element / sample | axial 或 top,bottom | Pa |
+| `sensor_measured_strain` | sensor | axial | 1 |
+| `sensor_reconstructed_strain` | sensor | axial | 1 |
+| `sensor_strain_residual` | sensor | axial | 1 |
+
+内置字段的单位、分量、关联与坐标系（global/local）在 v1 服务返回前校验；不要求所有
+算法返回全部字段。内置二维方法输出原始逐单元上下表面值，交界左右保留不同快照 ID；
+无 E 时不生成应力字段，不返回全零假数据。没有工程身份的旧配置调用使用明确的快照作用域 ID。
+
+测点残差定义为原始解在测点的 `B_surface(x, L, y) @ Ue − measured`，与用户选择的区间
+积分目标不同，也不表示真实重构误差。内置算法缺测报字段级错误，合法零不受影响。
+残差表将 SI 应变乘 `1e6` 显示为 με；RMS 为各已观测点的非加权均方根，不生成合格阈值。
+三个字段通过实体 ID 连接，并检查坐标系和差值公式一致；不一致时不给出误导性的残差汇总。
+显示连续化和采样密度不改变测点点值残差，探针保留物理位置，仅渲染标记随厚度显示倍率变化。
 
 接口 v1 的节点和单元集合目前对应完整 `ProjectDocument`，连接关系直接使用稳定节点 ID，
 不使用数组下标。几何与分析网格分离后将通过后续契约版本增加独立分析实体映射；不要在
 v1 中用临时求解器序号冒充项目 ID。圆弧、公式参数曲线和 NURBS 的沿程采样、父单元
-局部坐标、应变/应力度量和表面位置属于 `ANA-003` 的完整字段模式，本版不以不透明数组提前固化。
+局部坐标、有限变形应变/应力度量仍属于 `ANA-003` 的完整字段模式；本轮仅标准化显式位置和
+基础轴向分量，不把大变形应变自动解释为小应变，也不假设 Cauchy / Piola 应力可混用。
 
 ## 5. 三维自由度
 
@@ -188,12 +220,40 @@ v1 中用临时求解器序号冒充项目 ID。圆弧、公式参数曲线和 N
 6. 算法自身的数值基准、刚体模态、边界条件、单位和病态输入测试。
 7. 现有二维小变形样例位移基线不变。
 
-通用应变/应力图层和结果探针仍由 `ANA-003/ANA-004` 完成；新算法可以先通过统一服务
-返回标准状态与字段，界面映射不应再反向要求它模仿旧二维 `native_model`。
-当前主工作台仍以旧二维结果消费者为主，并会阻止非 legacy 几何直接运行；因此“直接接入”
-在本切片中明确指 `AlgorithmRegistry + AnalysisService`。真实新算法进入桌面界面前，还需
-完成通用 readiness/result consumer，这属于 `ANA-003`，不是新算法公式类的专用分支。
+通用字段注册、位置映射、字段浏览器及主工作台的标准状态/离散点绘图已经接入。
+v1 新插件通过 `validate_project()` / `run_project()` 接收完整工程、活动工况、版本/模式绑定和
+自己的参数；不再因非 legacy 几何被界面统一阻止。能力匹配、字段校验与插件数值校验仍必须通过。
+只有内置方法与旧 contract-v0 插件使用二维兼容参数入口；`query_xs/true_points` 和旧积分默认值
+不会自动注入新插件的严格参数模式，工况换方法时不混入旧方法的参数。
+
+`native_model` 仅在其为兼容的二维梁模型时进入原绘图器；其他对象不能因非空就被当作旧求解器。
+通用显示读取 `ReconstructionState` 的真实参考/重构 XYZ，将单元连接关系中的相邻分析节点连线，
+不重建曲梁精确曲线或实体截面；以 Matplotlib 三维交互和 XY/XZ/YZ 投影显示，不放大变形。
+`ResultField` 按明确分量与单位着色，只有已知位置的记录绘制离散点，不插值为连续云图。
+无位置的单元/全局记录仍可查表和复制；自定义字段保留原名/分量/单位，不推断物理意义。
+节点与字段记录通过稳定 ID 双向关联数据表，投影切换保持选择；跨实体关联的字段切换清除选择。
+转动状态表直接注明向量/四元数/矩阵表示及单位，不把三维转动折算成二维 `phi`。
+
+本切片通过测试局部插件验证二维/三维、小/大变形状态，没有注册新的生产算法。
+连续场、曲线采样局部参数、有限变形应变/应力度量和 VTK 通用场仍属于 `ANA-003/ANA-004`。
+项目格式保持 v7，不保存结果、图表选择或任务，也不提前扩展三维边界条件。
 
 进度回调使用 `[0, 1]` 的非递减比例和短状态文本；长循环应定期调用
 `cancellation.raise_if_cancelled()`。输入问题由 `ValidationReport` 返回稳定 JSON Pointer，
 取消使用 `AnalysisCancelled`，其他求解失败保留原异常并由任务层记录诊断。
+
+### 6.1 桌面后台执行
+
+`AnalysisJobController.start(service, config, algorithm_id=..., parameters=..., project=...,
+snapshot_key=..., project_only=False)` 复制输入后返回任务 ID。通用工作台传 `project_only=True`
+并由线程调用 `run_project()`，保留完整工况绑定；旧入口默认调用 `run()`。
+工作线程仅执行服务，不能调用 QWidget、Matplotlib
+或 VTK；所有公开回调在控制器所属的主线程发送。
+信号为 `progress(job_id, snapshot_key, fraction, message)`、
+`succeeded(..., result)` / `failed(..., error)` / `cancelled(...)` 之一，随后 `finished(...)`。
+消费者检查任务 ID 和工程输入代次后才能安装结果，过期或取消任务的晚到结果不得覆盖工作区。
+
+`cancel()` 是协作请求，不强杀线程。`shutdown()` 禁止后续任务并请求取消；返回 `False`
+代表必须保留事件循环至 `finished`，不能立即销毁应用。桌面入口含应用级 Quit 保护，先等待
+当前数值步骤结束，再进入未保存确认。同步 `run_reconstruction()` 保留给脚本和既有测试；
+真实按钮、F5、命令搜索和空态入口统一使用 `start_reconstruction()`。
